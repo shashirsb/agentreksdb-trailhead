@@ -249,16 +249,25 @@ pub async fn turn(
             "system": SYSTEM,
             "messages": messages,
         });
-        let resp: Value = http
+        let raw = http
             .post("https://api.anthropic.com/v1/messages")
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let status = raw.status();
+        let text_body = raw.text().await?;
+        if !status.is_success() {
+            // The API's own error message is the useful part; reqwest's status text is not.
+            // Surface the model's error (e.g. "model: unknown ...") without leaking the key.
+            let msg = serde_json::from_str::<Value>(&text_body)
+                .ok()
+                .and_then(|v| v["error"]["message"].as_str().map(String::from))
+                .unwrap_or_else(|| text_body.chars().take(300).collect());
+            anyhow::bail!("anthropic {status}: {msg} (model {})", cfg.agent.chat.model_id);
+        }
+        let resp: Value = serde_json::from_str(&text_body)?;
         let text = resp["content"][0]["text"].as_str().unwrap_or_default();
         let json_part = text
             .find('{')
