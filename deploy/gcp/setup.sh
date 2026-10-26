@@ -54,6 +54,26 @@ if [ "$(gh repo view "$TRAILHEAD_REPO" --json visibility -q .visibility)" != "PU
 fi
 ok "$TRAILHEAD_REPO is public"
 
+# The VM downloads prebuilt images. GitHub keeps a package private if it was first published while the
+# repo was private, even after the repo goes public, so check anonymous pull access explicitly.
+public_image() {
+  local tok
+  tok=$(curl -fsS "https://ghcr.io/token?scope=repository:$OWNER/$1:pull" 2>/dev/null |
+        python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))' 2>/dev/null) || return 1
+  [ -n "$tok" ] && curl -fsS -o /dev/null -H "Authorization: Bearer $tok" \
+    -H "Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json" \
+    "https://ghcr.io/v2/$OWNER/$1/manifests/main"
+}
+for img in agentreksdb-trailhead agentreksdb-trailhead-sandbox; do
+  until public_image "$img"; do
+    echo "   The image $img is not public yet. Open this page, scroll to 'Change visibility', choose Public:"
+    echo "     https://github.com/users/$OWNER/packages/container/$img/settings"
+    openurl "https://github.com/users/$OWNER/packages/container/$img/settings"
+    read -r -p "   Press Enter when done... " _
+  done
+done
+ok "server images are public (the VM downloads them; nothing compiles on the VM)"
+
 bold "2. GitHub App ($APP_NAME)"
 if [ ! -s "$STATE/app.json" ]; then
   manifest=$(python3 - "$APP_NAME" "$DOMAIN" "$TRAILHEAD_REPO" <<'PY'

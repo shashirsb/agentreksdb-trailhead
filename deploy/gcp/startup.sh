@@ -43,8 +43,12 @@ mkdir -p /var/lib/trailhead/runs /var/backups/trailhead
 # Prebuilt images (published by .github/workflows/images.yml); build locally only as a fallback.
 set -a; . ./.env; set +a
 SANDBOX_IMAGE="${TRAILHEAD_SANDBOX_IMAGE:-ghcr.io/shashirsb/agentreksdb-trailhead-sandbox:main}"
-docker pull "$SANDBOX_IMAGE" || docker build -t "$SANDBOX_IMAGE" ../sandbox
-docker compose --env-file .env pull || docker compose --env-file .env build
+# Never compile on a 1 GB VM: if the images are not downloadable yet (e.g. still private on ghcr.io),
+# wait and retry so the server comes up by itself as soon as they are made public.
+until docker pull -q "$SANDBOX_IMAGE" && docker compose --env-file .env pull -q; do
+  echo "images not downloadable yet; make the ghcr.io packages public. Retrying in 60 s."
+  sleep 60
+done
 docker compose --env-file .env up -d --remove-orphans
 
 # Nightly database backup to Cloud Storage (the public ledger must never be lost).
