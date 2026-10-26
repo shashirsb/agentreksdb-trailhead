@@ -163,12 +163,26 @@ fi
 BA=$(gcloud billing projects describe "$PROJECT_ID" --format='value(billingAccountName)' | sed 's#billingAccounts/##')
 gcloud services enable compute.googleapis.com secretmanager.googleapis.com billingbudgets.googleapis.com storage.googleapis.com >/dev/null
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')
-if ! gcloud billing budgets list --billing-account="$BA" --format='value(displayName)' 2>/dev/null | grep -qx "Trailhead"; then
-  gcloud billing budgets create --billing-account="$BA" --display-name="Trailhead" --budget-amount=10USD \
+# The budget must be in the billing account's own currency (an INR account rejects "10USD").
+CURRENCY=$(gcloud billing accounts describe "$BA" --format='value(currencyCode)' 2>/dev/null || echo USD)
+case "$CURRENCY" in
+  USD) BUDGET="10USD" ;;
+  INR) BUDGET="1000INR" ;;
+  EUR) BUDGET="10EUR" ;;
+  GBP) BUDGET="10GBP" ;;
+  *)   BUDGET="" ;;
+esac
+if gcloud billing budgets list --billing-account="$BA" --format='value(displayName)' 2>/dev/null | grep -qx "Trailhead"; then
+  ok "project and billing (budget alert already exists)"
+elif [ -n "$BUDGET" ] && gcloud billing budgets create --billing-account="$BA" --display-name="Trailhead" --budget-amount="$BUDGET" \
     --filter-projects="projects/$PROJECT_NUMBER" \
-    --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 --threshold-rule=percent=1.0 >/dev/null
+    --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 --threshold-rule=percent=1.0 >/dev/null; then
+  ok "project, billing and a $BUDGET/month budget alert"
+else
+  # A missing alert must not block the deployment; tell the user how to add it by hand.
+  printf '   \033[33m!\033[0m could not create the budget alert automatically (billing currency: %s).\n' "$CURRENCY"
+  echo "     Add one in the console: Billing → Budgets & alerts → Create budget, about \$10/month, alerts at 50/90/100%."
 fi
-ok "project, billing and a \$10/month budget alert"
 
 gcloud compute addresses describe trailhead-ip --region="$REGION" >/dev/null 2>&1 ||
   gcloud compute addresses create trailhead-ip --region="$REGION" >/dev/null
