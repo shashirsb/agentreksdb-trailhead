@@ -1,0 +1,31 @@
+AgentreksDB Trailhead
+Copyright 2026 The AgentreksDB Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+AI-generated code
+-----------------
+Source files in this repository and in the AgentreksDB repositories that were
+generated entirely by an AI model through the Trailhead pipeline, without human
+editing, may not be protected by copyright in some jurisdictions. To the extent
+that copyright does not subsist in such files, they are dedicated to the public
+domain under the Creative Commons CC0 1.0 Universal dedication
+(https://creativecommons.org/publicdomain/zero/1.0/). To the extent that
+copyright does subsist, they are licensed under the Apache License, Version 2.0.
+Either way, anyone may use, modify and redistribute them.
+
+Each AI-generated commit carries provenance trailers (Generated-By, Spec-Hash,
+Attestation) and a signed provenance statement recording the model, the intent
+and the human reviewer who approved the merge.
+
+Specifications, intents and documentation
+-----------------------------------------
+Specifications, intents, prompts, chat transcripts and documentation contributed
+through Trailhead are licensed under the Creative Commons Attribution 4.0
+International license (CC-BY-4.0, https://creativecommons.org/licenses/by/4.0/),
+contributed under the Developer Certificate of Origin (https://developercertificate.org/).
+
+Trademarks
+----------
+"AgentreksDB", "Agentreks", "Trailhead" and the mountain logo are trademarks
+governed by TRADEMARK.md. The Apache License does not grant trademark rights.

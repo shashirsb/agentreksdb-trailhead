@@ -1,0 +1,81 @@
+# Gate 5 — Attested commit. Blocking. Proves "AI-only" instead of claiming it: every commit in the PR
+# must be signed by gitsign with the Trailhead workflow identity (keyless Sigstore, logged in Rekor)
+# and carry the Trailhead trailers. A commit typed by a human fails here.
+# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+name: gate-attestation
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gate-attestation-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The workflow in agentreksdb-trailhead that signs generated commits.
+  TRAILHEAD_IDENTITY_REGEXP: ${{ vars.TRAILHEAD_IDENTITY_REGEXP || '^https://github\.com/shashirsb/agentreksdb-trailhead/\.github/workflows/commit\.yml@refs/heads/main$' }}
+  OIDC_ISSUER: https://token.actions.githubusercontent.com
+
+jobs:
+  verify:
+    name: gate-attestation / verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+        with:
+          fetch-depth: 0
+      - uses: sigstore/gitsign-installer@main # TODO(pin) — installs gitsign
+      - name: resolve range
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "range=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "range=${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+      - name: every commit signed by the Trailhead pipeline, with trailers
+        run: |
+          set -u
+          fail=0
+          if ! commits=$(git rev-list --no-merges "${{ steps.refs.outputs.range }}"); then
+            echo "::error::could not resolve the commit range"; exit 1
+          fi
+          if [ -z "$commits" ]; then echo "::error::no commits to verify; refusing an empty change"; exit 1; fi
+          # Merge commits: none are allowed in a PR (Trailhead pushes a single linear commit). In the merge
+          # queue, the only merge commits allowed are the ones GitHub itself creates, signed by its key.
+          merges=$(git rev-list --merges "${{ steps.refs.outputs.range }}")
+          if [ -n "$merges" ]; then
+            if [ "${{ github.event_name }}" != "merge_group" ]; then
+              echo "::error::merge commits are not allowed in Trailhead PRs: $merges"; exit 1
+            fi
+            curl -fsSL https://github.com/web-flow.gpg | gpg --batch --import 2>/dev/null
+            for m in $merges; do
+              committer=$(git log -1 --format='%ce' "$m")
+              if [ "$committer" != "noreply@github.com" ] || ! git verify-commit "$m" 2>/dev/null; then
+                echo "::error::merge commit $m was not created and signed by GitHub"; fail=1
+              fi
+            done
+          fi
+          for c in $commits; do
+            echo "── $c"
+            if ! gitsign verify \
+                --certificate-identity-regexp "$TRAILHEAD_IDENTITY_REGEXP" \
+                --certificate-oidc-issuer "$OIDC_ISSUER" "$c"; then
+              echo "::error::$c is not signed by the Trailhead pipeline identity. Human-authored commits are not accepted: open an intent on Trailhead instead."
+              fail=1
+              continue
+            fi
+            trailers=$(git log -1 --format='%(trailers:only,unfold)' "$c")
+            for t in Generated-By Spec-Hash Trailhead-Intent; do
+              if ! printf '%s\n' "$trailers" | grep -q "^$t: ."; then
+                echo "::error::$c is missing the '$t:' trailer."
+                fail=1
+              fi
+            done
+          done
+          exit $fail

@@ -1,0 +1,74 @@
+# Gate 8 (advisory input) — AI review for the governor. Never merges anything by itself.
+# The reviewer runs on a model from a DIFFERENT family than the generator (authorship bias is real:
+# a model approves its own errors more often). It reads the diff plus the public prompt log and spec
+# linked from the PR body, and must answer: does the code do what the intent asked, and nothing more?
+# TODO(pin): replace action tags with full commit SHAs.
+name: gate-ai-review
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+concurrency:
+  group: gate-ai-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    name: gate-ai-review / pr-agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: fetch prompt log and spec linked from the PR body
+        id: ctx
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          # Trailhead PR bodies carry lines like:  Prompt-Log: https://trailhead.../api/intents/42
+          url=$(printf '%s\n' "$BODY" | sed -n 's/^Prompt-Log: *//p' | head -1)
+          : > context.md
+          if [ -n "$url" ]; then
+            curl -sSfL --max-time 20 "$url" -o intent.json || true
+            python3 - <<'EOF' || true
+          import json
+          d = json.load(open("intent.json"))
+          spec = d.get("intent", {}).get("spec", {})
+          msgs = d.get("messages", [])
+          with open("context.md", "w") as f:
+              f.write("## Spec\n```json\n" + json.dumps(spec, indent=1)[:12000] + "\n```\n## Prompt log\n")
+              for m in msgs[-40:]:
+                  f.write(f"- **{m.get('role')}**: {m.get('body','')[:1500]}\n")
+          EOF
+          fi
+          {
+            echo 'extra<<__TRAILHEAD__'
+            echo "Review this AI-generated change for AgentreksDB. Compare the diff against the spec and prompt log below."
+            echo "Answer explicitly: (1) intent_match yes/no, (2) does it do anything the intent did not ask for,"
+            echo "(3) unsafe/auth/crypto/net/dependency touches, (4) tests added. Every rejection must cite a spec"
+            echo "requirement id and a concrete counterexample; label each finding 'confirmed' or 'possible'."
+            echo "End with a JSON block: {risk_score 0-10, blast_radius, intent_match, unsafe_touched, tests_added, confirmed_issues[], recommendation: merge|hold|reject}."
+            head -c 20000 context.md
+            echo '__TRAILHEAD__'
+          } >> "$GITHUB_OUTPUT"
+      - uses: qodo-ai/pr-agent@main # TODO(pin)
+        env:
+          OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Reviewer model must NOT be the generator's model family.
+          config.model: ${{ vars.REVIEW_MODEL || 'gpt-5.5' }}
+          config.fallback_models: '[]'
+          github_action_config.auto_review: "true"
+          github_action_config.auto_describe: "false"
+          github_action_config.auto_improve: "false"
+          pr_reviewer.require_score_review: "true"
+          pr_reviewer.require_tests_review: "true"
+          pr_reviewer.require_security_review: "true"
+          pr_reviewer.require_estimate_effort_to_review: "true"
+          pr_reviewer.enable_review_labels_effort: "true"
+          pr_reviewer.enable_review_labels_security: "true"
+          pr_reviewer.extra_instructions: ${{ steps.ctx.outputs.extra }}

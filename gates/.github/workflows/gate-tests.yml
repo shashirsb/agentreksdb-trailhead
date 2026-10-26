@@ -1,0 +1,158 @@
+# Gate 6 — Tests · QA. Blocking. Tests are the specification when no human writes code.
+# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+name: gate-tests
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gate-tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  static:
+    name: gate-tests / static
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+        with:
+          workspaces: ${{ env.WORKSPACE_DIR }}
+      - name: rustfmt
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: cargo fmt --all -- --check
+      - name: clippy (-D warnings)
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: forbidden test patterns (no new ignores, retries or allows)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          added=$(git diff "origin/${{ github.base_ref }}"...HEAD -U0 -- '*.rs' '*.toml' | grep '^+' | grep -v '^+++' || true)
+          bad=$(printf '%s\n' "$added" | grep -nE '#\[ignore\]|#\[should_panic\]|#!?\[allow\(|--test-threads=1|^\+\s*retries\s*=' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::New ignore/should_panic/allow/retry patterns need human sign-off:"
+            echo "$bad"
+            exit 1
+          fi
+
+  nextest:
+    name: gate-tests / nextest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+        with:
+          workspaces: ${{ env.WORKSPACE_DIR }}
+      - uses: taiki-e/install-action@v2 # TODO(pin)
+        with:
+          tool: cargo-nextest
+      # Unit, doc and property tests (proptest runs as ordinary #[test]s; failing seeds persist
+      # in proptest-regressions/, which is CODEOWNED by humans). Zero retries: a flaky
+      # deterministic test is a real bug.
+      - name: nextest (unit + property)
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        env:
+          PROPTEST_CASES: "512"
+        run: cargo nextest run --workspace --locked --no-fail-fast --retries 0
+      - name: doc tests
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: cargo test --workspace --locked --doc
+
+  coverage:
+    name: gate-tests / coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+        with:
+          workspaces: ${{ env.WORKSPACE_DIR }}
+      - uses: taiki-e/install-action@v2 # TODO(pin)
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+      - name: measure line coverage
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: cargo llvm-cov nextest --workspace --locked --json --summary-only --output-path "$RUNNER_TEMP/cov.json"
+      - name: ratchet against gates/coverage-floor.txt
+        run: |
+          pct=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['data'][0]['totals']['lines']['percent'])" "$RUNNER_TEMP/cov.json")
+          floor=$(cat gates/coverage-floor.txt 2>/dev/null || echo 0)
+          echo "line coverage: ${pct}% (floor ${floor}%, tolerance 0.5)"
+          python3 - "$pct" "$floor" <<'EOF'
+          import sys
+          pct, floor = float(sys.argv[1]), float(sys.argv[2])
+          if pct < floor - 0.5:
+              print(f"::error::Coverage {pct:.2f}% dropped more than 0.5 below the floor {floor:.2f}%")
+              sys.exit(1)
+          if pct > floor + 0.5:
+              print(f"::notice::Coverage rose to {pct:.2f}%; the floor in gates/coverage-floor.txt can be raised (it never goes down).")
+          EOF
+
+  mutants:
+    name: gate-tests / mutants
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+        with:
+          workspaces: ${{ env.WORKSPACE_DIR }}
+      - uses: taiki-e/install-action@v2 # TODO(pin)
+        with:
+          tool: cargo-mutants,cargo-nextest
+      - name: mutants on changed code
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          git diff "origin/${{ github.base_ref }}"...HEAD > "$RUNNER_TEMP/pr.diff"
+          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --test-tool nextest --no-shuffle -o "$RUNNER_TEMP" || true
+      - name: require caught rate >= 80%
+        run: |
+          python3 - "$RUNNER_TEMP/mutants.out/outcomes.json" <<'EOF'
+          import json, sys, os
+          path = sys.argv[1]
+          if not os.path.exists(path):
+              print("No mutants generated for this diff; nothing to score.")
+              sys.exit(0)
+          data = json.load(open(path))
+          caught = data.get("caught", 0)
+          missed = data.get("missed", 0)
+          timeout = data.get("timeout", 0)
+          scored = caught + missed + timeout
+          if scored == 0:
+              print("No viable mutants in changed code.")
+              sys.exit(0)
+          rate = (caught + timeout) / scored
+          print(f"mutants: caught={caught} timeout={timeout} missed={missed} rate={rate:.1%}")
+          if rate < 0.80:
+              print(f"::error::Mutation caught rate {rate:.1%} is below 80% on changed code: the tests do not pin this behaviour.")
+              sys.exit(1)
+          EOF
+      - uses: actions/upload-artifact@v4 # TODO(pin)
+        if: always()
+        with:
+          name: mutants-report
+          path: ${{ runner.temp }}/mutants.out
+          if-no-files-found: ignore

@@ -1,0 +1,33 @@
+# Paths the generator must never change on its own. Any PR touching them needs a human code-owner
+# approval (enforced by the main ruleset: require_code_owner_review). Install as .github/CODEOWNERS.
+# Later rules take precedence in CODEOWNERS; every rule here names the same human owner.
+
+# Tests are the specification: the AI cannot weaken the checks that grade it.
+/**/tests/                    @shashirsb
+/**/fuzz/                     @shashirsb
+/**/sim/                      @shashirsb
+/**/proptest-regressions/     @shashirsb
+/**/benches/                  @shashirsb
+
+# CI, gates and policy: the generator cannot loosen its own rules.
+/.github/                     @shashirsb
+/gates/                       @shashirsb
+/deny.toml                    @shashirsb
+/**/build.rs                  @shashirsb
+/**/.cargo/                   @shashirsb
+/**/Cargo.lock                @shashirsb
+
+# Security-sensitive code: always human-reviewed, kept small, rarely touched.
+/**/crypto/                   @shashirsb
+/**/auth/                     @shashirsb
+/**/signing/                  @shashirsb
+/**/tls/                      @shashirsb
+/**/ledger/                   @shashirsb
+/**/net/                      @shashirsb
+
+# Governance and license: amended only by the governing body's process.
+/LICENSE                      @shashirsb
+/NOTICE                       @shashirsb
+/GOVERNANCE.md                @shashirsb
+/CHARTER.md                   @shashirsb
+/TRADEMARK.md                 @shashirsb

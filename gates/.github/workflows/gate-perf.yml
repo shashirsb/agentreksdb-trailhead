@@ -1,0 +1,99 @@
+# Gate 6 — Performance. Blocking.
+# Tier A (every PR): instruction counts, which vary ~0.2% on no-op changes versus ~9% for wall time,
+#   so small regressions are detectable on shared runners. Fail rule: any benchmark > +2% instructions.
+# Tier B (label perf:macro, and nightly): wall-time macro benchmarks on ONE dedicated bare-metal runner
+#   tracked in Bencher. Fail rule: t-test against the last 64 main samples (upper boundary 0.99) plus a
+#   hard ceiling of 5% throughput loss and 10% p99 growth; recall@10 must not drop more than 0.5 pp.
+# A claimed speedup in the PR body ("Claims: <bench> -N%") must show up on the named bench.
+# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+name: gate-perf
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: gate-perf-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  instructions:
+    name: gate-perf / instructions
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - name: install valgrind
+        run: sudo apt-get update -y && sudo apt-get install -y valgrind
+      - uses: taiki-e/install-action@v2 # TODO(pin)
+        with:
+          tool: iai-callgrind-runner
+      # Base and PR are measured in the same job (A/B) to cancel runner drift.
+      - name: bench base
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          git checkout -q "origin/${{ github.base_ref }}"
+          cargo bench --locked --bench iai -- --save-baseline=base || echo "no iai bench on base yet"
+      # iai-callgrind enforces the limit itself: any benchmark more than +2% instructions (Ir)
+      # against the base baseline fails the run.
+      - name: bench PR (fail on > 2% instruction regression)
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          git checkout -q "${{ github.sha }}"
+          if ! grep -q 'name *= *"iai"' Cargo.toml */Cargo.toml 2>/dev/null; then
+            echo "::warning::No iai benchmark target yet; add a [[bench]] named iai to make this gate meaningful."
+            exit 0
+          fi
+          cargo bench --locked --bench iai -- --baseline=base --callgrind-limits='ir=2.0'
+
+  macro:
+    name: gate-perf / macro
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf:macro'))
+    # One fixed bare-metal box: pinned governor, SMT off, isolcpus, ASLR off.
+    runs-on: [self-hosted, perf-bare-metal]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - uses: bencherdev/bencher@main # TODO(pin) — Bencher CLI
+      - name: build bench binaries (fixed target, fat LTO)
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64-v3
+          CARGO_PROFILE_BENCH_LTO: fat
+          CARGO_PROFILE_BENCH_CODEGEN_UNITS: "1"
+        run: cargo build --release --locked --benches
+      - name: macro suite (go-ycsb A–F, vector recall@10 vs QPS, ClickBench subset)
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        env:
+          BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
+          BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT || 'agentreksdb' }}
+        run: |
+          branch="${{ github.head_ref || github.ref_name }}"
+          bencher run \
+            --branch "$branch" \
+            --start-point "${{ github.base_ref || 'main' }}" \
+            --start-point-reset \
+            --testbed perf-bare-metal \
+            --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 \
+            --threshold-measure throughput --threshold-test percentage --threshold-lower-boundary 0.05 \
+            --err \
+            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+            "./scripts/bench-macro.sh"

@@ -1,0 +1,26 @@
+# Local run: docker compose -f deploy/docker-compose.yml up --build, then open http://localhost:8080
+# Dev sign-in and the dry-run generator are on; nothing here talks to GitHub or a model.
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: trailhead
+      POSTGRES_DB: trailhead
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      retries: 20
+  trailhead:
+    build: ..
+    depends_on:
+      db: { condition: service_healthy }
+    ports: ["8080:8080"]
+    environment:
+      DATABASE_URL: postgres://postgres:trailhead@db:5432/trailhead
+      TRAILHEAD_PUBLIC_URL: http://localhost:8080
+      TRAILHEAD_DEV_LOGIN: "1"
+      TRAILHEAD_ENFORCE_WINDOW: "0"
+      TRAILHEAD_GOVERNORS: gov
+volumes:
+  pgdata: {}

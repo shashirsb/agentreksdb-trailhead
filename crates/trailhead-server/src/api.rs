@@ -1,0 +1,1208 @@
+//! HTTP API (see docs/API.md). Every read is public; writes need a GitHub session.
+
+use axum::body::Bytes;
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine;
+use chrono::{Datelike, Utc};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sqlx::PgPool;
+use std::sync::Arc;
+use tower_http::services::{ServeDir, ServeFile};
+use trailhead_core::credits::{self, EntryKind, VoteError};
+use trailhead_core::reputation::{self, Tier};
+use trailhead_core::spec::{self, Spec};
+use trailhead_core::{diffpolicy, guardrails, ledger, train};
+
+use crate::config::Config;
+use crate::db::{self, EventRow, IntentRow, UserRow};
+use crate::{auth, github, interviewer, users, worker};
+
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub cfg: Arc<Config>,
+    pub http: reqwest::Client,
+    pub guardrails: Arc<guardrails::Policy>,
+    pub diff_policy: Arc<diffpolicy::Policy>,
+    pub ledger_key: Arc<ed25519_dalek::SigningKey>,
+}
+
+// ---------- errors ----------
+
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub code: String,
+    pub message: String,
+    pub hint: String,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, code: &str, message: &str, hint: &str) -> Self {
+        ApiError {
+            status,
+            code: code.into(),
+            message: message.into(),
+            hint: hint.into(),
+        }
+    }
+    pub fn bad(code: &str, message: &str, hint: &str) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message, hint)
+    }
+    pub fn not_found(what: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("{what} not found."),
+            "",
+        )
+    }
+    pub fn forbidden(code: &str, message: &str, hint: &str) -> Self {
+        Self::new(StatusCode::FORBIDDEN, code, message, hint)
+    }
+    pub fn internal<E: std::fmt::Display>(e: E) -> Self {
+        tracing::error!("internal error: {e}");
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "Something went wrong on our side.",
+            "It has been logged; try again.",
+        )
+    }
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::internal(format!("{e:#}"))
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({"error": {"code": self.code, "message": self.message, "hint": self.hint}})),
+        )
+            .into_response()
+    }
+}
+
+type R<T> = Result<Json<T>, ApiError>;
+type CreditRow = (String, i64, Option<i64>, String, chrono::DateTime<Utc>);
+
+// ---------- router ----------
+
+pub fn router(st: AppState) -> Router {
+    let web = st.cfg.web_dir.clone();
+    let api = Router::new()
+        .route("/auth/github/login", get(auth::github_login))
+        .route("/auth/github/callback", get(auth::github_callback))
+        .route("/auth/logout", post(auth::logout))
+        .route("/auth/dev-login", post(auth::dev_login))
+        .route("/api/me", get(me))
+        .route("/api/intents", get(list_intents).post(create_intent))
+        .route("/api/intents/{id}", get(get_intent))
+        .route("/api/intents/{id}/messages", post(post_message))
+        .route("/api/intents/{id}/submit", post(submit))
+        .route("/api/intents/{id}/vote", post(vote))
+        .route("/api/train", get(train_state))
+        .route("/api/train/tick", post(train_tick))
+        .route("/api/governor/queue", get(governor_queue))
+        .route("/api/governor/{id}/decide", post(governor_decide))
+        .route("/api/admin/kill-switch", post(kill_switch))
+        .route("/api/ledger", get(ledger_list))
+        .route("/api/ledger/verify", get(ledger_verify))
+        .route("/api/ledger/checkpoint", get(ledger_checkpoint))
+        .route("/api/credits", get(my_credits))
+        .route("/api/stats", get(stats))
+        .route("/api/verify/{sha}", get(verify_sha))
+        .route("/api/bundles/{id}", get(bundle))
+        .route("/api/webhooks/github", post(webhook))
+        .route("/healthz", get(|| async { "ok" }));
+    api.fallback_service(ServeDir::new(&web).fallback(ServeFile::new(web.join("index.html"))))
+        .with_state(st)
+}
+
+// ---------- helpers ----------
+
+async fn intent_json(pool: &PgPool, it: &IntentRow) -> Result<Value, ApiError> {
+    let author: String = sqlx::query_scalar("SELECT login FROM users WHERE id = $1")
+        .bind(it.author_id)
+        .fetch_one(pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let votes: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(points),0)::bigint FROM votes WHERE intent_id = $1",
+    )
+    .bind(it.id)
+    .fetch_one(pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let s: Spec = serde_json::from_value(it.spec.clone()).unwrap_or_default();
+    Ok(json!({
+        "id": it.id, "title": it.title, "area": it.area, "author": author, "intent": it.intent,
+        "status": it.status, "stage": it.stage, "stake_credits": it.stake_credits,
+        "change_type": it.change_type, "risk": it.risk, "train": it.train, "holds": it.holds,
+        "branch": it.branch, "pr_number": it.pr_number, "commit_sha": it.commit_sha, "votes": votes,
+        "spec": it.spec, "readiness": spec::readiness(&s),
+        "created_at": it.created_at, "updated_at": it.updated_at,
+    }))
+}
+
+async fn load_intent(st: &AppState, id: i64) -> Result<IntentRow, ApiError> {
+    db::intent(&st.pool, id)
+        .await?
+        .ok_or_else(|| ApiError::not_found("Intent"))
+}
+
+async fn user_json(st: &AppState, u: &UserRow) -> Result<Value, ApiError> {
+    let tier = users::tier_of(&st.pool, u).await?;
+    let balance = db::balance(&st.pool, u.id).await?;
+    Ok(json!({
+        "id": u.id, "login": u.login, "tier": tier.as_str(), "rep_points": u.rep_points,
+        "is_governor": u.is_governor, "credits_balance": balance, "created_at": u.created_at,
+    }))
+}
+
+async fn require_governor(st: &AppState, h: &HeaderMap) -> Result<UserRow, ApiError> {
+    let u = auth::require_user(st, h).await?;
+    if !u.is_governor {
+        return Err(ApiError::forbidden(
+            "governors_only",
+            "Only governors can do this.",
+            "Governors are elected; see GOVERNANCE.md.",
+        ));
+    }
+    Ok(u)
+}
+
+fn quarter() -> String {
+    let n = Utc::now();
+    format!("{}-Q{}", n.year(), (n.month() - 1) / 3 + 1)
+}
+
+// ---------- handlers ----------
+
+async fn me(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
+    let u = auth::current_user(&st, &h).await?;
+    Ok(Json(
+        json!({"user": match u { Some(u) => user_json(&st, &u).await?, None => Value::Null },
+                   "dev_login": st.cfg.dev_login, "oauth": st.cfg.github_client_id.is_some()}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct ListQ {
+    status: Option<String>,
+    limit: Option<i64>,
+    before: Option<i64>,
+}
+
+async fn list_intents(State(st): State<AppState>, Query(q): Query<ListQ>) -> R<Value> {
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let rows: Vec<IntentRow> = sqlx::query_as(
+        "SELECT * FROM intents WHERE ($1::text IS NULL OR status = $1) AND ($2::bigint IS NULL OR id < $2)
+         ORDER BY id DESC LIMIT $3",
+    )
+    .bind(q.status.filter(|s| s != "all"))
+    .bind(q.before)
+    .bind(limit)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for r in &rows {
+        out.push(intent_json(&st.pool, r).await?);
+    }
+    Ok(Json(json!({"intents": out})))
+}
+
+#[derive(Deserialize)]
+struct CreateIntent {
+    title: String,
+    area: String,
+    intent: String,
+    stake_credits: Option<i64>,
+    change_type: Option<String>,
+}
+
+async fn create_intent(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<CreateIntent>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    if db::setting(&st.pool, "kill_switch").await?.as_deref() == Some("on") {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "kill_switch",
+            "New intents are paused by the kill switch.",
+            "See the ledger for the reason.",
+        ));
+    }
+    let title = b.title.trim();
+    let text = b.intent.trim();
+    if title.contains('\0') || text.contains('\0') || b.area.contains('\0') {
+        return Err(ApiError::bad(
+            "bad_text",
+            "Text may not contain NUL characters.",
+            "",
+        ));
+    }
+    if title.len() < 6 || title.len() > 140 {
+        return Err(ApiError::bad(
+            "bad_title",
+            "Give it a clear title (6–140 characters).",
+            "",
+        ));
+    }
+    if text.len() < 12 {
+        return Err(ApiError::bad(
+            "bad_intent",
+            "Describe the behaviour you expect.",
+            "A few sentences is enough; the interviewer asks for the rest.",
+        ));
+    }
+    let activity = users::activity(&st.pool, &u).await?;
+    if !reputation::may_participate(&activity) {
+        return Err(ApiError::forbidden(
+            "account_too_new",
+            "GitHub accounts need to be at least 90 days old to file intents.",
+            "Or verify an organisation email domain.",
+        ));
+    }
+    let tier = reputation::tier(&activity);
+    // Everything below runs under a lock on the user row, so parallel requests cannot all claim the
+    // free first intent or spend the same credits twice.
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let (open, prior): (i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status NOT IN ('merged','rejected')), count(*) FROM intents WHERE author_id = $1",
+    )
+    .bind(u.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if open >= tier.open_intent_limit() {
+        return Err(ApiError::forbidden(
+            "too_many_open",
+            &format!(
+                "Your tier ({}) allows {} open intents at a time.",
+                tier.as_str(),
+                tier.open_intent_limit()
+            ),
+            "Finish or withdraw one first; merged work raises the limit.",
+        ));
+    }
+    let change_type = b
+        .change_type
+        .clone()
+        .filter(|c| spec::CHANGE_TYPES.contains(&c.as_str()));
+    let min = credits::min_stake(change_type.as_deref().unwrap_or("bug"));
+    let stake = if prior == 0 {
+        b.stake_credits.unwrap_or(0).max(0)
+    } else {
+        b.stake_credits.unwrap_or(min)
+    };
+    if prior > 0 && stake < min {
+        return Err(ApiError::bad(
+            "stake_too_low",
+            &format!("This change needs a stake of at least {min} credits."),
+            "Stakes are refunded on merge or good-faith decline and burned only for spam.",
+        ));
+    }
+    let balance = db::balance_tx(&mut tx, u.id).await?;
+    if stake > balance {
+        return Err(ApiError::bad(
+            "insufficient_credits",
+            &format!("You have {balance} credits; the stake is {stake}."),
+            "Credits refill monthly by tier, or can be bought; money buys inference, never trust.",
+        ));
+    }
+    let seed = interviewer::seed(title, text, change_type.as_deref());
+    let opening = interviewer::opening(&seed);
+    let area = if b.area.trim().is_empty() {
+        "Engine".to_string()
+    } else {
+        b.area.trim().to_string()
+    };
+    let it: IntentRow = sqlx::query_as(
+        "INSERT INTO intents (title, area, author_id, intent, status, stage, stake_credits, change_type, spec)
+         VALUES ($1,$2,$3,$4,'draft',2,$5,$6,$7) RETURNING *",
+    )
+    .bind(title)
+    .bind(&area)
+    .bind(u.id)
+    .bind(text)
+    .bind(stake)
+    .bind(&change_type)
+    .bind(serde_json::to_value(&seed).map_err(ApiError::internal)?)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    sqlx::query(
+        "INSERT INTO intent_messages (intent_id, role, body) VALUES ($1,'user',$2), ($1,'ai',$3)",
+    )
+    .bind(it.id)
+    .bind(text)
+    .bind(&opening)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    db::add_credits(
+        &mut tx,
+        u.id,
+        EntryKind::StakeHold,
+        stake,
+        Some(it.id),
+        if prior == 0 { "first intent" } else { "stake" },
+    )
+    .await?;
+    db::append_event(
+        &mut tx,
+        "intent.created",
+        Some(it.id),
+        &u.login,
+        json!({"title": title, "area": area, "intent": text, "stake_credits": stake, "first_intent_free": prior == 0}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"intent": intent_json(&st.pool, &it).await?})))
+}
+
+async fn get_intent(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value> {
+    let it = load_intent(&st, id).await?;
+    let messages: Vec<(String, String, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT role, body, created_at FROM intent_messages WHERE intent_id = $1 ORDER BY id",
+    )
+    .bind(id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let gates: Vec<(String, String, String, chrono::DateTime<Utc>)> =
+        sqlx::query_as("SELECT gate, verdict, detail, created_at FROM gate_results WHERE intent_id = $1 ORDER BY id")
+            .bind(id)
+            .fetch_all(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let events: Vec<EventRow> =
+        sqlx::query_as("SELECT * FROM events WHERE intent_id = $1 ORDER BY seq")
+            .bind(id)
+            .fetch_all(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let decision: Option<(i64, String, String, String, String, chrono::DateTime<Utc>)> = sqlx::query_as(
+        "SELECT intent_id, train, decision, reason, governor, created_at FROM decisions WHERE intent_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "intent": intent_json(&st.pool, &it).await?,
+        "messages": messages.into_iter().map(|(r, b, t)| json!({"role": r, "body": b, "created_at": t})).collect::<Vec<_>>(),
+        "gates": gates.into_iter().map(|(g, v, d, t)| json!({"gate": g, "verdict": v, "detail": d, "created_at": t})).collect::<Vec<_>>(),
+        "events": events,
+        "decision": decision.map(|(i, tr, d, r, g, t)| json!({"intent_id": i, "train": tr, "decision": d, "reason": r, "governor": g, "created_at": t})),
+    })))
+}
+
+#[derive(Deserialize)]
+struct MessageBody {
+    body: String,
+}
+
+async fn post_message(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<MessageBody>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let it = load_intent(&st, id).await?;
+    if it.author_id != u.id {
+        return Err(ApiError::forbidden(
+            "author_only",
+            "Only the intent's author can chat with the interviewer.",
+            "Vote or comment instead.",
+        ));
+    }
+    if it.status != "draft" {
+        return Err(ApiError::bad(
+            "not_draft",
+            "This intent has been submitted; the spec is frozen.",
+            "File a new intent for further changes.",
+        ));
+    }
+    let body = b.body.trim();
+    if body.is_empty() || body.len() > 8000 || body.contains('\0') {
+        return Err(ApiError::bad(
+            "bad_message",
+            "Messages must be 1–8000 characters.",
+            "",
+        ));
+    }
+    let history: Vec<(String, String)> =
+        sqlx::query_as("SELECT role, body FROM intent_messages WHERE intent_id = $1 ORDER BY id")
+            .bind(id)
+            .fetch_all(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let spec: Spec = serde_json::from_value(it.spec.clone()).unwrap_or_default();
+    let turn = interviewer::turn(&st.cfg, &st.http, &spec, &history, body)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                "interviewer_failed",
+                &format!("The interviewer could not answer: {e}"),
+                "Try again in a moment.",
+            )
+        })?;
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    // The model call can take seconds: make sure nobody submitted or changed the spec meanwhile.
+    match db::lock_intent(&mut tx, id).await? {
+        Some(cur) if cur.status == "draft" && cur.spec == it.spec => {}
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "spec_changed",
+                "The intent changed while the interviewer was answering (submitted, or another message arrived).",
+                "Reload the intent and try again.",
+            ))
+        }
+    }
+    sqlx::query(
+        "INSERT INTO intent_messages (intent_id, role, body) VALUES ($1,'user',$2), ($1,'ai',$3)",
+    )
+    .bind(id)
+    .bind(body)
+    .bind(&turn.reply)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    let spec_v = serde_json::to_value(&turn.spec).map_err(ApiError::internal)?;
+    sqlx::query("UPDATE intents SET spec = $2, change_type = COALESCE($3, change_type), updated_at = now() WHERE id = $1")
+        .bind(id)
+        .bind(&spec_v)
+        .bind(&turn.spec.change_type)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "chat.turn",
+        Some(id),
+        &u.login,
+        json!({"interviewer": turn.by, "prompt": turn.prompt_for_log, "reply": turn.reply, "ready": turn.readiness.ready}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"reply": {"role": "ai", "body": turn.reply}, "spec": spec_v, "readiness": turn.readiness}),
+    ))
+}
+
+async fn submit(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let it = load_intent(&st, id).await?;
+    if it.author_id != u.id {
+        return Err(ApiError::forbidden(
+            "author_only",
+            "Only the author can submit.",
+            "",
+        ));
+    }
+    if it.status != "draft" {
+        return Err(ApiError::bad("not_draft", "Already submitted.", ""));
+    }
+    let spec: Spec = serde_json::from_value(it.spec.clone()).unwrap_or_default();
+    let r = spec::readiness(&spec);
+    if !r.ready {
+        return Err(ApiError::bad(
+            "spec_not_ready",
+            &format!(
+                "The spec is not ready: {} open.",
+                r.missing
+                    .iter()
+                    .chain(r.weak.iter())
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "Answer the interviewer's questions until the validator passes.",
+        ));
+    }
+    let train_label = train::train_for_submission(Utc::now());
+    let spec_hash = trailhead_core::provenance::sha256_hex(
+        &serde_json::to_vec(&ledger::canonical(&it.spec)).map_err(ApiError::internal)?,
+    );
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    match db::lock_intent(&mut tx, id).await? {
+        Some(cur) if cur.status == "draft" && cur.spec == it.spec => {}
+        _ => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "spec_changed",
+                "The intent changed while submitting.",
+                "Reload and submit again.",
+            ))
+        }
+    }
+    sqlx::query("UPDATE intents SET train = $2 WHERE id = $1")
+        .bind(id)
+        .bind(&train_label)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "intent.submitted",
+        Some(id),
+        &u.login,
+        json!({"train": train_label, "spec": it.spec, "spec_hash": spec_hash}),
+    )
+    .await?;
+    db::transition(
+        &mut tx,
+        id,
+        "guardrails",
+        3,
+        &u.login,
+        json!({"train": train_label}),
+    )
+    .await?;
+    db::enqueue(&mut tx, "guardrails", Some(id)).await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    let it = load_intent(&st, id).await?;
+    Ok(Json(json!({"intent": intent_json(&st.pool, &it).await?})))
+}
+
+#[derive(Deserialize)]
+struct VoteBody {
+    points: i64,
+}
+
+async fn vote(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<VoteBody>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let it = load_intent(&st, id).await?;
+    let tier = users::tier_of(&st.pool, &u).await?;
+    if tier == Tier::Visitor {
+        return Err(ApiError::forbidden(
+            "contributors_only",
+            "Voting opens after your first merged intent.",
+            "File an intent; your first one needs no stake.",
+        ));
+    }
+    if (Utc::now() - u.account_created_at).num_days() < credits::VOTE_MIN_ACCOUNT_DAYS {
+        return Err(ApiError::forbidden(
+            "account_too_new",
+            "Accounts need 30 days of age to vote.",
+            "",
+        ));
+    }
+    if matches!(it.status.as_str(), "merged" | "rejected") {
+        return Err(ApiError::bad("closed", "This intent is closed.", ""));
+    }
+    let q = quarter();
+    let spent: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(points*points),0)::bigint FROM votes WHERE user_id = $1 AND quarter = $2 AND intent_id <> $3",
+    )
+    .bind(u.id)
+    .bind(&q)
+    .bind(id)
+    .fetch_one(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let others: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(sum(points),0)::bigint FROM votes WHERE intent_id = $1 AND user_id <> $2",
+    )
+    .bind(id)
+    .bind(u.id)
+    .fetch_one(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let left = credits::check_vote(b.points, spent, others).map_err(|e| match e {
+        VoteError::NotPositive => ApiError::bad("bad_points", "Vote with at least 1 point.", ""),
+        VoteError::OverBudget { cost: i64::MAX, .. } => ApiError::bad(
+            "over_budget",
+            &format!("At most {} points per intent.", credits::VOTE_MAX_POINTS),
+            "Quadratic voting: n points cost n²; 10 points use the whole quarter.",
+        ),
+        VoteError::OverBudget { cost, left } => ApiError::bad(
+            "over_budget",
+            &format!(
+                "{} points cost {cost}; you have {left} left this quarter.",
+                b.points
+            ),
+            "Quadratic voting: n points cost n².",
+        ),
+        VoteError::OverCap => ApiError::bad(
+            "over_cap",
+            "One account can hold at most 20% of an intent's votes.",
+            "",
+        ),
+    })?;
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query(
+        "INSERT INTO votes (user_id, intent_id, quarter, points) VALUES ($1,$2,$3,$4)
+         ON CONFLICT (user_id, intent_id, quarter) DO UPDATE SET points = EXCLUDED.points, created_at = now()",
+    )
+    .bind(u.id)
+    .bind(id)
+    .bind(&q)
+    .bind(b.points)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "vote",
+        Some(id),
+        &u.login,
+        json!({"points": b.points, "cost": b.points * b.points, "quarter": q}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"votes": others + b.points, "budget_left": left}),
+    ))
+}
+
+async fn train_state(State(st): State<AppState>) -> R<Value> {
+    let s = train::state(Utc::now());
+    let current = s
+        .review
+        .as_ref()
+        .map(|r| r.train.clone())
+        .unwrap_or_else(|| s.intake.train.clone());
+    let counts: Vec<(String, i64)> =
+        sqlx::query_as("SELECT status, count(*) FROM intents WHERE train = $1 GROUP BY status")
+            .bind(&current)
+            .fetch_all(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let w = |w: &train::Window| {
+        json!({"train": w.train, "cutoff": w.cutoff, "decision": w.decision,
+        "cutoff_pt": train::fmt_pt(w.cutoff), "decision_pt": train::fmt_pt(w.decision)})
+    };
+    Ok(Json(json!({
+        "train": current,
+        "now_pt": s.now_pt,
+        "phase": if s.review.is_some() { "review" } else { "intake" },
+        "cutoff_pt": train::fmt_pt(s.intake.cutoff),
+        "decision_pt": train::fmt_pt(s.review.as_ref().map(|r| r.decision).unwrap_or(s.intake.decision)),
+        "intake": w(&s.intake),
+        "review": s.review.as_ref().map(w),
+        "counts": counts.into_iter().map(|(k, v)| (k, json!(v))).collect::<serde_json::Map<_, _>>(),
+    })))
+}
+
+async fn train_tick(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
+    let want = st
+        .cfg
+        .tick_token
+        .clone()
+        .ok_or_else(|| ApiError::not_found("Endpoint"))?;
+    let got = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_eq(got.as_bytes(), want.as_bytes()) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "bad_token",
+            "Bad tick token.",
+            "",
+        ));
+    }
+    Ok(Json(worker::tick(&st).await?))
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+async fn governor_queue(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
+    require_governor(&st, &h).await?;
+    let rows: Vec<IntentRow> = sqlx::query_as(
+        "SELECT * FROM intents WHERE status IN ('review','flagged','held') ORDER BY (status = 'flagged') DESC, id",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let mut items = Vec::new();
+    for it in &rows {
+        let gates: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT ON (gate) gate, verdict, detail FROM gate_results WHERE intent_id = $1 ORDER BY gate, id DESC",
+        )
+        .bind(it.id)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        let ai_review = gates
+            .iter()
+            .find(|g| g.0 == "ai-review")
+            .map(|g| g.2.clone());
+        items.push(json!({
+            "intent": intent_json(&st.pool, it).await?,
+            "gates": gates.into_iter().map(|(g, v, d)| json!({"gate": g, "verdict": v, "detail": d})).collect::<Vec<_>>(),
+            "ai_review": ai_review,
+        }));
+    }
+    Ok(Json(
+        json!({"items": items, "enforce_window": st.cfg.enforce_window}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct DecideBody {
+    decision: String,
+    reason: String,
+    #[serde(default)]
+    spam: bool,
+}
+
+async fn governor_decide(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<DecideBody>,
+) -> R<Value> {
+    let g = require_governor(&st, &h).await?;
+    match worker::decide(&st, id, g.id, &g.login, &b.decision, &b.reason, b.spam).await? {
+        Ok(v) => Ok(Json(json!({"decision": v}))),
+        Err(worker::DecideError::Invalid("not_found", _)) => Err(ApiError::not_found("Intent")),
+        Err(worker::DecideError::Invalid("recuse", msg)) => {
+            Err(ApiError::forbidden("recuse", &msg, ""))
+        }
+        Err(worker::DecideError::Invalid(code, msg)) => Err(ApiError::bad(code, &msg, "")),
+    }
+}
+
+#[derive(Deserialize)]
+struct KillBody {
+    on: bool,
+    reason: String,
+}
+
+async fn kill_switch(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<KillBody>,
+) -> R<Value> {
+    let g = require_governor(&st, &h).await?;
+    if b.reason.trim().is_empty() {
+        return Err(ApiError::bad(
+            "reason_required",
+            "Say why; it is published.",
+            "",
+        ));
+    }
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    db::set_setting(&mut tx, "kill_switch", if b.on { "on" } else { "off" }).await?;
+    db::append_event(
+        &mut tx,
+        "kill_switch",
+        None,
+        &g.login,
+        json!({"on": b.on, "reason": b.reason}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"kill_switch": b.on})))
+}
+
+#[derive(Deserialize)]
+struct LedgerQ {
+    after: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn ledger_list(State(st): State<AppState>, Query(q): Query<LedgerQ>) -> R<Value> {
+    let rows: Vec<EventRow> =
+        sqlx::query_as("SELECT * FROM events WHERE seq > $1 ORDER BY seq LIMIT $2")
+            .bind(q.after.unwrap_or(0))
+            .bind(q.limit.unwrap_or(100).clamp(1, 500))
+            .fetch_all(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    Ok(Json(json!({"events": rows})))
+}
+
+pub async fn verify_chain(pool: &PgPool) -> anyhow::Result<ledger::ChainReport> {
+    let mut prev = ledger::GENESIS.to_string();
+    let mut after = 0i64;
+    let mut checked = 0usize;
+    loop {
+        let rows: Vec<EventRow> =
+            sqlx::query_as("SELECT * FROM events WHERE seq > $1 ORDER BY seq LIMIT 5000")
+                .bind(after)
+                .fetch_all(pool)
+                .await?;
+        if rows.is_empty() {
+            return Ok(ledger::ChainReport {
+                ok: true,
+                checked,
+                head: prev,
+                first_bad_seq: None,
+            });
+        }
+        if rows[0].seq != after + 1 {
+            return Ok(ledger::ChainReport {
+                ok: false,
+                checked,
+                head: prev,
+                first_bad_seq: Some(after + 1),
+            });
+        }
+        after = rows.last().map(|r| r.seq).unwrap_or(after);
+        let events: Vec<ledger::Event> = rows.into_iter().map(Into::into).collect();
+        let r = ledger::verify(&prev, &events);
+        checked += r.checked;
+        if !r.ok {
+            return Ok(ledger::ChainReport {
+                ok: false,
+                checked,
+                head: r.head,
+                first_bad_seq: r.first_bad_seq,
+            });
+        }
+        prev = r.head;
+    }
+}
+
+async fn ledger_verify(State(st): State<AppState>) -> R<Value> {
+    Ok(Json(
+        serde_json::to_value(verify_chain(&st.pool).await?).map_err(ApiError::internal)?,
+    ))
+}
+
+async fn ledger_checkpoint(State(st): State<AppState>) -> R<Value> {
+    let last: Option<(i64, String)> =
+        sqlx::query_as("SELECT seq, hash FROM events ORDER BY seq DESC LIMIT 1")
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let (seq, head) = last.unwrap_or((0, ledger::GENESIS.to_string()));
+    let sig = ledger::sign_checkpoint(&st.ledger_key, seq, &head);
+    let pk = hex::encode(st.ledger_key.verifying_key().to_bytes());
+    sqlx::query("INSERT INTO checkpoints (seq, head, signature, public_key) VALUES ($1,$2,$3,$4) ON CONFLICT (seq) DO NOTHING")
+        .bind(seq)
+        .bind(&head)
+        .bind(&sig)
+        .bind(&pk)
+        .execute(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"seq": seq, "head": head, "signature": sig, "public_key": pk,
+                   "message": String::from_utf8_lossy(&ledger::checkpoint_message(seq, &head))}),
+    ))
+}
+
+async fn my_credits(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let entries: Vec<CreditRow> = sqlx::query_as(
+        "SELECT kind, credits, intent_id, memo, created_at FROM credit_entries WHERE user_id = $1 ORDER BY id DESC LIMIT 200",
+    )
+    .bind(u.id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "balance": db::balance(&st.pool, u.id).await?,
+        "entries": entries.into_iter().map(|(k, c, i, m, t)| json!({"kind": k, "credits": c, "intent_id": i, "memo": m, "created_at": t})).collect::<Vec<_>>(),
+    })))
+}
+
+async fn stats(State(st): State<AppState>) -> R<Value> {
+    let (open, in_review, merged, staked): (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT count(*) FILTER (WHERE status NOT IN ('merged','rejected')),
+                count(*) FILTER (WHERE status = 'review'),
+                count(*) FILTER (WHERE status = 'merged'),
+                COALESCE(sum(stake_credits) FILTER (WHERE status NOT IN ('merged','rejected')),0)::bigint
+         FROM intents",
+    )
+    .fetch_one(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let spent: i64 = sqlx::query_scalar("SELECT COALESCE(sum((payload->>'cost_credits')::bigint),0)::bigint FROM events WHERE kind = 'generation.result'")
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let s = train::state(Utc::now());
+    Ok(Json(json!({
+        "open": open, "in_review": in_review, "merged": merged,
+        "credits_spent": spent, "credits_staked": staked,
+        "spent_today": worker::spent_today(&st).await?, "daily_budget": st.cfg.daily_budget_credits,
+        "kill_switch": db::setting(&st.pool, "kill_switch").await?.as_deref() == Some("on"),
+        "train": s.review.map(|r| r.train).unwrap_or(s.intake.train),
+        "model_id": st.cfg.agent.generation.model_id,
+    })))
+}
+
+async fn verify_sha(State(st): State<AppState>, Path(sha): Path<String>) -> R<Value> {
+    let sha = sha.to_lowercase();
+    if sha.len() < 12 || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::bad(
+            "bad_sha",
+            "Give at least 12 hex characters of the commit SHA.",
+            "",
+        ));
+    }
+    let it: Option<IntentRow> = sqlx::query_as(
+        "SELECT * FROM intents WHERE commit_sha = $1 OR commit_sha LIKE $1 || '%' LIMIT 1",
+    )
+    .bind(&sha)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(it) = it else {
+        return Ok(Json(json!({"found": false})));
+    };
+    let prov: Option<(Value, String, i64)> = sqlx::query_as(
+        "SELECT provenance, patch_sha256, ledger_seq FROM bundles WHERE intent_id = $1",
+    )
+    .bind(it.id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "found": true, "intent_id": it.id, "commit_sha": it.commit_sha,
+        "provenance": prov.as_ref().map(|p| &p.0), "patch_sha256": prov.as_ref().map(|p| &p.1), "ledger_seq": prov.map(|p| p.2),
+    })))
+}
+
+async fn bundle(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value> {
+    // Bundles are public for audit, but the signing workflow only proceeds on `ready_to_sign`:
+    // a flagged, rejected or held intent never gets a commit.
+    let status: Option<String> = sqlx::query_scalar("SELECT status FROM intents WHERE id = $1")
+        .bind(id)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let ready_to_sign = status.as_deref() == Some("gates");
+    let b: Option<(String, Vec<u8>, String, String, Value, i64)> =
+        sqlx::query_as("SELECT base, patch, patch_sha256, message, provenance, ledger_seq FROM bundles WHERE intent_id = $1")
+            .bind(id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    let Some((base, patch, sha, message, prov, seq)) = b else {
+        return Err(ApiError::not_found("Bundle"));
+    };
+    let ev_sha: Option<String> =
+        sqlx::query_scalar("SELECT payload->>'patch_sha256' FROM events WHERE seq = $1")
+            .bind(seq)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?
+            .flatten();
+    Ok(Json(json!({
+        "intent_id": id, "base": base, "patch_b64": base64::engine::general_purpose::STANDARD.encode(&patch),
+        "patch_sha256": sha, "ledger_patch_sha256": ev_sha, "status": status, "ready_to_sign": ready_to_sign, "message": message, "provenance": prov, "ledger_seq": seq,
+        "branch": format!("trailhead/{id}"),
+    })))
+}
+
+async fn webhook(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    body: Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let secret = st
+        .cfg
+        .webhook_secret
+        .clone()
+        .ok_or_else(|| ApiError::not_found("Endpoint"))?;
+    let sig = h
+        .get("x-hub-signature-256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !github::verify_webhook(&secret, &body, sig) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "bad_signature",
+            "Webhook signature mismatch.",
+            "",
+        ));
+    }
+    let event = h
+        .get("x-github-event")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let v: Value = serde_json::from_slice(&body)
+        .map_err(|_| ApiError::bad("bad_json", "Webhook body is not JSON.", ""))?;
+    match event.as_str() {
+        "pull_request" => on_pull_request(&st, &v).await?,
+        "check_run" => on_check_run(&st, &v).await?,
+        _ => {}
+    }
+    Ok(Json(json!({"ok": true})))
+}
+
+fn intent_from_body(body: &str) -> Option<i64> {
+    body.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("Trailhead-Intent:")
+            .and_then(|x| x.trim().parse().ok())
+    })
+}
+
+async fn on_pull_request(st: &AppState, v: &Value) -> Result<(), ApiError> {
+    if v["repository"]["full_name"].as_str() != Some(st.cfg.target_repo.as_str()) {
+        return Ok(());
+    }
+    let pr = &v["pull_request"];
+    let action = v["action"].as_str().unwrap_or("");
+    let author = pr["user"]["login"].as_str().unwrap_or("");
+    let Some(id) = intent_from_body(pr["body"].as_str().unwrap_or("")) else {
+        return Ok(());
+    };
+    if author != st.cfg.bot_login {
+        // Only the Trailhead App may open intent PRs; anything else is logged as an anomaly.
+        let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+        db::append_event(
+            &mut tx,
+            "anomaly.foreign_pr",
+            Some(id),
+            "github",
+            json!({"author": author, "pr": pr["number"]}),
+        )
+        .await?;
+        tx.commit().await.map_err(ApiError::internal)?;
+        return Ok(());
+    }
+    let Some(it) = db::intent(&st.pool, id).await? else {
+        return Ok(());
+    };
+    let number = pr["number"].as_i64();
+    let head = pr["head"]["sha"].as_str().unwrap_or("").to_string();
+    let branch = pr["head"]["ref"].as_str().unwrap_or("").to_string();
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    match action {
+        "opened" | "reopened" | "synchronize" => {
+            sqlx::query("UPDATE intents SET pr_number = $2, commit_sha = $3, branch = $4, updated_at = now() WHERE id = $1")
+                .bind(id)
+                .bind(number)
+                .bind(&head)
+                .bind(&branch)
+                .execute(&mut *tx)
+                .await
+                .map_err(ApiError::internal)?;
+            db::append_event(
+                &mut tx,
+                "pr.updated",
+                Some(id),
+                "github",
+                json!({"action": action, "pr": number, "head": head, "branch": branch}),
+            )
+            .await?;
+            if it.status == "gates" && it.stage < 6 {
+                sqlx::query("UPDATE intents SET stage = 6 WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(ApiError::internal)?;
+            }
+        }
+        "closed" if pr["merged"].as_bool() == Some(true) && it.status != "merged" => {
+            db::append_event(
+                &mut tx,
+                "anomaly.merged_without_decision",
+                Some(id),
+                "github",
+                json!({"pr": number}),
+            )
+            .await?;
+        }
+        _ => {}
+    }
+    tx.commit().await.map_err(ApiError::internal)?;
+    if let (Some(train), Some(n), true) = (
+        it.train.as_ref(),
+        number,
+        action == "opened" && st.cfg.github_app_configured(),
+    ) {
+        let _ = github::GitHub {
+            cfg: &st.cfg,
+            http: &st.http,
+        }
+        .add_labels(n, &[format!("train/{train}")])
+        .await;
+    }
+    Ok(())
+}
+
+async fn on_check_run(st: &AppState, v: &Value) -> Result<(), ApiError> {
+    if v["action"].as_str() != Some("completed") {
+        return Ok(());
+    }
+    let cr = &v["check_run"];
+    // Only checks run by GitHub Actions in the target repo count; any other app could post a
+    // check with a convincing name.
+    if cr["app"]["slug"].as_str() != Some("github-actions")
+        || v["repository"]["full_name"].as_str() != Some(st.cfg.target_repo.as_str())
+    {
+        return Ok(());
+    }
+    let Some(gate) = worker::gate_for_check(cr["name"].as_str().unwrap_or("")) else {
+        return Ok(());
+    };
+    let head = cr["head_sha"].as_str().unwrap_or("").to_string();
+    let it: Option<IntentRow> = sqlx::query_as("SELECT * FROM intents WHERE commit_sha = $1")
+        .bind(&head)
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some(it) = it else { return Ok(()) };
+    let verdict = match cr["conclusion"].as_str().unwrap_or("") {
+        "success" => "pass",
+        "neutral" | "skipped" => "warn",
+        _ => "block",
+    };
+    let detail = format!(
+        "{} · {}",
+        cr["name"].as_str().unwrap_or(""),
+        cr["html_url"].as_str().unwrap_or("")
+    );
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO gate_results (intent_id, gate, check_name, verdict, detail, head_sha) VALUES ($1,$2,$6,$3,$4,$5)")
+        .bind(it.id)
+        .bind(gate)
+        .bind(verdict)
+        .bind(&detail)
+        .bind(&head)
+        .bind(cr["name"].as_str().unwrap_or(""))
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        &format!("gate.{gate}"),
+        Some(it.id),
+        "github",
+        json!({"verdict": verdict, "check": cr["name"], "url": cr["html_url"], "head": head}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    worker::evaluate_gates(st, it.id, &head).await?;
+    Ok(())
+}

@@ -1,0 +1,93 @@
+# The weekly train. Intake closes Sunday 00:00 America/Los_Angeles; the governing body decides by the
+# following Friday 00:00 America/Los_Angeles. The cron is only a trigger — this required check is the
+# enforcement: a PR can merge only with the current train's label AND `decision:merge`.
+# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+name: train-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+  schedule:
+    # GitHub cron is UTC-only and can slip. Sunday 00:00 PT is 07:00 UTC (PDT) or 08:00 UTC (PST);
+    # both fire and the guard below lets exactly one through.
+    - cron: "0 7 * * 0"
+    - cron: "0 8 * * 0"
+    # Friday 00:00 PT decision deadline.
+    - cron: "0 7 * * 5"
+    - cron: "0 8 * * 5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  gate:
+    name: train-gate
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: current train (America/Los_Angeles)
+        id: train
+        run: |
+          # The train under review is named by the ISO week of its Sunday cutoff: the most recent
+          # Sunday 00:00 PT (today, if today is Sunday). Review runs Sunday → Friday 00:00 PT; Friday
+          # and Saturday are the merge buffer for that same train.
+          dow=$(TZ=America/Los_Angeles date +%u)   # 1=Mon … 7=Sun
+          if [ "$dow" = "7" ]; then
+            cutoff=$(TZ=America/Los_Angeles date +%F)
+          else
+            cutoff=$(TZ=America/Los_Angeles date -d "last sunday" +%F)
+          fi
+          train=$(TZ=America/Los_Angeles date -d "$cutoff" +%G-W%V)
+          echo "train=$train" >> "$GITHUB_OUTPUT"
+          echo "Current train: $train (cutoff Sunday $cutoff 00:00 PT)"
+      - name: require train label and governor decision
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          TRAIN: ${{ steps.train.outputs.train }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = "merge_group" ]; then
+            echo "Merge queue entries were admitted with train-gate passing on the PR."
+            exit 0
+          fi
+          python3 - <<'EOF'
+          import json, os, sys
+          labels = set(json.loads(os.environ["LABELS"] or "[]"))
+          train = os.environ["TRAIN"]
+          need = {f"train/{train}", "decision:merge"}
+          missing = need - labels
+          if missing:
+              print(f"::error::Not mergeable yet: missing {sorted(missing)}. Merges happen only in the weekly train after a governor decision.")
+              sys.exit(1)
+          print(f"OK: {sorted(need)} present.")
+          EOF
+
+  tick:
+    name: train-tick
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: guard — only at 00 Pacific
+        id: guard
+        run: |
+          hour=$(TZ=America/Los_Angeles date +%H)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$hour" = "00" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Skipping: it is ${hour}:xx in America/Los_Angeles, not 00."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: tell Trailhead to advance the train
+        if: steps.guard.outputs.run == 'true'
+        env:
+          TRAILHEAD_URL: ${{ vars.TRAILHEAD_URL }}
+          TOKEN: ${{ secrets.TRAILHEAD_TICK_TOKEN }}
+        run: |
+          test -n "$TRAILHEAD_URL" || { echo "::error::vars.TRAILHEAD_URL is not set"; exit 1; }
+          curl -sSf -X POST "$TRAILHEAD_URL/api/train/tick" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'

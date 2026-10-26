@@ -1,0 +1,103 @@
+# Semgrep rules for AI-generated AgentreksDB code. Run by gate-diff-policy with --baseline-commit,
+# so only findings introduced by the PR are reported. ERROR findings block the gate.
+rules:
+  - id: trailhead.network-outside-net
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      New network I/O outside the net/ module. Egress must live in net/ where the governor reviews it.
+    paths:
+      exclude:
+        - "**/net/**"
+        - "**/tests/**"
+    pattern-either:
+      - pattern: std::net::TcpStream::connect(...)
+      - pattern: TcpStream::connect(...)
+      - pattern: std::net::TcpListener::bind(...)
+      - pattern: TcpListener::bind(...)
+      - pattern: std::net::UdpSocket::bind(...)
+      - pattern: UdpSocket::bind(...)
+      - pattern: tokio::net::TcpStream::connect(...)
+      - pattern: tokio::net::lookup_host(...)
+      - pattern: reqwest::get(...)
+      - pattern: reqwest::Client::new()
+      - pattern: reqwest::Client::builder()
+      - pattern: ureq::get(...)
+      - pattern: ureq::post(...)
+
+  - id: trailhead.process-spawn
+    languages: [rust]
+    severity: ERROR
+    message: Spawning an external process from database code.
+    paths:
+      exclude:
+        - "**/tests/**"
+        - "**/xtask/**"
+        - "**/benches/**"
+    pattern-either:
+      - pattern: std::process::Command::new(...)
+      - pattern: Command::new(...)
+
+  - id: trailhead.secret-env-read
+    languages: [rust]
+    severity: ERROR
+    message: Reads a secret-looking environment variable outside the config module.
+    paths:
+      exclude:
+        - "**/config/**"
+        - "**/config.rs"
+    patterns:
+      - pattern-either:
+          - pattern: std::env::var($NAME)
+          - pattern: env::var($NAME)
+          - pattern: std::env::var_os($NAME)
+          - pattern: env::var_os($NAME)
+      - metavariable-regex:
+          metavariable: $NAME
+          regex: (?i)".*(key|token|secret|pass|credential).*"
+
+  - id: trailhead.include-bytes
+    languages: [rust]
+    severity: ERROR
+    message: include_bytes!/include_str! embeds a file into the binary; blobs need human review.
+    pattern-either:
+      - pattern: include_bytes!(...)
+      - pattern: include_str!(...)
+
+  - id: trailhead.bidi-unicode
+    languages: [generic]
+    severity: ERROR
+    message: Bidirectional-control or zero-width character (Trojan Source).
+    paths:
+      include:
+        - "*.rs"
+        - "*.toml"
+    pattern-regex: "[‪-‮⁦-⁩​-‏﻿]"
+
+  - id: trailhead.hostname-gated
+    languages: [rust]
+    severity: ERROR
+    message: Behaviour gated by hostname — a classic logic-bomb shape.
+    pattern-either:
+      - pattern: hostname::get()
+      - pattern: gethostname::gethostname()
+      - pattern: nix::unistd::gethostname(...)
+
+  - id: trailhead.cfg-hostname
+    languages: [generic]
+    severity: ERROR
+    message: cfg attribute keyed on an environment value that is not a normal target property.
+    paths:
+      include:
+        - "*.rs"
+    pattern-regex: '#\[cfg\([^)]*(hostname|env!\(|option_env!\()'
+
+  - id: trailhead.time-bomb
+    languages: [rust]
+    severity: WARNING
+    message: Branch on wall-clock time; check this is not a time bomb.
+    pattern-either:
+      - pattern: if SystemTime::now() > $T { ... }
+      - pattern: if SystemTime::now() < $T { ... }
+      - pattern: if chrono::Utc::now() > $T { ... }
+      - pattern: if chrono::Utc::now() < $T { ... }

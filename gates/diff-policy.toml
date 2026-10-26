@@ -1,0 +1,219 @@
+# Trailhead diff-policy. Read by `trailhead policy check --manifest diff.json --policy gates/diff-policy.toml`.
+#
+# level = "block": hard stop — the change goes to a human governor and cannot merge on gates alone.
+# level = "warn":  annotated on the PR; does not stop the merge.
+# kind:
+#   "path"       — `pattern` matches the file path
+#   "added_line" — `pattern` matches each added line
+#   "lockfile"   — `pattern` matches the path of a changed lockfile (any Cargo.lock delta)
+#   "binary"     — triggers when the file is binary and `pattern` matches its path (".*" = any)
+# exempt_paths — regexes; a file whose path matches any of them is skipped by that rule.
+#
+# This file is a protected path (CODEOWNERS): the generator cannot loosen its own policy.
+
+# ── Supply chain ────────────────────────────────────────────────────────────────────────────────
+[[rule]]
+id = "lockfile-delta"
+level = "block"
+kind = "lockfile"
+pattern = '(^|/)Cargo\.lock$'
+exempt_paths = []
+message = "Dependency graph changed (Cargo.lock). New or updated crates need cargo-vet audit and human review."
+
+# Patterns use the Rust `regex` crate syntax (no look-around).
+[[rule]]
+id = "cargo-manifest"
+level = "warn"
+kind = "path"
+pattern = '(^|/)Cargo\.toml$'
+exempt_paths = []
+message = "Cargo.toml changed; any real dependency change also moves Cargo.lock, which blocks."
+
+[[rule]]
+id = "git-or-path-source"
+level = "block"
+kind = "added_line"
+pattern = '\b(git|path|registry)\s*=\s*"'
+exempt_paths = []
+message = "New git, path or alternate-registry source."
+
+[[rule]]
+id = "feature-net-ffi"
+level = "block"
+kind = "added_line"
+pattern = '(?i)features\s*=\s*\[[^\]]*("(net|ffi|socket|http|tls|openssl|native-tls|curl)[^"]*")'
+exempt_paths = []
+message = "Feature flag enabling networking or FFI."
+
+# ── Unsafe and native code ──────────────────────────────────────────────────────────────────────
+[[rule]]
+id = "unsafe-code"
+level = "block"
+kind = "added_line"
+pattern = '\bunsafe\s*(\{|fn\b|impl\b|trait\b|extern\b)|allow\(\s*unsafe_code\s*\)'
+exempt_paths = []
+message = "New unsafe code. Needs the governor:unsafe tag and Miri on the touched crate."
+
+[[rule]]
+id = "ffi-asm"
+level = "block"
+kind = "added_line"
+pattern = '\bextern\s+"C"|\basm!\s*\(|\bglobal_asm!'
+exempt_paths = []
+message = "FFI or inline assembly."
+
+# ── Build, CI and release surface (where xz hid) ───────────────────────────────────────────────
+[[rule]]
+id = "build-script"
+level = "block"
+kind = "path"
+pattern = '(^|/)build\.rs$'
+exempt_paths = []
+message = "Build scripts run arbitrary code at compile time."
+
+[[rule]]
+id = "build-config"
+level = "block"
+kind = "path"
+pattern = '(^|/)(\.cargo/|rust-toolchain(\.toml)?$|Dockerfile[^/]*$|Makefile$|justfile$|\.github/|gates/|scripts/release)'
+exempt_paths = []
+message = "Build, CI, release or gate configuration changed."
+
+[[rule]]
+id = "proc-macro"
+level = "block"
+kind = "added_line"
+pattern = '^\s*proc-macro\s*=\s*true|#\[proc_macro'
+exempt_paths = []
+message = "Procedural macros run at compile time."
+
+# ── Sensitive paths ─────────────────────────────────────────────────────────────────────────────
+[[rule]]
+id = "sensitive-path"
+level = "block"
+kind = "path"
+pattern = '(^|/)(crypto|auth|signing|tls|ledger|attest|keys?)(/|\.rs$|_)'
+exempt_paths = []
+message = "Touches crypto, auth, signing, TLS, ledger or key paths. Always human-reviewed."
+
+# ── Egress, processes, secrets ──────────────────────────────────────────────────────────────────
+[[rule]]
+id = "network-egress"
+level = "block"
+kind = "added_line"
+pattern = '\b(TcpStream|TcpListener|UdpSocket|UnixStream|ToSocketAddrs|lookup_host|reqwest::|hyper::Client|ureq::|isahc::|surf::|curl::)'
+exempt_paths = ['(^|/)net/']
+message = "New network call outside the net/ module."
+
+[[rule]]
+id = "process-spawn"
+level = "block"
+kind = "added_line"
+pattern = '\b(std::process::Command|process::Command|Command::new)\b'
+exempt_paths = ['(^|/)(tests|benches|xtask)/']
+message = "Spawns an external process."
+
+[[rule]]
+id = "secret-env-read"
+level = "block"
+kind = "added_line"
+pattern = '(?i)env::var(_os)?\s*\(\s*"[^"]*(key|token|secret|pass(word)?|credential)[^"]*"'
+exempt_paths = ['(^|/)config(/|\.rs$)']
+message = "Reads a secret-looking environment variable outside the config module."
+
+[[rule]]
+id = "secret-file-read"
+level = "block"
+kind = "added_line"
+pattern = '~/\.ssh|\.ssh/|/proc/|/etc/(passwd|shadow)|\.aws/credentials|\.netrc'
+exempt_paths = []
+message = "Reads SSH keys, /proc, system credential files."
+
+[[rule]]
+id = "embedded-blob"
+level = "block"
+kind = "added_line"
+pattern = '[A-Za-z0-9+/]{256,}={0,2}|\b(0x)?[0-9a-fA-F]{256,}\b|include_bytes!\s*\('
+exempt_paths = []
+message = "Embedded base64/hex blob over 256 characters, or include_bytes! of a file."
+
+[[rule]]
+id = "binary-file"
+level = "block"
+kind = "binary"
+pattern = '.*'
+exempt_paths = []
+message = "Binary file added or changed (fixtures, archives, blobs)."
+
+[[rule]]
+id = "compressed-fixture"
+level = "block"
+kind = "path"
+pattern = '\.(xz|gz|bz2|zst|tar|zip|7z|lz4)$'
+exempt_paths = []
+message = "Compressed archive in the tree."
+
+[[rule]]
+id = "trojan-source"
+level = "block"
+kind = "added_line"
+pattern = '[\x{202A}-\x{202E}\x{2066}-\x{2069}\x{200B}-\x{200F}\x{FEFF}]'
+exempt_paths = []
+message = "Bidirectional-control or invisible Unicode character (Trojan Source)."
+
+[[rule]]
+id = "environment-gated-cfg"
+level = "block"
+kind = "added_line"
+pattern = '(?i)(gethostname|hostname::get|SystemTime::now\(\)\s*[><]|chrono::Utc::now\(\)\s*[><]|cfg\(\s*(target_os|target_env)\s*=\s*"[^"]*"\s*\)\s*\]\s*fn\s+\w*(auth|verify|check))'
+exempt_paths = []
+message = "Behaviour gated by hostname or wall-clock comparison (logic-bomb pattern)."
+
+[[rule]]
+id = "telemetry"
+level = "block"
+kind = "added_line"
+pattern = '(?i)\b(phone[_-]?home|telemetry|analytics::|sentry::init|segment::)'
+exempt_paths = []
+message = "Telemetry or phone-home feature."
+
+[[rule]]
+id = "disabled-safety"
+level = "block"
+kind = "added_line"
+pattern = '(?i)(skip|disable|bypass)_?(verify|verification|signature|auth|quorum|fsync|checksum)'
+exempt_paths = []
+message = "Disables verification, auth, quorum, fsync or checksum checks."
+
+# ── Warnings ────────────────────────────────────────────────────────────────────────────────────
+[[rule]]
+id = "unwrap-in-server"
+level = "warn"
+kind = "added_line"
+pattern = '\.unwrap\(\)|\.expect\('
+exempt_paths = ['(^|/)(tests|benches|examples)/', '_test\.rs$']
+message = "unwrap/expect in non-test code; prefer a typed error."
+
+[[rule]]
+id = "lint-allow"
+level = "warn"
+kind = "added_line"
+pattern = '#!?\[allow\('
+exempt_paths = []
+message = "A lint was silenced."
+
+[[rule]]
+id = "ignored-test"
+level = "warn"
+kind = "added_line"
+pattern = '#\[ignore\]'
+exempt_paths = []
+message = "A test was marked #[ignore]."
+
+[[rule]]
+id = "test-file-deleted"
+level = "warn"
+kind = "path"
+pattern = '(^|/)(tests|fuzz|sim)/'
+exempt_paths = []
+message = "Test, fuzz or simulation files changed; check none were weakened or deleted."

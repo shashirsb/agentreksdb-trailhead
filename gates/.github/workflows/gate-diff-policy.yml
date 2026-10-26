@@ -1,0 +1,198 @@
+# Gate 7 — Diff-policy. Blocking. The only layer aimed at malice: tests prove the code does what the
+# intent says; this gate proves it does nothing else. It reads every byte of the diff (build scripts,
+# CI files, lockfiles, binary fixtures), not just src/.
+# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+name: gate-diff-policy
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gate-diff-policy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+env:
+  WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+  CARGO_TERM_COLOR: always
+
+jobs:
+  policy:
+    name: gate-diff-policy / policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4 # TODO(pin)
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - name: resolve base and head
+        id: refs
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=${{ github.event.merge_group.base_sha }}" >> "$GITHUB_OUTPUT"
+            echo "head=${{ github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
+          fi
+      # Manifest schema read by `trailhead policy check`:
+      # {"base": sha, "head": sha, "files": [{"path", "status": "added|modified|deleted|renamed",
+      #   "binary": bool, "added_lines": [str]}]}
+      - name: build diff manifest
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, subprocess
+          base, head = os.environ["BASE"], os.environ["HEAD"]
+          def git(*args):
+              return subprocess.run(["git", *args], check=True, capture_output=True).stdout
+          status_map = {"A": "added", "M": "modified", "D": "deleted", "R": "renamed", "C": "added", "T": "modified"}
+          files = []
+          name_status = git("diff", "--name-status", "-M", "-z", f"{base}...{head}").split(b"\0")
+          i = 0
+          entries = []
+          while i < len(name_status) and name_status[i]:
+              code = name_status[i].decode()[0]
+              if code in "RC":
+                  path = name_status[i + 2].decode(errors="replace"); i += 3
+              else:
+                  path = name_status[i + 1].decode(errors="replace"); i += 2
+              entries.append((status_map.get(code, "modified"), path))
+          numstat = {}
+          for line in git("diff", "--numstat", "-M", f"{base}...{head}").decode(errors="replace").splitlines():
+              parts = line.split("\t")
+              if len(parts) >= 3:
+                  numstat[parts[-1].split(" => ")[-1].rstrip("}")] = parts[0] == "-"
+          for status, path in entries:
+              binary = numstat.get(path, False)
+              added = []
+              if not binary and status != "deleted":
+                  patch = git("diff", "-U0", "--no-color", f"{base}...{head}", "--", path).decode(errors="replace")
+                  added = [l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++")]
+              files.append({"path": path, "status": status, "binary": binary, "added_lines": added})
+          json.dump({"base": base, "head": head, "files": files}, open("diff.json", "w"), indent=1)
+          print(f"manifest: {len(files)} files")
+          EOF
+      - name: load the policy from the BASE commit (a change can never loosen the gate that judges it)
+        run: |
+          mkdir -p .gate-base/semgrep
+          git show "${{ steps.refs.outputs.base }}:gates/diff-policy.toml" > .gate-base/diff-policy.toml
+          git show "${{ steps.refs.outputs.base }}:gates/semgrep/rust-trailhead.yml" > .gate-base/semgrep/rust-trailhead.yml
+      - name: trailhead policy check
+        id: policy
+        env:
+          VERIFIER: ${{ vars.TRAILHEAD_VERIFIER_IMAGE || 'ghcr.io/shashirsb/agentreksdb-trailhead:main' }}
+        run: |
+          set +e
+          docker run --rm -v "$PWD:/w" -w /w "$VERIFIER" \
+            trailhead policy check --manifest diff.json --policy .gate-base/diff-policy.toml --out policy-verdict.json
+          code=$?
+          cat policy-verdict.json
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: semgrep (custom Rust rules)
+        id: semgrep
+        run: |
+          pipx install semgrep >/dev/null
+          set +e
+          semgrep scan --config .gate-base/semgrep/rust-trailhead.yml --baseline-commit "${{ steps.refs.outputs.base }}" \
+            --sarif --output semgrep.sarif --error --metrics off
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      - uses: taiki-e/install-action@v2 # TODO(pin)
+        with:
+          tool: cargo-deny,cargo-audit
+      - name: cargo-deny (bans, sources, licenses, advisories)
+        id: deny
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          set +e
+          cargo deny --locked check
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: cargo-audit
+        id: audit
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          set +e
+          cargo audit --deny warnings
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: gitleaks (diff only)
+        id: gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.24.0/gitleaks_8.24.0_linux_x64.tar.gz | tar xz gitleaks
+          set +e
+          ./gitleaks git --log-opts="${{ steps.refs.outputs.base }}..${{ steps.refs.outputs.head }}" \
+            --report-format sarif --report-path gitleaks.sarif --redact
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: upload SARIF (semgrep)
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3 # TODO(pin)
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-trailhead
+      - name: upload SARIF (gitleaks)
+        if: always() && hashFiles('gitleaks.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3 # TODO(pin)
+        with:
+          sarif_file: gitleaks.sarif
+          category: gitleaks
+      - name: write gate-verdict.json
+        env:
+          POLICY: ${{ steps.policy.outputs.exit }}
+          SEMGREP: ${{ steps.semgrep.outputs.exit }}
+          DENY: ${{ steps.deny.outputs.exit }}
+          AUDIT: ${{ steps.audit.outputs.exit }}
+          GITLEAKS: ${{ steps.gitleaks.outputs.exit }}
+          SHA: ${{ steps.refs.outputs.head }}
+          POLICY_COMMIT: ${{ github.sha }}
+        run: |
+          python3 - <<'EOF'
+          import json, os
+          pv = {}
+          try:
+              pv = json.load(open("policy-verdict.json"))
+          except Exception:
+              pv = {"verdict": "block", "blocked_by": [{"rule": "policy-check-failed", "path": "", "line": None,
+                    "message": "trailhead policy check did not produce a verdict"}], "warned": []}
+          tools = {"semgrep": "SEMGREP", "cargo-deny": "DENY", "cargo-audit": "AUDIT", "gitleaks": "GITLEAKS"}
+          blocked = list(pv.get("blocked_by", []))
+          for tool, env in tools.items():
+              if os.environ.get(env, "0") not in ("", "0"):
+                  blocked.append({"rule": tool, "path": "", "line": None, "message": f"{tool} reported findings (see SARIF / logs)"})
+          verdict = {
+              "sha": os.environ["SHA"],
+              "verdict": "block" if blocked else pv.get("verdict", "pass"),
+              "rules_evaluated": ["gates/diff-policy.toml", *tools.keys()],
+              "blocked_by": blocked,
+              "warned": pv.get("warned", []),
+              "policy_commit": os.environ["POLICY_COMMIT"],
+          }
+          json.dump(verdict, open("gate-verdict.json", "w"), indent=2)
+          print(json.dumps(verdict, indent=2))
+          EOF
+      - uses: actions/upload-artifact@v4 # TODO(pin)
+        if: always()
+        with:
+          name: gate-verdict
+          path: |
+            gate-verdict.json
+            diff.json
+            policy-verdict.json
+      - name: enforce verdict
+        run: |
+          v=$(python3 -c "import json;print(json.load(open('gate-verdict.json'))['verdict'])")
+          if [ "$v" = "block" ]; then
+            echo "::error::Diff-policy BLOCK: a human governor must review this change (see gate-verdict.json)."
+            exit 1
+          fi
+          echo "diff-policy verdict: $v"

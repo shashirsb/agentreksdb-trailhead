@@ -1,0 +1,21 @@
+[package]
+name = "trailhead-core"
+description = "Pure decision logic for Trailhead: specs, guardrails, diff policy, weekly trains, the public ledger, credits and reputation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+regex.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+sha2.workspace = true
+hex.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true

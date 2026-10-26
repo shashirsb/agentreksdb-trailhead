@@ -1,0 +1,23 @@
+# The pinned generation setup. Changing this file is a "model rotation": it must arrive as a public
+# PR with a validation-set comparison (see docs/OPERATIONS.md), merged at least 30 days before the
+# vendor's retirement date. Every generated commit records these values in its provenance.
+
+[generation]
+# Exactly one dated model ID. No aliases like "latest".
+model_id = "claude-opus-5-5"
+harness = "claude-agent-sdk"
+max_budget_usd = 20.0
+max_turns = 80
+wall_clock_minutes = 45
+allowed_tools = ["Read", "Edit", "Write", "Grep", "Glob", "Bash(cargo *)", "Bash(git diff *)", "Bash(git status *)"]
+# Provider terms the outputs are generated under (archived per build).
+terms_version = "anthropic-commercial-terms-2025-06-17"
+
+[chat]
+# Model that interviews contributors and drafts the spec. It never writes code.
+model_id = "claude-sonnet-5-5"
+max_tokens = 2000
+
+[review]
+# The AI reviewer must come from a different model family than the generator (authorship bias).
+reviewer_family = "openai"

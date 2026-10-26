@@ -1,0 +1,67 @@
+# Production on one VM: Caddy (HTTPS for www.agentreksdb.com and trailhead.agentreksdb.com) -> Trailhead (API, UI, worker) -> Postgres, plus the model proxy
+# that sandboxes use. Start: docker compose --env-file .env up -d --build   (run from deploy/prod)
+services:
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    ports: ["80:80", "443:443"]
+    environment:
+      TRAILHEAD_DOMAIN: ${TRAILHEAD_DOMAIN}
+      SITE_DOMAIN: ${SITE_DOMAIN:-www.agentreksdb.com}
+      APEX_DOMAIN: ${APEX_DOMAIN:-agentreksdb.com}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ../../site:/srv/site:ro
+      - caddy_data:/data
+    depends_on: [trailhead]
+
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: trailhead
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 20
+
+  trailhead:
+    image: ${TRAILHEAD_IMAGE:-ghcr.io/shashirsb/agentreksdb-trailhead:main}
+    build: ../..
+    restart: unless-stopped
+    depends_on:
+      db: { condition: service_healthy }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://postgres:${POSTGRES_PASSWORD}@db:5432/trailhead
+      TRAILHEAD_PUBLIC_URL: https://${TRAILHEAD_DOMAIN}
+      TRAILHEAD_BIND: 0.0.0.0:8080
+      GITHUB_APP_PRIVATE_KEY_PATH: /run/secrets/app.pem
+      TRAILHEAD_WORK_DIR: /var/lib/trailhead/runs
+      TRAILHEAD_SANDBOX_IMAGE: ${TRAILHEAD_SANDBOX_IMAGE:-ghcr.io/shashirsb/agentreksdb-trailhead-sandbox:main}
+    user: root   # needs the Docker socket to start one sandbox container per run
+    volumes:
+      - ./app.pem:/run/secrets/app.pem:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/trailhead/runs:/var/lib/trailhead/runs
+
+  model-proxy:
+    image: ${TRAILHEAD_IMAGE:-ghcr.io/shashirsb/agentreksdb-trailhead:main}
+    build: ../..
+    restart: unless-stopped
+    command: ["trailhead", "model-proxy", "--bind", "0.0.0.0:8888"]
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      TRAILHEAD_PROXY_TOKEN: ${TRAILHEAD_PROXY_TOKEN}
+    networks: [default, sandbox]
+
+networks:
+  sandbox:
+    name: trailhead-sandbox
+    internal: true   # sandboxes on this network can reach only the model proxy
+
+volumes:
+  caddy_data: {}
+  pgdata: {}

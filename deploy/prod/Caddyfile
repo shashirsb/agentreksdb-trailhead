@@ -1,0 +1,29 @@
+# Caddy gets and renews HTTPS certificates from Let's Encrypt automatically for every name below.
+
+# The AgentreksDB website (static, from /site in this repo).
+{$SITE_DOMAIN} {
+	root * /srv/site
+	encode gzip
+	file_server
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}
+
+# The bare domain sends visitors to www.
+{$APEX_DOMAIN} {
+	redir https://{$SITE_DOMAIN}{uri} permanent
+}
+
+# Trailhead, the contribution portal.
+{$TRAILHEAD_DOMAIN} {
+	encode gzip
+	reverse_proxy trailhead:8080
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+	}
+}

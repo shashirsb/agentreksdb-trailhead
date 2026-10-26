@@ -1,0 +1,84 @@
+# Prompt guardrails (stage 3). ADVISORY: these rules label and route an intent before any tokens
+# are spent; they never replace the blocking diff-policy gate (stage 7).
+#   level = "red"   -> hold for a human before generation
+#   level = "amber" -> generate, but the governor must review the risk tag
+# Patterns are case-insensitive regular expressions matched against the intent text and spec.
+# Every verdict is published next to the prompt in the public ledger.
+
+[[rule]]
+id = "injection.ignore-instructions"
+level = "red"
+pattern = '(ignore|disregard|forget)\s+(all\s+|any\s+)?(previous|prior|above|earlier)\s+(instructions|rules|prompts)'
+message = "Prompt-injection phrasing: asks the model to ignore its instructions."
+
+[[rule]]
+id = "injection.authority-claim"
+level = "red"
+pattern = '''(i am|i'm|as)\s+(the\s+)?(maintainer|governor|admin|owner|anthropic|openai)\b|maintainers?\s+(said|approved|authori[sz]ed)'''
+message = "Claims maintainer or vendor authority. Authority comes from the governor queue, never from a prompt."
+
+[[rule]]
+id = "injection.secrecy"
+level = "red"
+pattern = '''(don't|do not|never)\s+(tell|mention|log|record|disclose)|keep (this|it) (secret|hidden|quiet)|without (logging|telling)'''
+message = "Asks for secrecy. Everything in Trailhead is public."
+
+[[rule]]
+id = "injection.encoded-payload"
+level = "red"
+pattern = '[A-Za-z0-9+/]{120,}={0,2}'
+message = "Long encoded blob in the request. Describe intent in words, not payloads."
+
+[[rule]]
+id = "exfil.secrets"
+level = "red"
+pattern = '(print|send|return|expose|upload|post)\b.{0,40}\b(env(ironment)? var|api[_ -]?key|token|secret|password|private key|credentials?)'
+message = "Requests that secrets or credentials be exposed."
+
+[[rule]]
+id = "exfil.telemetry"
+level = "red"
+pattern = '(phone[- ]home|telemetry|beacon|call home|report usage to)'
+message = "Telemetry or phone-home behaviour is not allowed in AgentreksDB."
+
+[[rule]]
+id = "safety.disable-checks"
+level = "red"
+pattern = '(disable|skip|remove|turn off|bypass)\b.{0,30}\b(tests?|lints?|clippy|fuzz(ing|ers)?|checks?|verification|signature|attestation|consensus|replication safety)'
+message = "Asks to weaken tests or safety checks."
+
+[[rule]]
+id = "pipeline.ci-edit"
+level = "red"
+pattern = '(\.github|workflow|ci/cd|release script|signing key|merge queue|ruleset|codeowners)'
+message = "CI, release, signing and repository rules cannot be changed through an intent."
+
+[[rule]]
+id = "risk.network"
+level = "amber"
+pattern = '\b(socket|http client|outbound|egress|dns|webhook|fetch from|connect to)\b'
+message = "Touches network egress; diff-policy will hard-stop any new egress outside net/."
+
+[[rule]]
+id = "risk.crypto-auth"
+level = "amber"
+pattern = '\b(crypto|encrypt|decrypt|hash(ing)?|nonce|rng|random|tls|certificate|auth(entication|orization)?|token signer|signature|password)\b'
+message = "Touches crypto or auth; needs a governor tag and a second human reviewer."
+
+[[rule]]
+id = "risk.unsafe"
+level = "amber"
+pattern = '\b(unsafe|ffi|extern "c"|raw pointer|transmute|asm!)\b'
+message = "Touches unsafe Rust or FFI; needs governor:unsafe."
+
+[[rule]]
+id = "risk.dependency"
+level = "amber"
+pattern = '\b(new (crate|dependency|library)|add (a )?(crate|dependency)|cargo add)\b'
+message = "Adds a dependency; diff-policy blocks dependency changes until a human approves."
+
+[[rule]]
+id = "risk.storage-format"
+level = "amber"
+pattern = '\b(storage format|on-disk format|wire (format|protocol)|wal format|migration|breaking change)\b'
+message = "Changes a storage or wire format; irreversible changes need 2/3 of governors and a 7-day comment period."
