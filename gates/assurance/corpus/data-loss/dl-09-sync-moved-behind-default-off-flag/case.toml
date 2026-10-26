@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-09-sync-moved-behind-default-off-flag"
+category = "data-loss"
+kind = "diff"
+title = "fsync kept textually but guarded by a flag that defaults off"
+description = "sync_all survives inside `if self.opts.eager_sync`, which no profile sets."
+expect = "block"
+expect_rules = []
+technique = "dropped-guard-evasion"
+source = "hand-written"
+known_gap = true
+gap_reason = "dropped-durability is a dropped_guard rule: a surviving added line matching sync_all suppresses the finding so that moving or reformatting a sync is quiet. Wrapping it in a default-off condition satisfies that test while removing the barrier in practice."

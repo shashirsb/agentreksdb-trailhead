@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-08-destructive-migration"
+category = "data-loss"
+kind = "diff"
+title = "Migration drops the previous events table"
+description = "An irreversible DROP TABLE ships as a routine migration."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "hand-written"
+known_gap = true
+gap_reason = "migrations/ is not a watched path and SQL DDL matches no pattern. GOVERNANCE.md requires 2/3 governors for an irreversible change, but nothing in the gate detects that this diff is one."
+delegated_to = "governor review (GOVERNANCE.md irreversible-change rule)"

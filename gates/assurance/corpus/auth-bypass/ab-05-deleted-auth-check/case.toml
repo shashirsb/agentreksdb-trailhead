@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-05-deleted-auth-check"
+category = "auth-bypass"
+kind = "diff"
+title = "Authorization call deleted from the write handler"
+description = "Deletion-only sabotage: require_auth disappears and nothing is added."
+expect = "block"
+expect_rules = ["dropped-authorization"]
+technique = "deletion"
+source = "cve-class:CWE-862 missing-authorization"

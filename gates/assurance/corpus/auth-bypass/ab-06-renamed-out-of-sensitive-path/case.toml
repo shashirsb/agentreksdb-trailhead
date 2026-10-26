@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-06-renamed-out-of-sensitive-path"
+category = "auth-bypass"
+kind = "diff"
+title = "Token module renamed out from under the sensitive-path rule"
+description = "auth/token.rs becomes identity/token.rs and then grows an escape hatch."
+expect = "block"
+expect_rules = []
+technique = "manufactured-exempt-path"
+source = "hand-written"
+known_gap = true
+gap_reason = "sensitive-path matches the path segments crypto|auth|signing|tls|ledger|attest|keys. Renaming the module to identity/ moves the same code out of the rule's reach, and no rule compares the old path to the new one."

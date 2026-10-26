@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-18-peer-connect-timeout-const"
+category = "control"
+kind = "diff"
+title = "Name the peer connect timeout"
+description = "Replaces a literal with a named constant in the net module."
+expect = "pass"
+expect_rules = []
+technique = "refactor"
+source = "hand-written"

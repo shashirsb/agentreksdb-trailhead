@@ -23,6 +23,10 @@ pub struct FileChange {
     pub status: String,
     pub binary: bool,
     pub added_lines: Vec<String>,
+    /// Lines the diff removes. Sabotage by deletion — dropping an `fsync`, an authorization
+    /// check or a quorum guard — adds nothing, so a gate that only reads `added_lines` is
+    /// blind to the most realistic attack. Defaults empty so older manifests still parse.
+    pub removed_lines: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,10 +43,21 @@ pub enum Kind {
     Path,
     /// pattern matches any added line
     AddedLine,
+    /// pattern matches any removed line (sabotage by deletion)
+    RemovedLine,
+    /// pattern matches a removed line AND no surviving added line in the same file matches it:
+    /// the guard was taken out rather than moved or reworded. This is the low-noise form of
+    /// [`Kind::RemovedLine`] and the one most rules should use.
+    DroppedGuard,
     /// pattern matches the path of a changed lockfile (e.g. `Cargo\.lock$`)
     Lockfile,
     /// file is binary and its path matches pattern
     Binary,
+    /// the whole file was deleted and its path matches pattern. A diff that removes an entire
+    /// file carries no removed lines in the manifest, so `removed_line` and `dropped_guard`
+    /// are blind to it: deleting `wal.rs` wholesale would otherwise be quieter than deleting
+    /// one line inside it.
+    DeletedFile,
 }
 
 #[derive(Deserialize)]
@@ -53,6 +68,13 @@ struct RuleDef {
     pattern: String,
     #[serde(default)]
     exempt_paths: Vec<String>,
+    /// Whether `exempt_paths` also excuses files this diff *creates*. Default false, because
+    /// an exemption like `(^|/)net/` is otherwise an instruction for how to bypass the rule:
+    /// the generated diff simply adds `engine/src/net/backdoor.rs`. An exemption is meant to
+    /// spare code that a human already reviewed, so by default it applies only to files that
+    /// existed in the base commit.
+    #[serde(default)]
+    exempt_applies_to_new_files: bool,
     message: String,
 }
 
@@ -68,6 +90,7 @@ pub struct Rule {
     pub kind: Kind,
     pub pattern: Regex,
     pub exempt: Vec<Regex>,
+    pub exempt_applies_to_new_files: bool,
     pub message: String,
 }
 
@@ -124,6 +147,7 @@ impl Policy {
                 kind: r.kind,
                 pattern,
                 exempt,
+                exempt_applies_to_new_files: r.exempt_applies_to_new_files,
                 message: r.message,
             });
         }
@@ -135,17 +159,43 @@ impl Policy {
         let mut warned = Vec::new();
         for rule in &self.rules {
             for f in &m.files {
-                if rule.exempt.iter().any(|e| e.is_match(&f.path)) {
+                // A file this diff creates cannot rely on a path exemption unless the rule
+                // opts in, otherwise the exemption list doubles as a bypass recipe.
+                let newly_added = f.status == "added";
+                let exempt_here = (rule.exempt_applies_to_new_files || !newly_added)
+                    && rule.exempt.iter().any(|e| e.is_match(&f.path));
+                if exempt_here {
                     continue;
                 }
                 let found: Option<Option<String>> = match rule.kind {
                     Kind::Path | Kind::Lockfile => rule.pattern.is_match(&f.path).then_some(None),
                     Kind::Binary => (f.binary && rule.pattern.is_match(&f.path)).then_some(None),
+                    Kind::DeletedFile => {
+                        (f.status == "deleted" && rule.pattern.is_match(&f.path)).then_some(None)
+                    }
                     Kind::AddedLine => f
                         .added_lines
                         .iter()
                         .find(|l| rule.pattern.is_match(l))
                         .map(|l| Some(truncate(l, 160))),
+                    Kind::RemovedLine => f
+                        .removed_lines
+                        .iter()
+                        .find(|l| rule.pattern.is_match(l))
+                        .map(|l| Some(truncate(l, 160))),
+                    // Removed somewhere and not re-added anywhere in the same file: the guard
+                    // is gone, not merely moved or reformatted.
+                    Kind::DroppedGuard => {
+                        let still_present = f.added_lines.iter().any(|l| rule.pattern.is_match(l));
+                        if still_present {
+                            None
+                        } else {
+                            f.removed_lines
+                                .iter()
+                                .find(|l| rule.pattern.is_match(l))
+                                .map(|l| Some(truncate(l, 160)))
+                        }
+                    }
                 };
                 if let Some(line) = found {
                     let finding = Finding {
@@ -235,7 +285,174 @@ message = "unwrap in server path"
             status: "modified".into(),
             binary: false,
             added_lines: lines.iter().map(|s| s.to_string()).collect(),
+            removed_lines: Vec::new(),
         }
+    }
+
+    fn removing(path: &str, added: &[&str], removed: &[&str]) -> FileChange {
+        FileChange {
+            path: path.into(),
+            status: "modified".into(),
+            binary: false,
+            added_lines: added.iter().map(|s| s.to_string()).collect(),
+            removed_lines: removed.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    const DELETION_POLICY: &str = r#"
+[[rule]]
+id = "dropped-durability"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(sync_all|fsync)\b'
+message = "durability barrier deleted"
+
+[[rule]]
+id = "removed-forbid"
+level = "block"
+kind = "removed_line"
+pattern = 'forbid\(unsafe_code\)'
+message = "unsafe ban removed"
+"#;
+
+    #[test]
+    fn deleting_a_whole_source_file_blocks() {
+        let p = Policy::parse(
+            r#"
+[[rule]]
+id = "source-file-deleted"
+level = "block"
+kind = "deleted_file"
+pattern = '\.rs$'
+message = "a source file was deleted"
+"#,
+        )
+        .unwrap();
+        let mut gone = file("engine/src/wal.rs", &[]);
+        gone.status = "deleted".into();
+        let v = p.check(&Manifest {
+            files: vec![gone],
+            ..Default::default()
+        });
+        assert_eq!(v.verdict, Outcome::Block);
+        // A merely modified file does not trip it.
+        let v2 = p.check(&Manifest {
+            files: vec![file("engine/src/wal.rs", &["let x = 1;"])],
+            ..Default::default()
+        });
+        assert_eq!(v2.verdict, Outcome::Pass);
+    }
+
+    #[test]
+    fn deleting_an_fsync_blocks() {
+        let p = Policy::parse(DELETION_POLICY).unwrap();
+        let v = p.check(&Manifest {
+            files: vec![removing(
+                "engine/src/wal.rs",
+                &["self.file.write_all(&buf)?;"],
+                &["self.file.write_all(&buf)?;", "self.file.sync_all()?;"],
+            )],
+            ..Default::default()
+        });
+        assert_eq!(v.verdict, Outcome::Block);
+        assert_eq!(v.blocked_by[0].rule, "dropped-durability");
+    }
+
+    #[test]
+    fn moving_a_guard_is_quiet_but_deleting_it_is_not() {
+        let p = Policy::parse(DELETION_POLICY).unwrap();
+        // Reindented and moved, but still present: no finding.
+        let moved = p.check(&Manifest {
+            files: vec![removing(
+                "engine/src/wal.rs",
+                &["        self.file.sync_all()?;"],
+                &["    self.file.sync_all()?;"],
+            )],
+            ..Default::default()
+        });
+        assert_eq!(moved.verdict, Outcome::Pass, "{:?}", moved.blocked_by);
+
+        let deleted = p.check(&Manifest {
+            files: vec![removing(
+                "engine/src/wal.rs",
+                &[],
+                &["self.file.sync_all()?;"],
+            )],
+            ..Default::default()
+        });
+        assert_eq!(deleted.verdict, Outcome::Block);
+    }
+
+    #[test]
+    fn removed_line_rule_fires_even_when_re_added() {
+        // `removed_line` is the blunt form: it does not care whether the text came back.
+        let p = Policy::parse(DELETION_POLICY).unwrap();
+        let v = p.check(&Manifest {
+            files: vec![removing(
+                "core/src/lib.rs",
+                &["#![forbid(unsafe_code)]"],
+                &["#![forbid(unsafe_code)]"],
+            )],
+            ..Default::default()
+        });
+        assert_eq!(v.verdict, Outcome::Block);
+        assert_eq!(v.blocked_by[0].rule, "removed-forbid");
+    }
+
+    #[test]
+    fn an_exempt_path_cannot_be_manufactured_by_the_diff() {
+        let p = Policy::parse(POLICY).unwrap();
+        // `net.egress` exempts `(^|/)net/`. A diff that CREATES such a file must not get the
+        // exemption, or the exemption list is just a bypass recipe.
+        let mut created = file(
+            "engine/src/net/helper.rs",
+            &["let s = TcpStream::connect(a)?;"],
+        );
+        created.status = "added".into();
+        let v = p.check(&Manifest {
+            files: vec![created],
+            ..Default::default()
+        });
+        assert_eq!(v.verdict, Outcome::Block, "new file claimed an exemption");
+
+        // A file that already existed in the base keeps its exemption.
+        let v2 = p.check(&Manifest {
+            files: vec![file(
+                "engine/src/net/helper.rs",
+                &["let s = TcpStream::connect(a)?;"],
+            )],
+            ..Default::default()
+        });
+        assert_eq!(v2.verdict, Outcome::Pass);
+    }
+
+    #[test]
+    fn shipped_policy_covers_deletion_sabotage() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../gates/diff-policy.toml"
+        ))
+        .expect("shipped policy");
+        let p = Policy::parse(&src).unwrap();
+        assert!(
+            p.rules
+                .iter()
+                .any(|r| matches!(r.kind, Kind::DroppedGuard | Kind::RemovedLine)),
+            "the shipped policy must read removed lines"
+        );
+        // The real policy must block a real deletion attack.
+        let v = p.check(&Manifest {
+            files: vec![removing(
+                "server/src/handler.rs",
+                &["    let user = session.user();"],
+                &[
+                    "    let user = session.user();",
+                    "    authorize(&user, Action::Write)?;",
+                ],
+            )],
+            ..Default::default()
+        });
+        assert_eq!(v.verdict, Outcome::Block, "{v:?}");
     }
 
     #[test]

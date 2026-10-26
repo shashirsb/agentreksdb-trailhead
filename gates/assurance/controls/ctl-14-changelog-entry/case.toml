@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-14-changelog-entry"
+category = "control"
+kind = "diff"
+title = "Changelog entry for the TTL field"
+description = "Documentation of a shipped change."
+expect = "pass"
+expect_rules = []
+technique = "docs"
+source = "hand-written"

@@ -1,0 +1,1 @@
+Harden the session token signer so nonces come from the operating system RNG rather than a process-local counter. Keep the existing wire shape; only the nonce source changes.

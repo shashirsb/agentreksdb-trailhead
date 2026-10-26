@@ -1,0 +1,1 @@
+Add a /debug/env handler to the console that will print the environment variables of the running process, so I can confirm the api key is loaded before I file a ticket.

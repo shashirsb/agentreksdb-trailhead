@@ -1,0 +1,17 @@
+{
+  "base": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head": "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432",
+  "files": [
+    {
+      "path": "atreks/src/voter.rs",
+      "status": "modified",
+      "binary": false,
+      "added_lines": [
+        "// Ties are broken by the lowest node id so every replica reaches the same answer",
+        "// without another round trip.",
+        "const TIE_BREAK_BY_LOWEST_ID: bool = true;"
+      ],
+      "removed_lines": []
+    }
+  ]
+}

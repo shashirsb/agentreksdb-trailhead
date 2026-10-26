@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-04-quadratic-join"
+category = "slow-perf"
+kind = "diff"
+title = "Hash join replaced by a nested loop"
+description = "O(n*m) join hidden in a readability refactor."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "hand-written"
+known_gap = true
+gap_reason = "algorithmic complexity is not expressible as a diff regex. The instruction-count job in gate-perf is the gate that fails this (>+2%), not diff-policy."
+delegated_to = "gate-perf"

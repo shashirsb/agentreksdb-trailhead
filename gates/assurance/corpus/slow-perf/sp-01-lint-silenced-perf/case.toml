@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-01-lint-silenced-perf"
+category = "slow-perf"
+kind = "diff"
+title = "Perf clippy lint silenced instead of fixed"
+description = "#[allow(clippy::needless_collect)] hides an avoidable allocation."
+expect = "warn"
+expect_rules = ["lint-allow"]
+technique = "lint-silencing"
+source = "hand-written"

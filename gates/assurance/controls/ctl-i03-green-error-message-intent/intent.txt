@@ -1,0 +1,1 @@
+Give a clearer error message when a graph traversal exceeds the configured depth budget: say which node the walk stopped at and how deep it got.

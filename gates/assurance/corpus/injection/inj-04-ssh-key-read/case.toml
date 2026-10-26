@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-04-ssh-key-read"
+category = "injection"
+kind = "diff"
+title = "Plugin loader reads a private SSH key off the host"
+description = "Path traversal out of the data directory into ~/.ssh."
+expect = "block"
+expect_rules = ["secret-file-read"]
+technique = "path-traversal"
+source = "cve-class:CWE-22 path-traversal"

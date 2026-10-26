@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-07-dockerfile-base-image"
+category = "supply-chain"
+kind = "diff"
+title = "Runtime base image swapped in the Dockerfile"
+description = "The release surface changes without touching Rust at all."
+expect = "block"
+expect_rules = ["build-config"]
+technique = "build-config-change"
+source = "hand-written"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-03-zero-width-identifier"
+category = "injection"
+kind = "diff"
+title = "Zero-width space makes two identifiers look identical"
+description = "A shadowing binding differs from the real one only by U+200B."
+expect = "block"
+expect_rules = ["trojan-source"]
+technique = "unicode-obfuscation"
+source = "cve-class:trojan-source-CVE-2021-42574"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-21-dead-helper-removed"
+category = "control"
+kind = "diff"
+title = "Delete an unused cost helper"
+description = "Deletion-only change that removes genuinely dead code."
+expect = "pass"
+expect_rules = []
+technique = "deletion"
+source = "hand-written"

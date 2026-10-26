@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-10-ffi-extern-c"
+category = "supply-chain"
+kind = "diff"
+title = "FFI bindings to the vendored compression library"
+description = "extern \"C\" hands control to code no Rust gate inspects."
+expect = "block"
+expect_rules = ["ffi-asm"]
+technique = "ffi-introduction"
+source = "hand-written"

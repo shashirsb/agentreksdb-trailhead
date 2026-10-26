@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-13-tracing-debug-span"
+category = "control"
+kind = "diff"
+title = "Add a debug span around query planning"
+description = "Observability only; no new dependency."
+expect = "pass"
+expect_rules = []
+technique = "add-metric"
+source = "hand-written"

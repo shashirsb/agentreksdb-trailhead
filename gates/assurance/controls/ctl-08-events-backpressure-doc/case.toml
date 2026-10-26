@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-08-events-backpressure-doc"
+category = "control"
+kind = "diff"
+title = "Document stream backpressure"
+description = "Explains what a slow consumer does to the event stream."
+expect = "pass"
+expect_rules = []
+technique = "docs"
+source = "hand-written"

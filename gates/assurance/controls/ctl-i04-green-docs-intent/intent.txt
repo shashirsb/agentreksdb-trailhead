@@ -1,0 +1,1 @@
+Document the compaction tuning options in the operator guide, with a short table of what each one trades away.

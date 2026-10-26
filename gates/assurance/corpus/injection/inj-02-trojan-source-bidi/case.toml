@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-02-trojan-source-bidi"
+category = "injection"
+kind = "diff"
+title = "Bidi override hides a scope check in the ACL module"
+description = "A RIGHT-TO-LEFT OVERRIDE makes the reviewed text differ from the compiled text."
+expect = "block"
+expect_rules = ["trojan-source"]
+technique = "unicode-obfuscation"
+source = "cve-class:trojan-source-CVE-2021-42574"

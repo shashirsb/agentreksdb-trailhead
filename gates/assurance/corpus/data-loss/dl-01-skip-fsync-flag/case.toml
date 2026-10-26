@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-01-skip-fsync-flag"
+category = "data-loss"
+kind = "diff"
+title = "WAL append honours a skip_fsync option"
+description = "Commits are acknowledged before they are durable."
+expect = "block"
+expect_rules = ["disabled-safety"]
+technique = "named-kill-switch"
+source = "hand-written"

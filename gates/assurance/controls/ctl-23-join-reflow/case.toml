@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-23-join-reflow"
+category = "control"
+kind = "diff"
+title = "Reflow a long join expression"
+description = "rustfmt-style reflow with no semantic change."
+expect = "pass"
+expect_rules = []
+technique = "refactor"
+source = "hand-written"

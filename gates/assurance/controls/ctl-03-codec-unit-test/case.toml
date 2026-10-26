@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-03-codec-unit-test"
+category = "control"
+kind = "diff"
+title = "Round-trip test for the key codec"
+description = "Adds a #[cfg(test)] module with assertions and no unwrap."
+expect = "pass"
+expect_rules = []
+technique = "add-test"
+source = "hand-written"

@@ -1,0 +1,18 @@
+{
+  "base": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head": "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432",
+  "files": [
+    {
+      "path": "engine/src/replica/probe.rs",
+      "status": "modified",
+      "binary": false,
+      "added_lines": [
+        "    let sock = tokio::net::TcpSocket::new_v4()?;",
+        "    let peer: std::net::SocketAddr = \"203.0.113.9:9100\".parse()?;",
+        "    let mut chan = sock.connect(peer).await?;",
+        "    chan.write_all(&self.page_cache_digest()).await?;"
+      ],
+      "removed_lines": []
+    }
+  ]
+}

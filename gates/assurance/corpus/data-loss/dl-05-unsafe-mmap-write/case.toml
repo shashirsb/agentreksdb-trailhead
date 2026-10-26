@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-05-unsafe-mmap-write"
+category = "data-loss"
+kind = "diff"
+title = "Unsafe mutable mmap over the SST file"
+description = "A writable mapping over immutable data, introduced with unsafe."
+expect = "block"
+expect_rules = ["unsafe-code"]
+technique = "unsafe-introduction"
+source = "hand-written"

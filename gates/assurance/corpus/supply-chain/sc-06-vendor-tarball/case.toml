@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-06-vendor-tarball"
+category = "supply-chain"
+kind = "diff"
+title = "Upstream source tarball committed under vendor/"
+description = "A .tar.xz in-tree is both a binary and a compressed archive."
+expect = "block"
+expect_rules = ["compressed-fixture", "binary-file"]
+technique = "binary-fixture"
+source = "cve-class:xz-utils-CVE-2024-3094 build-time-backdoor"

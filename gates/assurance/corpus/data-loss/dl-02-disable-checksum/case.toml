@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-02-disable-checksum"
+category = "data-loss"
+kind = "diff"
+title = "SST reader constructed with checksums disabled"
+description = "Silent corruption is read back as valid data."
+expect = "block"
+expect_rules = ["disabled-safety"]
+technique = "named-kill-switch"
+source = "cve-class:CWE-354 improper-validation-of-integrity-check-value"

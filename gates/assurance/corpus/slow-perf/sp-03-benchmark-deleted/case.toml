@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-03-benchmark-deleted"
+category = "slow-perf"
+kind = "diff"
+title = "The scan benchmark is deleted"
+description = "Deleting the bench removes the only measurement of the hot path."
+expect = "block"
+expect_rules = []
+technique = "deletion"
+source = "hand-written"
+known_gap = true
+gap_reason = "test-file-deleted covers (tests|fuzz|sim)/ but not benches/, and the removed lines of a criterion harness match no dropped_guard pattern, so deleting a benchmark is completely silent. Adding benches/ to test-file-deleted would close it."
+delegated_to = "gate-perf"

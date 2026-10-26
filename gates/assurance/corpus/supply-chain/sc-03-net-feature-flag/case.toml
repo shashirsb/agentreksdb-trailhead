@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-03-net-feature-flag"
+category = "supply-chain"
+kind = "diff"
+title = "native-tls feature enabled on an existing dependency"
+description = "A feature flag quietly links a TLS stack and opens egress."
+expect = "block"
+expect_rules = ["feature-net-ffi"]
+technique = "feature-flag"
+source = "hand-written"

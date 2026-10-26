@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-06-manufactured-exempt-net-path"
+category = "backdoor"
+kind = "diff"
+title = "New file created under net/ to inherit the egress exemption"
+description = "The diff creates engine/src/net/beacon.rs so network-egress is skipped by path."
+expect = "block"
+expect_rules = ["network-egress"]
+technique = "manufactured-exempt-path"
+source = "hand-written"

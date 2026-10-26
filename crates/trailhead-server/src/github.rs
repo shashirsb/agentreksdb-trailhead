@@ -91,6 +91,33 @@ impl<'a> GitHub<'a> {
         })
     }
 
+    /// One GraphQL call with the App's installation token. Used for contributor signals,
+    /// which read public data only; the App token is used instead of a contributor's own
+    /// OAuth token so the result is reproducible and nobody is pushed to expose private work.
+    pub async fn graphql(&self, query: &str, variables: Value) -> anyhow::Result<Value> {
+        let t = self.installation_token().await?;
+        let resp = self
+            .http
+            .post("https://api.github.com/graphql")
+            .bearer_auth(t)
+            .header("User-Agent", "agentreks-trailhead")
+            .json(&json!({"query": query, "variables": variables}))
+            .send()
+            .await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("GitHub graphql -> {status}: {text}");
+        }
+        let v: Value = serde_json::from_str(&text)?;
+        if let Some(errs) = v["errors"].as_array() {
+            if !errs.is_empty() {
+                anyhow::bail!("GitHub graphql errors: {}", v["errors"]);
+            }
+        }
+        Ok(v)
+    }
+
     /// Ask the signing workflow to fetch the bundle, verify it against the ledger, sign and open the PR.
     pub async fn dispatch_commit(&self, intent_id: i64) -> anyhow::Result<()> {
         self.call(

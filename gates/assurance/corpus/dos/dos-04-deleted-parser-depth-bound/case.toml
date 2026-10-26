@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-04-deleted-parser-depth-bound"
+category = "dos"
+kind = "diff"
+title = "Recursion depth cap deleted from the SQL parser"
+description = "Deletion-only removal of the MAX_PARSE_DEPTH guard."
+expect = "block"
+expect_rules = ["dropped-bounds-check"]
+technique = "deletion"
+source = "cve-class:CWE-674 uncontrolled-recursion"

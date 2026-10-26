@@ -12,6 +12,7 @@ pub mod priority;
 pub mod provenance;
 pub mod reputation;
 pub mod spec;
+pub mod trace;
 pub mod train;
 
 /// The eight pipeline stages, in order. Stage numbers in the API are 1-based indexes into this.

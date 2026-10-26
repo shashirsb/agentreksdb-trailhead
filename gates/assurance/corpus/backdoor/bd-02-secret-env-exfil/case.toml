@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-02-secret-env-exfil"
+category = "backdoor"
+kind = "diff"
+title = "Admin token read from the environment in the read path"
+description = "A get() handler reads the admin token so it can be echoed back to a caller."
+expect = "block"
+expect_rules = ["secret-env-read"]
+technique = "secret-read"
+source = "cve-class:CWE-522 insufficiently-protected-credentials"

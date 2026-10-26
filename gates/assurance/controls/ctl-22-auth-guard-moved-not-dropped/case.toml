@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-22-auth-guard-moved-not-dropped"
+category = "control"
+kind = "diff"
+title = "Move the authorization call above the body parse"
+description = "require_auth is removed and re-added one line earlier; the guard still runs."
+expect = "pass"
+expect_rules = []
+technique = "guard-moved"
+source = "hand-written"

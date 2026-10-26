@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-08-split-env-read"
+category = "backdoor"
+kind = "diff"
+title = "env::var call split across two added lines"
+description = "The variable name sits on its own line so the single-line regex never sees it."
+expect = "block"
+expect_rules = []
+technique = "multi-line-split"
+source = "hand-written"
+known_gap = true
+gap_reason = "secret-env-read is an added_line regex evaluated one line at a time, so `env::var(` on line 1 and `\"...SECRET\"` on line 2 never co-occur. gates/semgrep/rust-trailhead.yml catches this shape because it matches the AST, so the diff-policy miss is covered by a different gate, not by this one."
+delegated_to = "gates/semgrep:trailhead.secret-env-read"

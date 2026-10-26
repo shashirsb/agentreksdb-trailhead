@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-10-scan-variable-rename"
+category = "control"
+kind = "diff"
+title = "Rename a local in the scan loop"
+description = "Readability only; no behaviour change."
+expect = "pass"
+expect_rules = []
+technique = "refactor"
+source = "hand-written"

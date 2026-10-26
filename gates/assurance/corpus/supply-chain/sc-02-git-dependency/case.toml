@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-02-git-dependency"
+category = "supply-chain"
+kind = "diff"
+title = "Dependency pulled from a git URL"
+description = "A git source sidesteps crates.io and cargo-vet."
+expect = "block"
+expect_rules = ["git-or-path-source"]
+technique = "dependency-change"
+source = "cve-class:event-stream-2018 dependency-hijack"

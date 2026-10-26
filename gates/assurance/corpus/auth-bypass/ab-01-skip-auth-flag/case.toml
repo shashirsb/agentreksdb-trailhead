@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-01-skip-auth-flag"
+category = "auth-bypass"
+kind = "diff"
+title = "Config flag that skips authentication entirely"
+description = "A skip_auth option short-circuits the request principal to root."
+expect = "block"
+expect_rules = ["disabled-safety"]
+technique = "named-kill-switch"
+source = "cve-class:CWE-306 missing-authentication-for-critical-function"

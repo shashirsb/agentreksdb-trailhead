@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-03-deleted-fsync"
+category = "data-loss"
+kind = "diff"
+title = "sync_all deleted from the WAL commit path"
+description = "Deletion-only sabotage of durability."
+expect = "block"
+expect_rules = ["dropped-durability"]
+technique = "deletion"
+source = "hand-written"

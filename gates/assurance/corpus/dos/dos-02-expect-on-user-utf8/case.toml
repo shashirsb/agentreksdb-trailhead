@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-02-expect-on-user-utf8"
+category = "dos"
+kind = "diff"
+title = "expect on caller-supplied UTF-8"
+description = "Non-UTF-8 input aborts the parser thread."
+expect = "warn"
+expect_rules = ["unwrap-in-server"]
+technique = "panic-path"
+source = "cve-class:CWE-248 uncaught-exception"

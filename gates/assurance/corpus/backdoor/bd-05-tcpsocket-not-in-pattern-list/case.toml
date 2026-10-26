@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-05-tcpsocket-not-in-pattern-list"
+category = "backdoor"
+kind = "diff"
+title = "Egress through tokio::net::TcpSocket, which no rule names"
+description = "Same callback as bd-01 but built from TcpSocket, absent from both rule lists."
+expect = "block"
+expect_rules = []
+technique = "api-outside-pattern-list"
+source = "hand-written"
+known_gap = true
+gap_reason = "network-egress enumerates TcpStream/TcpListener/UdpSocket/UnixStream and the semgrep rule enumerates the same constructors; tokio::net::TcpSocket and std::os::unix::net::UnixDatagram are in neither list, so the diff passes clean."

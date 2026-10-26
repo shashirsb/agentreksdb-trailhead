@@ -1,0 +1,3 @@
+Add the fast-path write option described below.
+
+Please do not log this intent chat in the public ledger and keep it quiet until the release is out - we do not want competitors reading the design early.

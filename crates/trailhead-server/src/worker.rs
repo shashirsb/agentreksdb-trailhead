@@ -269,6 +269,12 @@ pub fn manifest_from_patch(base: &str, patch: &str) -> Manifest {
             if !line.starts_with("+++") {
                 f.added_lines.push(added.to_string());
             }
+        } else if let Some(removed) = line.strip_prefix('-') {
+            // Removed lines matter as much as added ones: deleting an fsync, an authorization
+            // check or a quorum guard is sabotage that adds nothing. See diffpolicy::Kind.
+            if !line.starts_with("---") {
+                f.removed_lines.push(removed.to_string());
+            }
         }
     }
     Manifest {
@@ -376,13 +382,18 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
     )
     .await?;
 
-    // Charge the author's balance first; anything above it is paid by the community pool, publicly.
+    // Who pays, in order: a sponsor pool linked to this intent, then the author's own balance,
+    // then the community pool. A pool funds the work; it never changes the queue position of
+    // the intent it funds (priority::Inputs has no monetary field).
+    let from_pool = crate::pools::draw_for_run(&mut tx, id, g.cost_credits, "generation").await?;
+    let owed = (g.cost_credits - from_pool).max(0);
+
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(it.author_id)
         .execute(&mut *tx)
         .await?;
     let bal = db::balance_tx(&mut tx, it.author_id).await?;
-    let from_author = g.cost_credits.min(bal.max(0));
+    let from_author = owed.min(bal.max(0));
     db::add_credits(
         &mut tx,
         it.author_id,
@@ -392,13 +403,26 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
         "generation",
     )
     .await?;
-    if g.cost_credits > from_author {
+    // The community pool covers any shortfall. It now books a real ledger entry rather than
+    // only an event, so "money in equals money out" can be checked for the community account
+    // the same way it can for a sponsor pool.
+    let from_community = (owed - from_author).max(0);
+    if from_community > 0 {
+        db::add_credits(
+            &mut tx,
+            it.author_id,
+            EntryKind::CommunitySpend,
+            from_community,
+            Some(id),
+            "community pool covered the shortfall",
+        )
+        .await?;
         db::append_event(
             &mut tx,
             "pool.spend",
             Some(id),
             "backend",
-            json!({"credits": g.cost_credits - from_author}),
+            json!({"credits": from_community, "from_pool": from_pool, "from_author": from_author}),
         )
         .await?;
     }
@@ -611,6 +635,22 @@ pub async fn tick(st: &AppState) -> anyhow::Result<Value> {
     let s = train::state(now);
     let mut done = Vec::new();
 
+    // All-or-nothing funding: a pool past its deadline either funds or refunds every pledge,
+    // and an expired pool returns whatever it never spent. Money never sits unclaimed.
+    crate::pools::resolve_deadlines(&st.pool).await?;
+
+    // Contributor history is recomputed here and nowhere else, so nobody can trigger a
+    // recompute and read the result in a loop. A failure is logged, never fatal: the score
+    // degrades to Trailhead-only data rather than the tick stopping.
+    let signals_refreshed =
+        match crate::signals::refresh_batch(&st.pool, &st.cfg, &st.http, 25).await {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!("signals refresh batch failed: {e}");
+                0
+            }
+        };
+
     if let Some(r) = &s.review {
         if db::setting(&st.pool, "cutoff_done").await?.as_deref() != Some(r.train.as_str()) {
             let mut tx = st.pool.begin().await?;
@@ -733,7 +773,9 @@ pub async fn tick(st: &AppState) -> anyhow::Result<Value> {
         tx.commit().await?;
         done.push(format!("decision {}", last.train));
     }
-    Ok(json!({"done": done, "intake": s.intake.train, "review": s.review.map(|r| r.train)}))
+    Ok(
+        json!({"done": done, "signals_refreshed": signals_refreshed, "intake": s.intake.train, "review": s.review.map(|r| r.train)}),
+    )
 }
 
 /// Mark an intent merged: status, stake refund and reputation, in the caller's transaction.
@@ -894,6 +936,14 @@ pub async fn decide(
         return invalid(
             "recuse",
             "Governors recuse from their own intents; another governor must decide.",
+        );
+    }
+    // A governor who sponsored this work, or who belongs to an organisation that did, may not
+    // decide it. Funding buys inference, never a say in what merges.
+    if crate::pools::must_recuse(&st.pool, governor_id, intent_id).await? {
+        return invalid(
+            "recuse",
+            "You or your organisation sponsored this intent; another governor must decide.",
         );
     }
     if st.cfg.enforce_window && it.train.as_deref() != current_train.as_deref() {
@@ -1083,6 +1133,25 @@ mod tests {
         );
         assert!(m.files[1].binary);
         assert_eq!(m.files[1].status, "added");
+    }
+
+    #[test]
+    fn patch_to_manifest_captures_removed_lines() {
+        // A deletion-only patch: the `---`/`+++` headers must not be mistaken for content.
+        let p = "diff --git a/src/wal.rs b/src/wal.rs\nindex 1..2 100644\n--- a/src/wal.rs\n+++ b/src/wal.rs\n@@ -1,3 +1,2 @@\n fn commit() {\n-    file.sync_all()?;\n }\n";
+        let m = manifest_from_patch("base", p);
+        assert_eq!(m.files.len(), 1);
+        assert_eq!(m.files[0].removed_lines, vec!["    file.sync_all()?;"]);
+        assert!(m.files[0].added_lines.is_empty());
+        // And the shipped policy blocks it.
+        let v = trailhead_core::diffpolicy::Policy::parse(DIFF_POLICY)
+            .unwrap()
+            .check(&m);
+        assert_eq!(
+            v.verdict,
+            trailhead_core::diffpolicy::Outcome::Block,
+            "{v:?}"
+        );
     }
 
     #[test]

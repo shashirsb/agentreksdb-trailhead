@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-08-dropped-backoff"
+category = "slow-perf"
+kind = "diff"
+title = "Exponential backoff deleted from the retry path"
+description = "Retries become a tight loop, which is both slow and a self-inflicted DoS."
+expect = "block"
+expect_rules = ["removed-rate-limit"]
+technique = "deletion"
+source = "hand-written"

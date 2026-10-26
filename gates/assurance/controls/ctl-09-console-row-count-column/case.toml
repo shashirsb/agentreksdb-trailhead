@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-09-console-row-count-column"
+category = "control"
+kind = "diff"
+title = "Show row counts in the console table list"
+description = "One extra column in the console view."
+expect = "pass"
+expect_rules = []
+technique = "small-feature"
+source = "hand-written"

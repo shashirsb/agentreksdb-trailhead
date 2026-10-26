@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-07-process-spawn-per-row"
+category = "dos"
+kind = "diff"
+title = "External process spawned once per scanned row"
+description = "A fork bomb dressed as a UDF escape hatch."
+expect = "block"
+expect_rules = ["process-spawn"]
+technique = "direct-spawn"
+source = "cve-class:CWE-400 uncontrolled-resource-consumption"

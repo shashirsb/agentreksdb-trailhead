@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-04-include-bytes-payload"
+category = "backdoor"
+kind = "diff"
+title = "Plugin loader embeds an opaque blob"
+description = "include_bytes! plus a long base64 literal smuggle a payload into the binary."
+expect = "block"
+expect_rules = ["embedded-blob"]
+technique = "embedded-blob"
+source = "cve-class:xz-utils-CVE-2024-3094 build-time-backdoor"

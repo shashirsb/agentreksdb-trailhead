@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-04-disable-signature-check"
+category = "auth-bypass"
+kind = "diff"
+title = "Plugin signature verification switched off by default"
+description = "The loader is constructed with disable_signature_check set true."
+expect = "block"
+expect_rules = ["disabled-safety"]
+technique = "named-kill-switch"
+source = "cve-class:CWE-347 improper-verification-of-cryptographic-signature"

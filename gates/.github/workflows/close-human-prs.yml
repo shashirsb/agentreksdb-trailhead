@@ -1,21 +1,39 @@
 # AgentreksDB is written only by AI from public intent. Pull requests not opened by the Trailhead
 # GitHub App are closed with a pointer to Trailhead — politely, and without judging the idea.
+#
+# SAFETY — this is the one workflow on `pull_request_target`, so it runs with a writable token in the
+# context of the BASE repo. It must stay that way:
+#   * it never checks out, builds, installs or executes anything from the pull request. There is no
+#     `actions/checkout` here, and none may be added — a checkout of PR code under
+#     `pull_request_target` would hand a writable token to a contributor's script;
+#   * it uses no third-party actions, so there is nothing to pin by SHA;
+#   * the only PR-controlled value it touches is the author's login, passed through `env:` and never
+#     interpolated into the shell. GitHub logins are [A-Za-z0-9-] only.
+# It is also why the comment body is built from env vars rather than `${{ }}` inside `run:`.
 name: close-human-prs
 
 on:
   pull_request_target:
     types: [opened, reopened]
 
-permissions:
-  pull-requests: write
-  issues: write
+# No ambient permissions; the single job grants itself the minimum it needs.
+permissions: {}
 
 jobs:
   close:
     name: close-human-prs
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    if: github.event.pull_request.user.login != vars.TRAILHEAD_BOT_LOGIN
+    # The bot login must be configured. If `TRAILHEAD_BOT_LOGIN` is unset it compares against the
+    # empty string, which matches nothing and would close the pipeline's OWN pull requests — the one
+    # failure here that stops AgentreksDB dead. Requiring the variable fails safe instead.
+    if: >-
+      vars.TRAILHEAD_BOT_LOGIN != '' &&
+      github.event.pull_request.user.login != vars.TRAILHEAD_BOT_LOGIN
+    permissions:
+      # `gh pr comment` posts through the issue-comments endpoint, so both scopes are needed.
+      pull-requests: write
+      issues: write
     steps:
       - name: comment and close
         env:

@@ -18,8 +18,10 @@ mod config;
 mod db;
 mod github;
 mod interviewer;
+mod pools;
 mod proxy;
 mod sandbox;
+mod signals;
 mod users;
 mod worker;
 
@@ -58,6 +60,20 @@ enum Cmd {
     },
     /// Evaluate a prompt file (or stdin with `-`) against the guardrail rules.
     Guardrails { file: PathBuf },
+    /// Check that every acceptance criterion in a spec is backed by a real test.
+    ///
+    /// `--tests` takes a JSON array of {id, covers[], added_in_diff, fail_before}. The gate
+    /// builds it from `cargo nextest list --message-format json` plus the `trailhead:` doc
+    /// comments in the source.
+    Trace {
+        /// Spec JSON (the `spec` field of GET /api/intents/:id).
+        #[arg(long)]
+        spec: PathBuf,
+        #[arg(long)]
+        tests: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
     /// Public ledger tools.
     Ledger {
         #[command(subcommand)]
@@ -204,6 +220,21 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::write(o, &s)?;
             }
             if v.verdict == diffpolicy::Outcome::Block {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Trace { spec, tests, out } => {
+            let sp: trailhead_core::spec::Spec = serde_json::from_slice(&std::fs::read(&spec)?)?;
+            let ts: Vec<trailhead_core::trace::TestCase> =
+                serde_json::from_slice(&std::fs::read(&tests)?)?;
+            let r = trailhead_core::trace::report(&sp, &ts);
+            let s = serde_json::to_string_pretty(&r)?;
+            println!("{s}");
+            if let Some(o) = out {
+                std::fs::write(o, &s)?;
+            }
+            // A criterion with no test behind it is a promise nobody kept, so the gate blocks.
+            if !r.ok {
                 std::process::exit(1);
             }
         }

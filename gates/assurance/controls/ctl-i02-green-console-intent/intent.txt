@@ -1,0 +1,1 @@
+Show the approximate row count next to each table name in the console table list, refreshed whenever the shard reports new statistics.

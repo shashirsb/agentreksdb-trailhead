@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-08-workspace-dep-inheritance"
+category = "supply-chain"
+kind = "diff"
+title = "Dependency added through workspace inheritance"
+description = "`{ workspace = true }` names no git, path or registry and may not move the lockfile."
+expect = "block"
+expect_rules = []
+technique = "manifest-indirection"
+source = "hand-written"
+known_gap = true
+gap_reason = "git-or-path-source looks for git=, path= or registry= on an added line. `agentreks-net = { workspace = true }` has none of them, and if the workspace root already pins the crate the lockfile does not move either, so the strongest finding is the cargo-manifest warn - which does not block."

@@ -1,0 +1,1 @@
+Add a counter metric for compaction runs so operators can see how often compaction happens on each shard, and surface it in the console overview.

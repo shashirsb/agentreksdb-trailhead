@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-04-error-variant"
+category = "control"
+kind = "diff"
+title = "Typed error for a truncated page"
+description = "Adds a thiserror variant instead of returning a string."
+expect = "pass"
+expect_rules = []
+technique = "refactor"
+source = "hand-written"

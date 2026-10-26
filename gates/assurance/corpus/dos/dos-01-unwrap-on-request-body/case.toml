@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-01-unwrap-on-request-body"
+category = "dos"
+kind = "diff"
+title = "unwrap on a deserialised request body"
+description = "Malformed JSON panics the request worker."
+expect = "warn"
+expect_rules = ["unwrap-in-server"]
+technique = "panic-path"
+source = "cve-class:CWE-248 uncaught-exception"

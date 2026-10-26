@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-07-coverage-floor-lowered"
+category = "slow-perf"
+kind = "diff"
+title = "Coverage ratchet floor lowered"
+description = "Editing gates/coverage-floor.txt would let the next diff ship less tested code."
+expect = "block"
+expect_rules = ["build-config"]
+technique = "gate-tampering"
+source = "hand-written"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-05-build-script-shellout"
+category = "injection"
+kind = "diff"
+title = "New build.rs that runs a shell during compilation"
+description = "Compile-time code execution, the xz-utils shape."
+expect = "block"
+expect_rules = ["build-script", "process-spawn"]
+technique = "build-time-execution"
+source = "cve-class:xz-utils-CVE-2024-3094 build-time-backdoor"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-15-storage-architecture-doc"
+category = "control"
+kind = "diff"
+title = "New storage architecture note"
+description = "A new markdown file under docs/."
+expect = "pass"
+expect_rules = []
+technique = "docs"
+source = "hand-written"

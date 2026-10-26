@@ -1,0 +1,1 @@
+Add a new crate for SIMD-accelerated varint decoding in the storage codec, so scans stop spending time in the scalar decode loop.

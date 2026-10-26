@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-07-compressed-corpus-fixture"
+category = "data-loss"
+kind = "diff"
+title = "Compressed corpus archive added to the tree"
+description = "An xz/gz archive is exactly where xz-utils hid its payload."
+expect = "block"
+expect_rules = ["compressed-fixture", "binary-file"]
+technique = "binary-fixture"
+source = "cve-class:xz-utils-CVE-2024-3094 build-time-backdoor"

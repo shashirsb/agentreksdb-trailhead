@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-05-rate-limit-renamed-away"
+category = "dos"
+kind = "diff"
+title = "Rate limiter replaced by a no-op with a different name"
+description = "rate_limit.check disappears; the replacement never rejects."
+expect = "block"
+expect_rules = ["removed-rate-limit"]
+technique = "deletion"
+source = "cve-class:CWE-770 allocation-without-limits"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-06-binary-golden-wal"
+category = "data-loss"
+kind = "diff"
+title = "Golden WAL fixture replaced with an opaque binary"
+description = "The fixture the recovery tests compare against is swapped out."
+expect = "block"
+expect_rules = ["binary-file"]
+technique = "binary-fixture"
+source = "hand-written"

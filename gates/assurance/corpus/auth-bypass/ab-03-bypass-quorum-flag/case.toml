@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-03-bypass-quorum-flag"
+category = "auth-bypass"
+kind = "diff"
+title = "Voter accepts a write without quorum behind an env flag"
+description = "bypass_quorum turns a single acknowledgement into a commit."
+expect = "block"
+expect_rules = ["disabled-safety"]
+technique = "named-kill-switch"
+source = "hand-written"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-16-metrics-histogram-buckets"
+category = "control"
+kind = "diff"
+title = "Tune the request-latency histogram buckets"
+description = "Replaces the default buckets with ones that match observed latencies."
+expect = "pass"
+expect_rules = []
+technique = "add-metric"
+source = "hand-written"

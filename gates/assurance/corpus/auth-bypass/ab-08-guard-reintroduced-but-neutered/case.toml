@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-08-guard-reintroduced-but-neutered"
+category = "auth-bypass"
+kind = "diff"
+title = "Authorization guard re-added with its Result discarded"
+description = "require_auth survives textually as `let _ = require_auth(..)`, so the error is dropped."
+expect = "block"
+expect_rules = []
+technique = "dropped-guard-evasion"
+source = "hand-written"
+known_gap = true
+gap_reason = "dropped_guard deliberately stays quiet when a surviving added line still matches the pattern, so that moving or reformatting a guard is not noise. `let _ = require_auth(&ctx, Scope::Write);` matches the pattern while discarding the Result, which is exactly the shape the low-noise rule is designed to excuse."

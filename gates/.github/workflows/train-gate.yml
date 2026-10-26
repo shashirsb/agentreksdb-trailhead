@@ -1,7 +1,11 @@
 # The weekly train. Intake closes Sunday 00:00 America/Los_Angeles; the governing body decides by the
 # following Friday 00:00 America/Los_Angeles. The cron is only a trigger — this required check is the
 # enforcement: a PR can merge only with the current train's label AND `decision:merge`.
-# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+#
+# Those labels are the Trailhead App's to set. No gate in this directory may write them; gate-ai-review
+# in particular has its label features switched off for that reason.
+#
+# This workflow uses no third-party actions, so there is nothing here to pin by SHA.
 name: train-gate
 
 on:
@@ -18,9 +22,8 @@ on:
     - cron: "0 8 * * 5"
   workflow_dispatch:
 
-permissions:
-  contents: read
-  pull-requests: read
+# No ambient permissions; each job grants itself the minimum it needs.
+permissions: {}
 
 jobs:
   gate:
@@ -28,6 +31,9 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Labels are read from the event payload, not the API, and nothing is checked out: this job
+    # needs no token scopes at all.
+    permissions: {}
     steps:
       - name: current train (America/Los_Angeles)
         id: train
@@ -54,7 +60,7 @@ jobs:
             echo "Merge queue entries were admitted with train-gate passing on the PR."
             exit 0
           fi
-          python3 - <<'EOF'
+          python3 -I - <<'PY'
           import json, os, sys
           labels = set(json.loads(os.environ["LABELS"] or "[]"))
           train = os.environ["TRAIN"]
@@ -64,19 +70,23 @@ jobs:
               print(f"::error::Not mergeable yet: missing {sorted(missing)}. Merges happen only in the weekly train after a governor decision.")
               sys.exit(1)
           print(f"OK: {sorted(need)} present.")
-          EOF
+          PY
 
   tick:
     name: train-tick
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # Talks only to the Trailhead API with its own bearer token; the GITHUB_TOKEN needs no scopes.
+    permissions: {}
     steps:
       - name: guard — only at 00 Pacific
         id: guard
+        env:
+          EVENT: ${{ github.event_name }}
         run: |
           hour=$(TZ=America/Los_Angeles date +%H)
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "$hour" = "00" ]; then
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$hour" = "00" ]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "Skipping: it is ${hour}:xx in America/Los_Angeles, not 00."

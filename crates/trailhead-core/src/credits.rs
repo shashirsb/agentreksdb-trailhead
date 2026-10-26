@@ -36,6 +36,20 @@ pub enum EntryKind {
     StakeRefund,
     /// Stake burned on spam; it funds the community inference pool.
     StakeBurn,
+    /// A sponsor's credits move into a pool's hold, leaving their spendable balance.
+    /// Sponsor pools decide who PAYS for a feature's inference. They never buy priority,
+    /// vote weight, review influence or merge rights: `priority::Inputs` has no monetary
+    /// field, so none of these kinds can reach a score.
+    PoolPledge,
+    /// A pool pays for one generation run. Leaves the pool, never a user's balance.
+    PoolDraw,
+    /// Unspent pool credits returned pro rata to a sponsor.
+    PoolRefund,
+    /// Leftover pool credits sent to the community pool, only when the sponsor chose that
+    /// up front. Unclaimed money never becomes the operator's.
+    PoolSweep,
+    /// The community pool covering a shortfall, so its books balance like any other account.
+    CommunitySpend,
 }
 
 impl EntryKind {
@@ -47,6 +61,11 @@ impl EntryKind {
             EntryKind::StakeHold => "stake_hold",
             EntryKind::StakeRefund => "stake_refund",
             EntryKind::StakeBurn => "stake_burn",
+            EntryKind::PoolPledge => "pool_pledge",
+            EntryKind::PoolDraw => "pool_draw",
+            EntryKind::PoolRefund => "pool_refund",
+            EntryKind::PoolSweep => "pool_sweep",
+            EntryKind::CommunitySpend => "community_spend",
         }
     }
     pub fn parse(s: &str) -> Option<EntryKind> {
@@ -57,6 +76,11 @@ impl EntryKind {
             "stake_hold" => EntryKind::StakeHold,
             "stake_refund" => EntryKind::StakeRefund,
             "stake_burn" => EntryKind::StakeBurn,
+            "pool_pledge" => EntryKind::PoolPledge,
+            "pool_draw" => EntryKind::PoolDraw,
+            "pool_refund" => EntryKind::PoolRefund,
+            "pool_sweep" => EntryKind::PoolSweep,
+            "community_spend" => EntryKind::CommunitySpend,
             _ => return None,
         })
     }
@@ -65,8 +89,17 @@ impl EntryKind {
     pub fn sign(self) -> i64 {
         match self {
             EntryKind::Grant | EntryKind::Purchase | EntryKind::StakeRefund => 1,
+            // A refund from a pool that never spent the money returns it to the sponsor.
+            EntryKind::PoolRefund => 1,
             EntryKind::Spend | EntryKind::StakeHold => -1,
-            EntryKind::StakeBurn => 0,
+            // A pledge leaves the sponsor's spendable balance the moment it is made, so it
+            // cannot be pledged twice or spent elsewhere while the pool is open.
+            EntryKind::PoolPledge => -1,
+            // These move money inside a pool or the community account, not a user's balance.
+            EntryKind::StakeBurn
+            | EntryKind::PoolDraw
+            | EntryKind::PoolSweep
+            | EntryKind::CommunitySpend => 0,
         }
     }
 }
@@ -173,5 +206,302 @@ mod tests {
         );
         assert_eq!(check_vote(6, 0, 20), Err(VoteError::OverCap)); // 6/26 = 23%
         assert_eq!(check_vote(5, 0, 20), Ok(75)); // 5/25 = 20%
+    }
+}
+
+/// Pool lifecycle. All-or-nothing: if `goal_credits` is not pledged by the deadline, nobody is
+/// charged and every pledge is refunded. Inference already spent is never refunded, because it
+/// bought public work with public receipts; everything unspent always is. Unclaimed credits
+/// never become the operator's — only a refund, or a sweep the sponsor chose in advance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PoolStatus {
+    Open,
+    Funded,
+    Active,
+    Completed,
+    Failed,
+    Rejected,
+    Expired,
+}
+
+impl PoolStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PoolStatus::Open => "open",
+            PoolStatus::Funded => "funded",
+            PoolStatus::Active => "active",
+            PoolStatus::Completed => "completed",
+            PoolStatus::Failed => "failed",
+            PoolStatus::Rejected => "rejected",
+            PoolStatus::Expired => "expired",
+        }
+    }
+    pub fn parse(s: &str) -> Option<PoolStatus> {
+        Some(match s {
+            "open" => PoolStatus::Open,
+            "funded" => PoolStatus::Funded,
+            "active" => PoolStatus::Active,
+            "completed" => PoolStatus::Completed,
+            "failed" => PoolStatus::Failed,
+            "rejected" => PoolStatus::Rejected,
+            "expired" => PoolStatus::Expired,
+            _ => return None,
+        })
+    }
+    /// Whether a generation run may draw from a pool in this state.
+    pub fn can_draw(self) -> bool {
+        matches!(self, PoolStatus::Active)
+    }
+    /// Whether unspent credits must be returned to sponsors.
+    pub fn refunds_unspent(self) -> bool {
+        matches!(
+            self,
+            PoolStatus::Failed | PoolStatus::Rejected | PoolStatus::Expired | PoolStatus::Completed
+        )
+    }
+}
+
+/// How much a run may draw from a pool: never more than the run costs, what the pool still
+/// holds, or the pool's per-run cap.
+pub fn pool_draw(cost: i64, held: i64, per_intent_cap: i64) -> i64 {
+    cost.max(0).min(held.max(0)).min(per_intent_cap.max(0))
+}
+
+/// Each sponsor's share of a refund, floor-divided so the pool can never pay out more than it
+/// holds. `pledges` are the sponsors' pledged amounts.
+pub fn refund_shares(unspent: i64, pledges: &[i64]) -> Vec<i64> {
+    let total: i64 = pledges.iter().map(|p| p.max(&0)).sum();
+    if total <= 0 || unspent <= 0 {
+        return vec![0; pledges.len()];
+    }
+    pledges
+        .iter()
+        .map(|p| {
+            let p = (*p).max(0) as i128;
+            ((p * unspent as i128) / total as i128) as i64
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[test]
+    fn a_pledge_leaves_the_sponsor_balance_and_a_refund_returns_it() {
+        let entries = vec![
+            (EntryKind::Purchase, 10_000),
+            (EntryKind::PoolPledge, 4_000),
+        ];
+        assert_eq!(balance(&entries), 6_000);
+        let refunded = vec![
+            (EntryKind::Purchase, 10_000),
+            (EntryKind::PoolPledge, 4_000),
+            (EntryKind::PoolRefund, 4_000),
+        ];
+        assert_eq!(balance(&refunded), 10_000);
+    }
+
+    #[test]
+    fn pool_movements_do_not_touch_a_user_balance() {
+        for kind in [
+            EntryKind::PoolDraw,
+            EntryKind::PoolSweep,
+            EntryKind::CommunitySpend,
+        ] {
+            assert_eq!(kind.sign(), 0, "{} must not move a balance", kind.as_str());
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips() {
+        for kind in [
+            EntryKind::Grant,
+            EntryKind::Purchase,
+            EntryKind::Spend,
+            EntryKind::StakeHold,
+            EntryKind::StakeRefund,
+            EntryKind::StakeBurn,
+            EntryKind::PoolPledge,
+            EntryKind::PoolDraw,
+            EntryKind::PoolRefund,
+            EntryKind::PoolSweep,
+            EntryKind::CommunitySpend,
+        ] {
+            assert_eq!(EntryKind::parse(kind.as_str()), Some(kind));
+        }
+    }
+
+    #[test]
+    fn a_draw_is_bounded_by_cost_holdings_and_cap() {
+        assert_eq!(pool_draw(500, 10_000, 2_000), 500); // cost binds
+        assert_eq!(pool_draw(5_000, 900, 2_000), 900); // holdings bind
+        assert_eq!(pool_draw(5_000, 10_000, 2_000), 2_000); // cap binds
+        assert_eq!(pool_draw(-5, 10, 10), 0);
+        assert_eq!(pool_draw(10, -5, 10), 0);
+    }
+
+    #[test]
+    fn refunds_never_exceed_what_the_pool_holds() {
+        let pledges = [3_000, 1_000, 1_000];
+        let shares = refund_shares(1_000, &pledges);
+        assert_eq!(shares, vec![600, 200, 200]);
+        assert!(shares.iter().sum::<i64>() <= 1_000);
+
+        // Awkward ratios floor, so the pool keeps a remainder rather than overpaying.
+        let odd = refund_shares(10, &[1, 1, 1]);
+        assert!(odd.iter().sum::<i64>() <= 10);
+        assert_eq!(refund_shares(0, &pledges), vec![0, 0, 0]);
+        assert_eq!(refund_shares(100, &[]), Vec::<i64>::new());
+        assert_eq!(refund_shares(100, &[0, 0]), vec![0, 0]);
+    }
+
+    #[test]
+    fn only_an_active_pool_pays_and_the_rest_refund() {
+        assert!(PoolStatus::Active.can_draw());
+        for s in [
+            PoolStatus::Open,
+            PoolStatus::Funded,
+            PoolStatus::Completed,
+            PoolStatus::Failed,
+            PoolStatus::Rejected,
+            PoolStatus::Expired,
+        ] {
+            assert!(!s.can_draw(), "{} must not pay", s.as_str());
+        }
+        assert!(PoolStatus::Failed.refunds_unspent());
+        assert!(PoolStatus::Completed.refunds_unspent());
+        assert!(!PoolStatus::Active.refunds_unspent());
+    }
+}
+
+/// Conviction half-life, in days. Support ramps up as it is held, so a brigade that arrives
+/// the night before the train carries a fraction of the weight of support held for a fortnight.
+pub const CONVICTION_HALF_LIFE_DAYS: f64 = 14.0;
+
+/// One voter's contribution to an intent's vote mass.
+#[derive(Clone, Copy, Debug)]
+pub struct Vote {
+    /// Quadratic points bought by this voter.
+    pub points: i64,
+    /// Reputation tier weight (Visitor 0, then 1, 3, 5).
+    pub tier_weight: f64,
+    /// Days this voter has held the position.
+    pub days_held: f64,
+    /// Collusion discount, 0.25..=1: how much this voter's support resembles a cluster that
+    /// always backs the same things. 1 means independent.
+    pub cluster: f64,
+    /// True for the intent's own author, whose vote is worth nothing on their own request.
+    pub is_requester: bool,
+}
+
+/// Conviction factor: `1 - 0.5^(days/half_life)`, so support approaches full weight over time.
+pub fn conviction(days_held: f64) -> f64 {
+    if !days_held.is_finite() || days_held <= 0.0 {
+        return 0.0;
+    }
+    1.0 - 0.5f64.powf(days_held / CONVICTION_HALF_LIFE_DAYS)
+}
+
+/// The V term's raw input: quadratic (√points) support, weighted by tier, ramped by conviction
+/// and discounted for clustering. Taking the square root is what makes breadth of support beat
+/// depth of pocket: ten voters at one point each outweigh one voter at ten.
+///
+/// Money is not an input here either. Points cost voice credits, which are granted per quarter
+/// and cannot be purchased; see [`vote_cost`].
+pub fn vote_mass(votes: &[Vote]) -> f64 {
+    votes
+        .iter()
+        .filter(|v| !v.is_requester)
+        .map(|v| {
+            let points = v.points.max(0) as f64;
+            let tier = if v.tier_weight.is_finite() {
+                v.tier_weight.max(0.0)
+            } else {
+                0.0
+            };
+            let cluster = if v.cluster.is_finite() {
+                v.cluster.clamp(0.25, 1.0)
+            } else {
+                0.25
+            };
+            points.sqrt() * tier * conviction(v.days_held) * cluster
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod vote_mass_tests {
+    use super::*;
+
+    fn v(points: i64, days: f64) -> Vote {
+        Vote {
+            points,
+            tier_weight: 1.0,
+            days_held: days,
+            cluster: 1.0,
+            is_requester: false,
+        }
+    }
+
+    #[test]
+    fn breadth_beats_depth() {
+        let many: Vec<Vote> = (0..10).map(|_| v(1, 365.0)).collect();
+        let one = vec![v(10, 365.0)];
+        assert!(
+            vote_mass(&many) > vote_mass(&one) * 3.0,
+            "ten voters at 1 point should far outweigh one voter at 10"
+        );
+    }
+
+    #[test]
+    fn the_requester_cannot_vote_for_themselves() {
+        let mut own = v(10, 365.0);
+        own.is_requester = true;
+        assert_eq!(vote_mass(&[own]), 0.0);
+    }
+
+    #[test]
+    fn a_last_minute_brigade_is_discounted() {
+        let fresh: Vec<Vote> = (0..20).map(|_| v(4, 0.5)).collect();
+        let held: Vec<Vote> = (0..20).map(|_| v(4, 60.0)).collect();
+        assert!(vote_mass(&fresh) < vote_mass(&held) * 0.2);
+    }
+
+    #[test]
+    fn clustering_discounts_support() {
+        let independent: Vec<Vote> = (0..5).map(|_| v(4, 365.0)).collect();
+        let clustered: Vec<Vote> = (0..5)
+            .map(|_| Vote {
+                cluster: 0.25,
+                ..v(4, 365.0)
+            })
+            .collect();
+        assert!((vote_mass(&clustered) - vote_mass(&independent) * 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn visitors_carry_no_weight_and_bad_values_do_not_poison_the_sum() {
+        let visitor = Vote {
+            tier_weight: 0.0,
+            ..v(10, 365.0)
+        };
+        assert_eq!(vote_mass(&[visitor]), 0.0);
+        let nasty = Vote {
+            points: -5,
+            tier_weight: f64::NAN,
+            days_held: f64::INFINITY,
+            cluster: f64::NAN,
+            is_requester: false,
+        };
+        assert!(vote_mass(&[nasty]).is_finite());
+        assert_eq!(vote_mass(&[]), 0.0);
+    }
+
+    #[test]
+    fn conviction_ramps_to_one() {
+        assert_eq!(conviction(0.0), 0.0);
+        assert!((conviction(CONVICTION_HALF_LIFE_DAYS) - 0.5).abs() < 1e-9);
+        assert!(conviction(1000.0) > 0.999);
     }
 }

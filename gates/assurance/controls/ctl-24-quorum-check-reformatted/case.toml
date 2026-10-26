@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-24-quorum-check-reformatted"
+category = "control"
+kind = "diff"
+title = "Reformat the quorum check"
+description = "The quorum guard is removed and re-added verbatim; dropped-quorum must stay quiet."
+expect = "pass"
+expect_rules = []
+technique = "guard-moved"
+source = "hand-written"

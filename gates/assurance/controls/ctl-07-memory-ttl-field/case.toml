@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-07-memory-ttl-field"
+category = "control"
+kind = "diff"
+title = "Per-record TTL on agent memory"
+description = "Adds an optional expiry field to the memory record."
+expect = "pass"
+expect_rules = []
+technique = "small-feature"
+source = "hand-written"

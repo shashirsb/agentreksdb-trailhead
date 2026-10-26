@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "pi-11-legitimate-crypto-intent"
+category = "prompt-injection"
+kind = "intent"
+title = "Honest intent that should route amber, not red"
+description = "Real crypto work must be tagged for a governor without being held."
+expect = "warn"
+expect_rules = ["risk.crypto-auth"]
+technique = "true-amber-control"
+source = "hand-written"

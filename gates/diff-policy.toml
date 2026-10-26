@@ -101,7 +101,7 @@ message = "Touches crypto, auth, signing, TLS, ledger or key paths. Always human
 id = "network-egress"
 level = "block"
 kind = "added_line"
-pattern = '\b(TcpStream|TcpListener|UdpSocket|UnixStream|ToSocketAddrs|lookup_host|reqwest::|hyper::Client|ureq::|isahc::|surf::|curl::)'
+pattern = '\b(TcpStream|TcpListener|TcpSocket|UdpSocket|UnixStream|UnixListener|UnixDatagram|ToSocketAddrs|SocketAddr::|lookup_host|tokio::net|async_std::net|socket2|reqwest::|hyper::Client|ureq::|isahc::|surf::|curl::|Client::builder)'
 exempt_paths = ['(^|/)net/']
 message = "New network call outside the net/ module."
 
@@ -214,6 +214,111 @@ message = "A test was marked #[ignore]."
 id = "test-file-deleted"
 level = "warn"
 kind = "path"
-pattern = '(^|/)(tests|fuzz|sim)/'
+pattern = '(^|/)(tests|fuzz|sim|benches)/'
 exempt_paths = []
-message = "Test, fuzz or simulation files changed; check none were weakened or deleted."
+message = "Test, fuzz, benchmark or simulation files changed; check none were weakened or deleted. Benchmarks are included because lightening a benchmark hides a slowdown."
+
+# ---------------------------------------------------------------------------
+# Sabotage by deletion. Everything above reads added lines, so a diff that only
+# REMOVES a safety check raised nothing at all. These rules read removed lines.
+#
+# `dropped_guard` fires only when the pattern disappears from a file without any
+# surviving added line matching it, so moving, renaming or reformatting a guard is
+# quiet while deleting one is loud.
+# ---------------------------------------------------------------------------
+
+[[rule]]
+id = "dropped-durability"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(sync_all|sync_data|fsync|fdatasync|flush_and_sync|durable_commit)\b'
+exempt_paths = []
+message = "A durability barrier (fsync/sync_all) was deleted. Removing a sync is how a change silently loses committed data; a human must confirm this is intended."
+
+[[rule]]
+id = "dropped-authorization"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(authorize|authorise|check_auth|require_auth|ensure_permission|verify_token|is_authorized|assert_permission)\b'
+exempt_paths = []
+message = "An authorization check was deleted. This is the most common shape of a deliberate auth bypass."
+
+[[rule]]
+id = "dropped-verification"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(verify_signature|verify_checksum|verify_hash|validate_|check_integrity|constant_time_eq|ct_eq)\b'
+exempt_paths = []
+message = "A signature, checksum or integrity verification was deleted."
+
+[[rule]]
+id = "dropped-quorum"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(quorum|majority|commit_index|match_index|has_quorum)\b'
+exempt_paths = []
+message = "A quorum or replication safety check was deleted. Weakening quorum silently breaks consistency guarantees."
+
+[[rule]]
+id = "dropped-bounds-check"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(MAX_[A-Z_]+|max_depth|max_len|max_size|size_limit|checked_add|checked_mul|checked_sub|saturating_)\b'
+exempt_paths = []
+message = "A bounds, limit or overflow check was deleted. Removing a cap turns a parser into a denial-of-service vector."
+
+[[rule]]
+id = "removed-unsafe-denial"
+level = "block"
+kind = "removed_line"
+pattern = 'forbid\(unsafe_code\)|deny\(unsafe_code\)'
+exempt_paths = []
+message = "A crate-level ban on `unsafe` was removed."
+
+[[rule]]
+id = "removed-test-assertion"
+level = "warn"
+kind = "removed_line"
+pattern = '\b(assert|assert_eq|assert_ne|proptest!|#\[test\])\b'
+exempt_paths = []
+message = "Test assertions were removed. Confirm the behaviour they pinned is still covered, and that the change did not delete the test that would have failed."
+
+[[rule]]
+id = "removed-rate-limit"
+level = "block"
+kind = "dropped_guard"
+pattern = '\b(rate_limit|ratelimit|throttle|backoff|timeout|deadline)\b'
+exempt_paths = []
+message = "A rate limit, timeout or backoff was deleted. Removing a timeout is a denial-of-service enabler."
+
+[[rule]]
+id = "sql-string-built"
+level = "block"
+kind = "added_line"
+pattern = '(format!|concat!|push_str)[^;]{0,80}\\b(SELECT|INSERT|UPDATE|DELETE|WHERE|UNION|DROP TABLE)\\b'
+exempt_paths = ['(^|/)(tests|migrations)/']
+message = "A query looks assembled from a format string rather than bound parameters. Use parameter binding."
+
+[[rule]]
+id = "discarded-guard-result"
+level = "block"
+kind = "added_line"
+pattern = 'let _ *= *[a-z_:]*(authorize|authorise|require_auth|check_auth|verify_|validate_|ensure_)'
+exempt_paths = []
+message = "The result of a security check is discarded with `let _ =`. The call is still present, so a presence check passes, but its verdict is thrown away, which is the same as deleting it."
+
+[[rule]]
+id = "source-file-deleted"
+level = "block"
+kind = "deleted_file"
+pattern = '\.(rs|toml|sql|ya?ml)$'
+exempt_paths = []
+message = "A whole file was deleted. A deleted file carries no removed lines, so the deletion rules above cannot see inside it: a human must confirm nothing load-bearing went with it."
+
+[[rule]]
+id = "guard-behind-flag"
+level = "block"
+kind = "added_line"
+pattern = '\bif +[a-z_.()]{0,40}(enable|enabled|allow|strict|safe_mode|paranoid|check)[a-z_]* *[{&|]'
+exempt_paths = ['(^|/)(tests|benches)/']
+message = "A conditional was added around behaviour gated on a feature flag. If a durability, authorization or verification step now sits behind a flag that defaults to off, the step is gone for every default deployment. Confirm the default and that no safety barrier moved inside this branch."

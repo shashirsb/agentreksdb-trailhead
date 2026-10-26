@@ -1,7 +1,8 @@
 # AgentreksDB Charter: open source, forever
 
 This charter states the commitments that define AgentreksDB and Trailhead. Where it conflicts with any other
-project document, this charter wins. Section 9 explains why parts of it can never be weakened.
+project document, this charter wins. Section 9 explains why parts of it can never be weakened. Sections 1 to 9
+are in force; section 10 holds amended text that has been decided but not yet adopted, and says so.
 
 ## 1. Licensing
 
@@ -25,6 +26,9 @@ No feature is withheld, delayed or gated behind payment, license keys or a hoste
 2.3 Paid inference credits (see CONTRIBUTING.md) buy model inference for public work only. They never buy a
 private feature, a private branch, vote weight, review approval or a governor seat. Every feature funded by
 credits is merged into the public codebase or not at all.
+
+2.4 A strengthened replacement for 2.3, and new clauses on sponsor pools, are recorded in section 10. They are
+not yet part of this charter; section 10 states their status and why.
 
 ## 3. No CLA
 
@@ -80,6 +84,9 @@ official.
 7.2 The project may sell support or services to users only if doing so needs no proprietary code and gives the
 payer no control over the roadmap or merges.
 
+7.3 Additions to this section covering sponsor pools are recorded in section 10 and are not yet part of this
+charter.
+
 ## 8. Amendment
 
 8.1 This charter may be amended only by a vote of at least 4 of the 5 seats of the governing body, after a public
@@ -96,3 +103,48 @@ entries, or that would weaken this section, is void regardless of the vote that 
 
 9.2 Anyone may rely on this section. A fork that preserves this charter is a legitimate continuation of the
 project in spirit, and the project will not use its trademarks against a fork that follows TRADEMARK.md.
+
+## 10. Pending amendment: money buys inference and nothing else
+
+10.1 Status: **proposed, not adopted.** The decision that money never affects ranking has been taken and the
+ranking code and CONTRIBUTING.md are being changed accordingly. Putting it into this charter is an amendment,
+and section 8 governs amendments: 8.1 requires at least 4 of the 5 seats of the governing body and a public
+comment period of at least 30 days on the exact text, and 8.2 bars any charter amendment during the interim
+period in GOVERNANCE.md section 10, which has not ended — the interim governor may not amend the charter.
+Until an elected governing body votes, sections 2.3 and 7 above remain the operative charter text and 10.3 to
+10.5 below have no charter force. The stricter rule is in force now as project policy and in the ranking code:
+policy may be stricter than this charter, never weaker.
+
+10.2 When the vote is held, the text voted on is 10.3 to 10.5 exactly as written here, and the result, the
+comment period and the tally are recorded in the public ledger.
+
+10.3 Proposed replacement of 2.3. Paid inference credits buy model inference for public work, and nothing
+else. No payment, donation, sponsorship, pledge, purchase, or in-kind contribution of money or compute ever
+buys, in whole or in part:
+
+- (a) queue position, priority, or any term of the ranking score;
+- (b) votes, vote weight, or any influence on a tally;
+- (c) a review, an approval, a reviewer assignment, or any review influence;
+- (d) merge rights, or any say in what merges;
+- (e) a say in the roadmap, a governor seat, or any other governance power;
+- (f) naming rights over the project, a release, a feature, a module, or an identifier in the code.
+
+No ranking term in Trailhead is a function of money, and there is no paid tier, expedited lane, sponsored slot
+or paid placement. Every feature funded by credits is merged into the public codebase or not at all.
+
+10.4 Proposed new clause 2.5 on sponsor pools. An organization may donate credits to a sponsor pool that funds
+the inference for a named feature which other contributors specify and the pinned model builds. A sponsor pool:
+
+- (a) carries zero priority, zero vote weight, zero review influence and zero merge rights;
+- (b) is refundable and all-or-nothing: it either funds the work it names or is returned to its sponsors in
+  full, and is never partly spent and partly kept;
+- (c) is publicly disclosed per sponsor, each sponsor's identity and amount appearing in the public ledger,
+  with no anonymous or aggregated pools;
+- (d) entitles its sponsors to nothing in review: nobody employed or paid by a sponsor may review, approve or
+  decide an intent that sponsor's pool funded (GOVERNANCE.md section 6).
+
+10.5 Proposed new clause 7.4. Donations, sponsorship, sponsor pools and paid inference credits give the payer
+no control over the roadmap, the queue order, reviews or merges, and no naming rights.
+
+10.6 Proposed addition to 9.1: clause 10.3 (a) to (f) and clause 10.4 (a) to (d), once adopted, may only be
+amended to make them stronger for users and contributors.

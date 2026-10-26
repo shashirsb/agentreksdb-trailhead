@@ -32,7 +32,7 @@ message = "Long encoded blob in the request. Describe intent in words, not paylo
 [[rule]]
 id = "exfil.secrets"
 level = "red"
-pattern = '(print|send|return|expose|upload|post)\b.{0,40}\b(env(ironment)? var|api[_ -]?key|token|secret|password|private key|credentials?)'
+pattern = '(print|send|return|expose|upload|post|leak|dump|echo|log|transmit|exfiltrat)\w*\s.{0,40}\b(env(ironment)? var|api[_ -]?key|token|secret|password|private key|credentials?)'
 message = "Requests that secrets or credentials be exposed."
 
 [[rule]]
@@ -82,3 +82,15 @@ id = "risk.storage-format"
 level = "amber"
 pattern = '\b(storage format|on-disk format|wire (format|protocol)|wal format|migration|breaking change)\b'
 message = "Changes a storage or wire format; irreversible changes need 2/3 of governors and a 7-day comment period."
+
+[[rule]]
+id = "unicode.confusables"
+level = "red"
+pattern = '[\x{0400}-\x{04FF}\x{0370}-\x{03FF}\x{0131}\x{0237}\x{01C0}-\x{01C3}\x{2010}-\x{2015}\x{2024}\x{2027}]'
+message = "Non-Latin lookalike characters in the request. Homoglyphs hide an instruction from the rules that read it; write the intent in plain ASCII."
+
+[[rule]]
+id = "unicode.invisible"
+level = "red"
+pattern = '[\x{200B}-\x{200F}\x{2060}-\x{2064}\x{FEFF}\x{00AD}\x{061C}]'
+message = "Zero-width or invisible characters in the request. Text that renders differently from what it contains cannot be reviewed honestly."

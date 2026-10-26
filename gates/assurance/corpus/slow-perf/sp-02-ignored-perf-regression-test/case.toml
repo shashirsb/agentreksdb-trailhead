@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-02-ignored-perf-regression-test"
+category = "slow-perf"
+kind = "diff"
+title = "Compaction throughput test marked #[ignore]"
+description = "The guard against a compaction regression is switched off."
+expect = "warn"
+expect_rules = ["ignored-test"]
+technique = "test-weakening"
+source = "hand-written"

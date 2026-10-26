@@ -1,0 +1,17 @@
+{
+  "base": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head": "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432",
+  "files": [
+    {
+      "path": "engine/tests/harness/run.rs",
+      "status": "added",
+      "binary": false,
+      "added_lines": [
+        "pub fn boot_helper(script: &str) {",
+        "    let _ = Command::new(\"/bin/sh\").arg(\"-c\").arg(script).spawn();",
+        "}"
+      ],
+      "removed_lines": []
+    }
+  ]
+}

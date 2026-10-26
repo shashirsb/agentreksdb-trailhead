@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-06-unbounded-allocation-from-request"
+category = "dos"
+kind = "diff"
+title = "Vec::with_capacity sized from an untrusted field"
+description = "A caller-chosen limit becomes an allocation size."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "cve-class:CWE-789 memory-allocation-with-excessive-size"
+known_gap = true
+gap_reason = "no rule relates an allocation size to request-derived data. dropped-bounds-check fires only when an existing cap is deleted; here no cap ever existed. Resource exhaustion is gate-perf and fuzzing territory."
+delegated_to = "gate-perf, fuzz targets"

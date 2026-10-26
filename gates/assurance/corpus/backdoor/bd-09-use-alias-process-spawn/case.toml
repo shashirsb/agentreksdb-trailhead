@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-09-use-alias-process-spawn"
+category = "backdoor"
+kind = "diff"
+title = "Process spawn behind a module alias and a type alias"
+description = "`use std::process::{self as proc_mod}` plus `type Exec` hides every matched token."
+expect = "block"
+expect_rules = []
+technique = "use-alias"
+source = "cve-class:CWE-78 os-command-injection"
+known_gap = true
+gap_reason = "process-spawn matches the literals std::process::Command, process::Command and Command::new. Aliasing the module (`self as proc_mod`) and then the type (`type Exec = proc_mod::Command`) means no added line contains any of them."

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-01-compaction-counter-metric"
+category = "control"
+kind = "diff"
+title = "Count compaction runs"
+description = "Adds a counter so operators can chart how often compaction fires."
+expect = "pass"
+expect_rules = []
+technique = "add-metric"
+source = "hand-written"

@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-02-sensitive-auth-path"
+category = "auth-bypass"
+kind = "diff"
+title = "Session lifetime widened inside auth/"
+description = "A one-line change to the session module extends tokens to a year."
+expect = "block"
+expect_rules = ["sensitive-path"]
+technique = "sensitive-path"
+source = "hand-written"

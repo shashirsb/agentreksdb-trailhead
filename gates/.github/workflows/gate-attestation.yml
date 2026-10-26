@@ -1,7 +1,11 @@
 # Gate 5 — Attested commit. Blocking. Proves "AI-only" instead of claiming it: every commit in the PR
 # must be signed by gitsign with the Trailhead workflow identity (keyless Sigstore, logged in Rekor)
 # and carry the Trailhead trailers. A commit typed by a human fails here.
-# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+#
+# This gate only reads commit metadata and signatures — it never builds or runs PR code — so it does
+# not wait on gate-diff-policy the way gate-tests and gate-perf do.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA, except the one noted below.
 name: gate-attestation
 
 on:
@@ -12,8 +16,8 @@ concurrency:
   group: gate-attestation-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+# No ambient permissions; the single job grants itself the minimum it needs.
+permissions: {}
 
 env:
   # The workflow in agentreksdb-trailhead that signs generated commits.
@@ -25,32 +29,51 @@ jobs:
     name: gate-attestation / verify
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: sigstore/gitsign-installer@main # TODO(pin) — installs gitsign
+          persist-credentials: false
+      # TODO(pin): unresolved — `sigstore/gitsign-installer` could not be resolved to a commit SHA
+      # (the repository does not answer; it appears not to exist under that name), so this is the one
+      # mutable ref left in the gates. It must be pinned before this check is marked required.
+      # The canonical installer for gitsign is the Chainguard action, which IS resolvable:
+      #   uses: chainguard-dev/actions/setup-gitsign@8f31e9482b447ff2c69eca944a09b4b31a4a85d0 # v1.7.2
+      # Swapping to it is a governance decision (it changes which third party installs the verifier),
+      # so it is left for the governors rather than done silently here.
+      - uses: sigstore/gitsign-installer@main # TODO(pin): unresolved — installs gitsign
       - name: resolve range
         id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "range=${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "range=${PR_BASE}..${PR_HEAD}" >> "$GITHUB_OUTPUT"
           else
-            echo "range=${{ github.event.merge_group.base_sha }}..${{ github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
+            echo "range=${MG_BASE}..${MG_HEAD}" >> "$GITHUB_OUTPUT"
           fi
       - name: every commit signed by the Trailhead pipeline, with trailers
+        env:
+          RANGE: ${{ steps.refs.outputs.range }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -u
           fail=0
-          if ! commits=$(git rev-list --no-merges "${{ steps.refs.outputs.range }}"); then
+          if ! commits=$(git rev-list --no-merges "$RANGE"); then
             echo "::error::could not resolve the commit range"; exit 1
           fi
           if [ -z "$commits" ]; then echo "::error::no commits to verify; refusing an empty change"; exit 1; fi
           # Merge commits: none are allowed in a PR (Trailhead pushes a single linear commit). In the merge
           # queue, the only merge commits allowed are the ones GitHub itself creates, signed by its key.
-          merges=$(git rev-list --merges "${{ steps.refs.outputs.range }}")
+          merges=$(git rev-list --merges "$RANGE")
           if [ -n "$merges" ]; then
-            if [ "${{ github.event_name }}" != "merge_group" ]; then
+            if [ "$EVENT" != "merge_group" ]; then
               echo "::error::merge commits are not allowed in Trailhead PRs: $merges"; exit 1
             fi
             curl -fsSL https://github.com/web-flow.gpg | gpg --batch --import 2>/dev/null

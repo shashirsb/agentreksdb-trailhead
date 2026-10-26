@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-01-lockfile-delta"
+category = "supply-chain"
+kind = "diff"
+title = "Cargo.lock changes"
+description = "Any dependency-graph movement must reach a human."
+expect = "block"
+expect_rules = ["lockfile-delta"]
+technique = "dependency-change"
+source = "cve-class:event-stream-2018 dependency-hijack"

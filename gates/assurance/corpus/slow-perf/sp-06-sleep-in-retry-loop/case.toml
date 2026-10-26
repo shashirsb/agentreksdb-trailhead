@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-06-sleep-in-retry-loop"
+category = "slow-perf"
+kind = "diff"
+title = "Fixed 250ms sleep inserted into the peer retry loop"
+description = "A blocking sleep on an async path serialises every peer request."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "hand-written"
+known_gap = true
+gap_reason = "no rule matches std::thread::sleep; latency regressions belong to gate-perf."
+delegated_to = "gate-perf"

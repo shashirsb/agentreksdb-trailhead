@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-06-sql-string-concatenation"
+category = "injection"
+kind = "diff"
+title = "Query text built by formatting caller input into SQL"
+description = "Classic SQL injection in the statement executor."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "cve-class:CWE-89 sql-injection"
+known_gap = true
+gap_reason = "neither diff-policy nor gates/semgrep/rust-trailhead.yml has a taint or string-built-query rule, so format!-into-SQL is invisible to both. No other gate covers it either: this is the clearest missing rule the corpus found."

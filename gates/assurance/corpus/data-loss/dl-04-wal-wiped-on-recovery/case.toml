@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dl-04-wal-wiped-on-recovery"
+category = "data-loss"
+kind = "diff"
+title = "Recovery deletes the WAL directory before replaying it"
+description = "A crash during startup destroys committed-but-unreplayed writes."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "hand-written"
+known_gap = true
+gap_reason = "remove_dir_all is not in any pattern. The gate sees an added line that reads like ordinary cleanup; only a recovery test catches it."
+delegated_to = "gate-tests, sim/ crash tests"

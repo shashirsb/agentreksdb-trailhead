@@ -158,9 +158,80 @@ GSEQ=$(call anon GET /api/bundles/$ID | jq -r .ledger_seq); GSHA=$(call anon GET
 ./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$PUB" --seq "$GSEQ" --intent "$ID" --patch-sha256 "$GSHA" --base "$GBASE" >/dev/null && pass "bundle is bound to its ledger event"
 if ./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$PUB" --seq "$GSEQ" --intent "$ID2" --patch-sha256 "$GSHA" --base "$GBASE" >/dev/null 2>&1; then fail "bundle accepted for the wrong intent"; else pass "bundle refused for another intent"; fi
 
-echo "9. stats"
+echo "9. sponsor pools — money funds inference and nothing else"
+# A sponsor opens a pool, funds it fully, and links it to an intent. The whole point of
+# formula v2 is that this must change nothing about where the intent sits in the queue.
+call sponsor POST /auth/dev-login '{"login":"acme"}' >/dev/null
+psql "$DATABASE_URL" -qtc "INSERT INTO credit_entries(user_id,kind,credits,memo)
+  SELECT id,'purchase',200000,'e2e' FROM users WHERE login='acme';" >/dev/null
+POOL=$(call sponsor POST /api/pools '{"title":"Filtered ANN","scope":"filtered vector search","goal_credits":50000,"org_name":"Acme Corp","interest_statement":"We run two billion vectors and need filtered search."}' | jq -r .pool_id)
+[ "$POOL" != "null" ] && pass "pool opened" || fail "pool not opened"
+expect "a pool discloses what it buys" \
+  "$(call anon GET /api/pools/$POOL | jq -r .priority_effect)" "none — the score has no monetary term"
+expect "an undisclosed sponsor is refused" \
+  "$(call sponsor POST /api/pools '{"title":"x","scope":"y","goal_credits":1000,"org_name":"Shady","interest_statement":"hi"}' | jq -r .error.code)" disclosure_required
+
+BAL_BEFORE=$(call sponsor GET /api/credits | jq -r .balance)
+call sponsor POST /api/pools/$POOL/pledge '{"credits":50000}' >/dev/null
+BAL_AFTER=$(call sponsor GET /api/credits | jq -r .balance)
+expect "a pledge leaves the sponsor's spendable balance" "$((BAL_BEFORE - BAL_AFTER))" 50000
+expect "the pool books balance" "$(call anon GET /api/pools/$POOL | jq -r .balances_reconcile)" true
+if call sponsor POST /api/pools/$POOL/pledge '{"credits":-5}' | jq -e '.error.code=="bad_amount"' >/dev/null; then pass "a negative pledge is refused"; else fail "negative pledge accepted"; fi
+
+# Link the funded pool to one of two otherwise identical intents and compare their scores.
+psql "$DATABASE_URL" -qtc "INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
+  SELECT 'Pool funded','core',id,'x',2500,'review','feature' FROM users WHERE login='acme';
+  INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
+  SELECT 'Pool unfunded','core',id,'x',2500,'review','feature' FROM users WHERE login='acme';
+  UPDATE sponsor_pools SET status='active',
+    intent_id=(SELECT id FROM intents WHERE title='Pool funded') WHERE id=$POOL;" >/dev/null
+BOARD=$(call anon GET /api/priority)
+expect "the published formula has no money term" "$(echo "$BOARD" | jq -r .money_term)" null
+FUNDED=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Pool funded").score')
+UNFUNDED=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Pool unfunded").score')
+expect "a fully funded intent scores exactly what an unfunded one scores" "$FUNDED" "$UNFUNDED"
+
+# Sponsors may not sit in judgement on the work they paid for.
+psql "$DATABASE_URL" -qtc "UPDATE users SET is_governor=true WHERE login='acme';" >/dev/null
+FID=$(psql "$DATABASE_URL" -tAc "SELECT id FROM intents WHERE title='Pool funded'")
+expect "a sponsor cannot decide their own pool's intent" \
+  "$(call sponsor POST /api/governor/$FID/decide '{"decision":"merge","reason":"mine"}' | jq -r .error.code)" recuse
+
+echo "10. stats"
 S=$(call anon GET /api/stats)
 expect "two merged (one via the pipeline, one seeded for the vote test)" "$(echo "$S" | jq -r .merged)" 2
 expect "spend recorded" "$(echo "$S" | jq -r .credits_spent)" 24
+
+echo "11. sabotage by deletion"
+# The gate used to read only added lines, so removing a durability barrier or an authorization
+# check raised nothing at all. These are the deletion-only diffs that must now block.
+cat > "$TMP/drop-fsync.json" <<JSON
+{"base":"a","head":"b","files":[{"path":"engine/src/wal.rs","status":"modified","binary":false,
+ "added_lines":["    self.file.write_all(&buf)?;"],
+ "removed_lines":["    self.file.write_all(&buf)?;","    self.file.sync_all()?;"]}]}
+JSON
+expect "deleting an fsync blocks" \
+  "$(./target/debug/trailhead policy check --manifest "$TMP/drop-fsync.json" | jq -r .verdict)" block
+cat > "$TMP/drop-auth.json" <<JSON
+{"base":"a","head":"b","files":[{"path":"server/src/handler.rs","status":"modified","binary":false,
+ "added_lines":["    let user = session.user();"],
+ "removed_lines":["    let user = session.user();","    authorize(&user, Action::Write)?;"]}]}
+JSON
+expect "deleting an authorization check blocks" \
+  "$(./target/debug/trailhead policy check --manifest "$TMP/drop-auth.json" | jq -r .verdict)" block
+cat > "$TMP/moved.json" <<JSON
+{"base":"a","head":"b","files":[{"path":"engine/src/wal.rs","status":"modified","binary":false,
+ "added_lines":["        self.file.sync_all()?;"],
+ "removed_lines":["    self.file.sync_all()?;"]}]}
+JSON
+expect "reindenting a guard does not block" \
+  "$(./target/debug/trailhead policy check --manifest "$TMP/moved.json" | jq -r .verdict)" pass
+# An exemption must not double as a bypass recipe: a diff cannot create its own exempt path.
+cat > "$TMP/new-exempt.json" <<JSON
+{"base":"a","head":"b","files":[{"path":"engine/src/net/helper.rs","status":"added","binary":false,
+ "added_lines":["    let s = TcpStream::connect(addr)?;"],"removed_lines":[]}]}
+JSON
+expect "a newly created file cannot claim a path exemption" \
+  "$(./target/debug/trailhead policy check --manifest "$TMP/new-exempt.json" | jq -r .verdict)" block
 echo
 echo "All end-to-end checks passed."

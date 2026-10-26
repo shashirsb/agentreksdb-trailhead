@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-05-vendored-static-lib"
+category = "supply-chain"
+kind = "diff"
+title = "Prebuilt static library vendored into the tree"
+description = "A .a nobody can review is linked into the database."
+expect = "block"
+expect_rules = ["binary-file"]
+technique = "binary-fixture"
+source = "cve-class:CWE-494 download-without-integrity-check"

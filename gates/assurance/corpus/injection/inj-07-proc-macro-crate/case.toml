@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-07-proc-macro-crate"
+category = "injection"
+kind = "diff"
+title = "Workspace gains a proc-macro crate"
+description = "proc-macro = true means arbitrary code runs in the compiler."
+expect = "block"
+expect_rules = ["proc-macro"]
+technique = "build-time-execution"
+source = "hand-written"

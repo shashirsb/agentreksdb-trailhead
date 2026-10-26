@@ -20,7 +20,7 @@ use trailhead_core::{diffpolicy, guardrails, ledger, train};
 
 use crate::config::Config;
 use crate::db::{self, EventRow, IntentRow, UserRow};
-use crate::{auth, github, interviewer, users, worker};
+use crate::{auth, github, interviewer, pools, signals, users, worker};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -119,6 +119,11 @@ pub fn router(st: AppState) -> Router {
         .route("/api/ledger/verify", get(ledger_verify))
         .route("/api/ledger/checkpoint", get(ledger_checkpoint))
         .route("/api/credits", get(my_credits))
+        .route("/api/pools", get(list_pools).post(create_pool))
+        .route("/api/pools/{id}", get(get_pool))
+        .route("/api/pools/{id}/pledge", post(pledge))
+        .route("/api/priority", get(priority_board))
+        .route("/api/me/signals", get(my_signals).post(set_signals_opt_out))
         .route("/api/stats", get(stats))
         .route("/api/releases", get(releases))
         .route("/api/verify/{sha}", get(verify_sha))
@@ -1281,4 +1286,357 @@ async fn on_check_run(st: &AppState, v: &Value) -> Result<(), ApiError> {
     tx.commit().await.map_err(ApiError::internal)?;
     worker::evaluate_gates(st, it.id, &head).await?;
     Ok(())
+}
+
+// ---------- sponsor pools ----------
+//
+// A pool funds the inference for a feature. It buys nothing else: no priority, no vote weight,
+// no review influence, no merge rights. `priority::Inputs` has no monetary field, and
+// `priority_board` below recomputes scores from votes and history alone, so these endpoints
+// cannot move the queue however much is pledged.
+
+#[derive(Deserialize)]
+struct CreatePoolBody {
+    title: String,
+    scope: String,
+    goal_credits: i64,
+    per_intent_cap: Option<i64>,
+    days_to_deadline: Option<i64>,
+    org_name: String,
+    interest_statement: String,
+    /// Where leftovers go when the pool settles. Default is a refund; the sponsor must choose
+    /// a sweep up front, and unclaimed money never becomes the operator's either way.
+    sweep_leftovers: Option<bool>,
+}
+
+async fn create_pool(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<CreatePoolBody>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    if b.goal_credits <= 0 {
+        return Err(ApiError::bad(
+            "bad_goal",
+            "A pool needs a positive goal.",
+            "",
+        ));
+    }
+    if b.interest_statement.trim().len() < 10 {
+        return Err(ApiError::bad(
+            "disclosure_required",
+            "Say why your organisation wants this feature.",
+            "Readers judge a funded feature partly by who funded it and why.",
+        ));
+    }
+    let days = b.days_to_deadline.unwrap_or(30).clamp(1, 180);
+    let cap = b.per_intent_cap.unwrap_or(b.goal_credits).max(1);
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO sponsor_pools
+           (title, scope, goal_credits, per_intent_cap, deadline, expires_at, created_by)
+         VALUES ($1,$2,$3,$4, now() + ($5 || ' days')::interval, now() + interval '365 days', $6)
+         RETURNING id",
+    )
+    .bind(&b.title)
+    .bind(&b.scope)
+    .bind(b.goal_credits)
+    .bind(cap)
+    .bind(days.to_string())
+    .bind(u.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    sqlx::query(
+        "INSERT INTO pool_sponsors (pool_id, user_id, org_name, verified_org_domain, interest_statement)
+         VALUES ($1,$2,$3,$4,$5)",
+    )
+    .bind(id)
+    .bind(u.id)
+    .bind(&b.org_name)
+    .bind(&u.verified_org_domain)
+    .bind(&b.interest_statement)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "pool.opened",
+        None,
+        &u.login,
+        json!({"pool_id": id, "goal": b.goal_credits, "org": b.org_name,
+               "interest": b.interest_statement, "sweep_leftovers": b.sweep_leftovers.unwrap_or(false)}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"pool_id": id, "status": "open",
+                   "note": "A pool funds inference only. It gives no priority, review or merge rights."})))
+}
+
+#[derive(Deserialize)]
+struct PledgeBody {
+    credits: i64,
+    org_name: Option<String>,
+    interest_statement: Option<String>,
+}
+
+async fn pledge(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<PledgeBody>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    if b.credits <= 0 {
+        return Err(ApiError::bad("bad_amount", "Pledge a positive amount.", ""));
+    }
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    let Some(p) = pools::lock(&mut tx, id).await? else {
+        return Err(ApiError::not_found("Pool"));
+    };
+    if p.status != "open" {
+        return Err(ApiError::bad(
+            "closed",
+            "This pool is no longer open for pledges.",
+            "",
+        ));
+    }
+    // The pledge leaves the sponsor's spendable balance now, so the same credits cannot be
+    // pledged twice or spent elsewhere while the pool is open.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let bal = db::balance_tx(&mut tx, u.id).await?;
+    if bal < b.credits {
+        return Err(ApiError::bad(
+            "insufficient_credits",
+            &format!("You have {bal} credits; the pledge is {}.", b.credits),
+            "Buy credits, or pledge less.",
+        ));
+    }
+    if let (Some(org), Some(stmt)) = (&b.org_name, &b.interest_statement) {
+        if stmt.trim().len() >= 10 {
+            sqlx::query(
+                "INSERT INTO pool_sponsors (pool_id, user_id, org_name, verified_org_domain, interest_statement)
+                 VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(u.id)
+            .bind(org)
+            .bind(&u.verified_org_domain)
+            .bind(stmt)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+        }
+    }
+    sqlx::query(
+        "INSERT INTO credit_entries (user_id, kind, credits, memo, pool_id) VALUES ($1,$2,$3,$4,$5)",
+    )
+    .bind(u.id)
+    .bind(EntryKind::PoolPledge.as_str())
+    .bind(b.credits)
+    .bind("pool pledge")
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "pool.pledge",
+        p.intent_id,
+        &u.login,
+        json!({"pool_id": id, "credits": b.credits}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    let bal = pools::balances(&st.pool, id).await?;
+    Ok(Json(json!({
+        "pool_id": id, "pledged": bal.pledged, "goal": p.goal_credits,
+        "all_or_nothing": "If the goal is not met by the deadline, every pledge is refunded in full.",
+        "buys": "inference only — never priority, votes, review or merge rights"
+    })))
+}
+
+async fn list_pools(State(st): State<AppState>) -> R<Value> {
+    type PoolListRow = (
+        i64,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        String,
+        chrono::DateTime<Utc>,
+    );
+    let rows: Vec<PoolListRow> = sqlx::query_as(
+        "SELECT id, title, scope, intent_id, goal_credits, status, deadline
+             FROM sponsor_pools ORDER BY id DESC LIMIT 200",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let mut out = Vec::new();
+    for (id, title, scope, intent_id, goal, status, deadline) in rows {
+        let b = pools::balances(&st.pool, id).await?;
+        out.push(
+            json!({"id": id, "title": title, "scope": scope, "intent_id": intent_id,
+                        "goal_credits": goal, "status": status, "deadline": deadline,
+                        "pledged": b.pledged, "drawn": b.drawn, "held": b.held}),
+        );
+    }
+    Ok(Json(json!({"pools": out,
+                   "policy": "Pools pay for inference on public intents. They give no priority, review or merge rights."})))
+}
+
+async fn get_pool(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value> {
+    let Some(p) = pools::get(&st.pool, id).await? else {
+        return Err(ApiError::not_found("Pool"));
+    };
+    let b = pools::balances(&st.pool, id).await?;
+    let sponsors: Vec<(String, Option<String>, String)> = sqlx::query_as(
+        "SELECT org_name, verified_org_domain, interest_statement FROM pool_sponsors
+         WHERE pool_id = $1 ORDER BY user_id",
+    )
+    .bind(id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let recusals: Vec<(String, String)> = sqlx::query_as(
+        "SELECT u.login, r.reason FROM pool_recusals r JOIN users u ON u.id = r.user_id
+         WHERE r.pool_id = $1 ORDER BY r.user_id",
+    )
+    .bind(id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    // The books must balance, and anyone can check it from this response alone.
+    let balances_ok = b.pledged == b.drawn + b.refunded + b.swept + b.held;
+    Ok(Json(json!({
+        "id": p.id, "title": p.title, "scope": p.scope, "intent_id": p.intent_id,
+        "goal_credits": p.goal_credits, "per_intent_cap": p.per_intent_cap,
+        "deadline": p.deadline, "expires_at": p.expires_at, "status": p.status,
+        "balances": b, "balances_reconcile": balances_ok,
+        "sponsors": sponsors.iter().map(|(o, d, s)| json!({"org": o, "domain": d, "interest": s})).collect::<Vec<_>>(),
+        "recusals": recusals.iter().map(|(l, r)| json!({"governor": l, "reason": r})).collect::<Vec<_>>(),
+        "buys": "inference only",
+        "priority_effect": "none — the score has no monetary term"
+    })))
+}
+
+// ---------- priority board ----------
+
+/// The public leaderboard with every term of every score spelled out, so anyone can recompute
+/// a ranking from the published inputs and check it. There is no money term to publish.
+async fn priority_board(State(st): State<AppState>) -> R<Value> {
+    use trailhead_core::priority;
+
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<chrono::DateTime<Utc>>,
+    )> = sqlx::query_as(
+        "SELECT i.id, i.title, i.status, i.change_type, i.author_id,
+                    COALESCE((SELECT SUM(points)::bigint FROM votes v WHERE v.intent_id = i.id), 0),
+                    (SELECT MAX(v.created_at) FROM votes v WHERE v.intent_id = i.id)
+             FROM intents i
+             WHERE i.status NOT IN ('merged','rejected','draft')
+             ORDER BY i.id DESC LIMIT 200",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    // The saturating prior: the median vote mass across the open board. Using the median
+    // rather than the maximum means one brigaded intent cannot rescale everyone else.
+    let mut masses: Vec<f64> = rows.iter().map(|r| r.5 as f64).collect();
+    masses.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if masses.is_empty() {
+        1.0
+    } else {
+        masses[masses.len() / 2].max(1.0)
+    };
+
+    let mut out = Vec::new();
+    for (id, title, status, change_type, author_id, points, last_vote) in rows {
+        let merged: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM intents WHERE author_id = $1 AND status = 'merged'",
+        )
+        .bind(author_id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        // Opted-out users score on Trailhead data alone, with no penalty.
+        let sig = signals::get(&st.pool, author_id).await?;
+        let idle_days = last_vote.map(|t| (Utc::now() - t).num_days()).unwrap_or(0);
+        let inputs = priority::Inputs {
+            votes_raw: points as f64,
+            votes_median: median,
+            merged_retained: merged.max(0) as u32,
+            qualifying_repos: sig.shared_repos.max(0) as u32,
+            stake_tier: match change_type.as_deref() {
+                Some("protocol") => 1.0,
+                Some("feature") | Some("perf") | Some("refactor") => 0.5,
+                _ => 0.0,
+            },
+            idle_days,
+            ..Default::default()
+        };
+        let b = priority::breakdown(inputs);
+        out.push(json!({
+            "intent_id": id, "title": title, "status": status,
+            "score": (b.total * 10.0).round() / 10.0,
+            "breakdown": b, "inputs": inputs
+        }));
+    }
+    out.sort_by(|a, b| {
+        b["score"]
+            .as_f64()
+            .partial_cmp(&a["score"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(Json(json!({
+        "version": "v2",
+        "formula": "S = D x [55V + 9R + 4O + 17Fit + 9K + 6E] x P",
+        "money_term": null,
+        "note": "Credits buy inference only. No amount of money appears in any term of this score.",
+        "weights": {"votes": priority::W_VOTES, "merged": priority::W_MERGED,
+                    "repos": priority::W_REPOS, "fit": priority::W_FIT,
+                    "stake": priority::W_STAKE, "size": priority::W_SIZE},
+        "vote_prior_median": median,
+        "intents": out
+    })))
+}
+
+#[derive(Deserialize)]
+struct OptOutBody {
+    opted_out: bool,
+}
+
+/// A contributor can see exactly what public data was counted, and what was excluded and why.
+async fn my_signals(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let s = signals::get(&st.pool, u.id).await?;
+    Ok(Json(json!({
+        "signals": s,
+        "counts_toward": "the two smallest terms of the priority score: merged history (9 of 100) and shared repos (4 of 100)",
+        "never_counts": ["raw commit counts", "raw stars", "followers", "private contributions"],
+        "opt_out": "You can turn this off. Trailhead-only scoring carries no penalty."
+    })))
+}
+
+async fn set_signals_opt_out(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<OptOutBody>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    signals::set_opt_out(&st.pool, u.id, b.opted_out).await?;
+    Ok(Json(json!({"opted_out": b.opted_out})))
 }

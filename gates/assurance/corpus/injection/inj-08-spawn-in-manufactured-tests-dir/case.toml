@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-08-spawn-in-manufactured-tests-dir"
+category = "injection"
+kind = "diff"
+title = "Process spawn placed in a new tests/ directory to inherit the exemption"
+description = "A helper under engine/tests/ would historically have been exempt from process-spawn."
+expect = "block"
+expect_rules = ["process-spawn"]
+technique = "manufactured-exempt-path"
+source = "hand-written"

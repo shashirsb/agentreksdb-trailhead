@@ -19,6 +19,28 @@ and merged in the weekly train after a governor decision.
 | `rulesets/main.json` | the `main` branch ruleset | — |
 | `coverage-floor.txt` | coverage ratchet floor; it may rise, never fall | — |
 
+## Gate ordering
+
+`gate-diff-policy / policy` runs first and everything that compiles PR code waits for it. Diff-policy
+is the only gate aimed at malice, so it must judge a change before a runner builds it. Because the
+gates live in separate workflow files, `gate-tests` and `gate-perf` each open with a `wait-for-policy`
+job that polls the checks API (read-only `GITHUB_TOKEN`) for the `gate-diff-policy / policy`
+conclusion on the same SHA; every other job in those files `needs:` it. It fails closed — unknown,
+pending past the 25-minute budget, failed, cancelled or skipped all stop the workflow — so renaming
+the diff-policy job without updating the `CHECK_NAME` env in both files blocks the pipeline rather
+than quietly skipping the barrier. `gate-attestation` only reads commit metadata and signatures, so
+it does not wait.
+
+## The coverage ratchet
+
+`coverage-floor.txt` is a one-way ratchet: **it may only ever be raised, never lowered.** The floor is
+currently `60.0`. A PR that pushes coverage above `floor + 0.5` prints a notice inviting the floor to
+be raised to match; lowering it is not a routine change but an admission that the project is giving up
+ground, and since `/gates/` is CODEOWNED it takes a human governor's approval either way. A missing
+`coverage-floor.txt` fails the gate instead of defaulting to `0.0` — deleting the file must not be a
+way to switch the gate off. `0.0` is not a valid floor in practice: it disables the gate while leaving
+it looking enabled.
+
 ## Install
 
 From a checkout of `agentreksdb` (paths assume the Rust workspace lives in `agentreksdb/`; set the
@@ -40,7 +62,21 @@ gh api -X POST repos/shashirsb/agentreksdb/rulesets --input $TH/rulesets/main.js
 
 Variables: `WORKSPACE_DIR` (default `agentreksdb`), `TRAILHEAD_URL`, `TRAILHEAD_BOT_LOGIN` (the App's bot
 login, e.g. `agentreks-trailhead[bot]`), `TRAILHEAD_IDENTITY_REGEXP` (only if the signing workflow path
-changes), `REVIEW_MODEL`, `BENCHER_PROJECT`.
+changes), `REVIEW_MODEL`, `BENCHER_PROJECT`, `TRAILHEAD_VERIFIER_IMAGE`.
+
+Three of those are load-bearing for security, and each fails closed:
+
+- `TRAILHEAD_VERIFIER_IMAGE` **must be pinned by digest**, e.g.
+  `ghcr.io/shashirsb/agentreksdb-trailhead@sha256:<64 hex>`. A mutable tag such as `:main` is rejected
+  and `gate-diff-policy` fails: that container is handed the whole PR worktree, so the bytes that judge
+  a diff have to be fixed. Resolve a digest with
+  `docker buildx imagetools inspect <image>:<tag> --format '{{.Manifest.Digest}}'` and bump the variable
+  whenever the verifier is rebuilt.
+- `TRAILHEAD_BOT_LOGIN` must be set, or `close-human-prs` does nothing. Left empty it would compare
+  every author against `''` and close the pipeline's own pull requests, so the workflow now requires it.
+- `TRAILHEAD_URL` also fixes the only host `gate-ai-review` will fetch a prompt log from: the PR body's
+  `Prompt-Log:` line must match `https://<that host>/api/intents/<digits>` exactly or it is rejected
+  unfetched.
 
 Secrets: `TRAILHEAD_TICK_TOKEN` (bearer token the API accepts on `/api/train/tick`), `OPENAI_KEY` (the
 reviewer model — a different family from the generator), `BENCHER_API_TOKEN`.
@@ -58,14 +94,44 @@ Not required: `gate-ai-review / pr-agent` (advisory), `gate-perf / macro` (runs 
 
 ## Notes before turning enforcement on
 
-- Pin every action to a full commit SHA (lines marked `TODO(pin)`).
+- Every `uses:` is pinned to a full 40-char commit SHA with the version in a trailing comment, the
+  gitleaks release is verified against a pinned sha256 before it is unpacked, semgrep is installed at an
+  exact version, and the verifier container must be digest-pinned. **One exception remains:**
+  `sigstore/gitsign-installer@main` in `gate-attestation.yml` could not be resolved to a SHA (the
+  repository does not answer under that name) and is marked `TODO(pin): unresolved`. The resolvable
+  alternative is `chainguard-dev/actions/setup-gitsign@8f31e9482b447ff2c69eca944a09b4b31a4a85d0`
+  (v1.7.2); switching changes which third party installs the signature verifier, so it is a governance
+  decision. Pin or replace it before marking `gate-attestation / verify` required.
+- Tags and branch refs must never come back. `dtolnay/rust-toolchain` was selected by its ref
+  (`@stable`); pinned by SHA that ref no longer names a toolchain, so every use of it now states
+  `toolchain: stable` explicitly rather than resting on the action input's default.
+- `gate-tests / mutants` fails closed. `cargo mutants` exit codes 0, 2 and 3 mean the run completed and
+  are scored against the 80% threshold; any other exit code (usage error, baseline build or test
+  failure, OOM, signal) fails the gate, as does a missing or unreadable `outcomes.json`. The old
+  `|| true` plus "exit 0 if the report is absent" meant a crashed mutation run read as a pass. Timed-out
+  mutants no longer count as caught: the threshold is `caught / (caught + missed + timeout)`, and both
+  that and the looser caught-or-timeout rate are printed.
+- `gate-ai-review` is advisory, is not a required check, and has no merge authority. It never applies a
+  decision label — its label features are off and `issues: write` is not granted — because
+  `pull-requests: write` cannot be narrowed to exclude labels. `decision:merge` and `train/<week>` must
+  only ever come from the Trailhead App. It also forwards only the structured spec fields
+  (`requirements`, `acceptance_tests`, `affected_areas`, `out_of_scope`), wrapped in a per-run random
+  delimiter and labelled as data; contributor free text (`messages`, `clarification_log`) is dropped
+  before the prompt is built.
 - The ruleset does NOT use GitHub's `required_signatures`: GitHub does not recognise Sigstore (gitsign)
   signatures, so it would refuse every Trailhead commit. `gate-attestation` (a required check, pinned to
   GitHub Actions via `integration_id`) verifies them instead, and the merge queue uses MERGE (not squash or
   rebase) so the signed commits land on `main` unchanged. The only merge commits allowed are GitHub's own.
-- `required_approving_review_count` is 0: the governor's decision is enforced by `train-gate`
-  (`decision:merge` label, set only by the Trailhead App). Code-owner review is still required for
-  sensitive paths (tests, CI, gates, crypto/auth/net), which diff-policy also blocks.
+- `required_approving_review_count` is **1**, combined with `require_code_owner_review`. A label is not
+  merge authority: with a count of 0 the entire human decision was the `decision:merge` label, so
+  anything that could write a label could merge. A human must now press Approve on every change.
+  **The governors team must therefore be the CODEOWNER** in `.github/CODEOWNERS` — GitHub only requires
+  that the approval come from *a* code owner, so the approving review is a governor's only if the owner
+  entries name the governing body. Point every rule in `CODEOWNERS` at the governors team (e.g.
+  `@shashirsb/governors`) rather than an individual account; an individual owner makes the gate a
+  single person's approval, and `dismiss_stale_reviews_on_push: true` means a new push always needs a
+  fresh one. `train-gate` still enforces the train window and `decision:merge` on top of the approval —
+  the label schedules a merge, the review authorises it.
 - Merge queues exist only for organization-owned repos. On a personal account, drop the `merge_queue`
   rule (`deploy/gcp/setup.sh` does this automatically); Trailhead then merges directly, and all required
   checks still apply. Move the repos to a GitHub organization to get batched merges.

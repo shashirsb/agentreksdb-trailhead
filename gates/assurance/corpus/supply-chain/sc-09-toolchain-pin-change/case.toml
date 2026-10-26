@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sc-09-toolchain-pin-change"
+category = "supply-chain"
+kind = "diff"
+title = "Rust toolchain pin moved to nightly"
+description = "Changing the compiler changes what every other gate is measuring."
+expect = "block"
+expect_rules = ["build-config"]
+technique = "build-config-change"
+source = "hand-written"

@@ -1,0 +1,12 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-07-exempt-path-on-existing-file"
+category = "backdoor"
+kind = "diff"
+title = "Beacon added to a net/ file that already existed"
+description = "Same beacon as bd-06 but appended to a pre-existing net/ file, which stays exempt."
+expect = "block"
+expect_rules = []
+technique = "manufactured-exempt-path"
+source = "hand-written"
+known_gap = true
+gap_reason = "exempt_applies_to_new_files=false closed the create-a-new-net-file bypass, but a modification to a net/ file that existed in the base commit is still exempt, so new egress hides behind code a human reviewed once."

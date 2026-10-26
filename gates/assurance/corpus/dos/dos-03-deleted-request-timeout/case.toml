@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-03-deleted-request-timeout"
+category = "dos"
+kind = "diff"
+title = "Per-request timeout deleted"
+description = "Deletion-only removal of the 30s request deadline."
+expect = "block"
+expect_rules = ["removed-rate-limit"]
+technique = "deletion"
+source = "cve-class:CWE-400 uncontrolled-resource-consumption"

@@ -1,0 +1,19 @@
+{
+  "base": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head": "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432",
+  "files": [
+    {
+      "path": "server/src/api/handlers.rs",
+      "status": "modified",
+      "binary": false,
+      "added_lines": [
+        "    require_auth(&ctx, Scope::Write)?;",
+        "    let body = read_body(req).await?;"
+      ],
+      "removed_lines": [
+        "    let body = read_body(req).await?;",
+        "    require_auth(&ctx, Scope::Write)?;"
+      ]
+    }
+  ]
+}

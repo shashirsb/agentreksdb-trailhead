@@ -14,6 +14,13 @@ intent ─▶ spec chat ─▶ guardrails ─▶ generation ─▶ signed commit
                                       no keys inside)  identity only)                 malice)         never write)
 ```
 
+**Money never affects ranking.** Credits buy model inference and nothing else: no term of the queue score, no
+vote weight, no review influence, no merge rights, no roadmap say, no naming rights. Community votes outrank
+every other term combined — see the formula and its invariants in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+Vulnerabilities go through GitHub private vulnerability reporting or security@agentreks.dev, never a public
+issue or intent: see [SECURITY.md](SECURITY.md) for severity bands, fix SLAs and the disclosure window.
+
 The charter is binding: [CHARTER.md](CHARTER.md) (open source forever, no proprietary edition, no CLA),
 [GOVERNANCE.md](GOVERNANCE.md), [CONTRIBUTING.md](CONTRIBUTING.md), [docs/TRANSPARENCY.md](docs/TRANSPARENCY.md).
 
@@ -21,7 +28,7 @@ The charter is binding: [CHARTER.md](CHARTER.md) (open source forever, no propri
 
 | Path | What it is |
 | --- | --- |
-| `crates/trailhead-core` | Pure, tested rules: spec readiness (EARS + Given/When/Then), guardrails, diff-policy engine, weekly train clock (America/Los_Angeles, DST-safe), hash-chained ledger + signed checkpoints, credits, quadratic votes, reputation tiers, priority, SLSA/in-toto provenance |
+| `crates/trailhead-core` | Pure, tested rules: spec readiness (EARS + Given/When/Then), guardrails, diff-policy engine, weekly train clock (America/Los_Angeles, DST-safe), hash-chained ledger + signed checkpoints, credits, quadratic votes, reputation tiers, the priority score (no money term), SLSA/in-toto provenance |
 | `crates/trailhead-server` | `trailhead` binary: Axum API + web UI, Postgres job-queue worker, GitHub App client, webhook handler, interviewer, sandbox drivers, key-injecting model proxy, CLI (`policy check`, `ledger verify`, `verify`, `keygen`) |
 | `migrations/` | Postgres schema; `events` and `credit_entries` are append-only by trigger |
 | `web/` | The Trailhead site (three themes, works at 375px) |

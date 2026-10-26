@@ -5,7 +5,13 @@
 #   tracked in Bencher. Fail rule: t-test against the last 64 main samples (upper boundary 0.99) plus a
 #   hard ceiling of 5% throughput loss and 10% p99 growth; recall@10 must not drop more than 0.5 pp.
 # A claimed speedup in the PR body ("Claims: <bench> -N%") must show up on the named bench.
-# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+#
+# ORDERING: both tiers build and run PR code, so both wait for `gate-diff-policy / policy` to
+# conclude `success` on the same SHA. gate-diff-policy is a separate workflow file, so the
+# dependency is the `wait-for-policy` job below; on schedule/workflow_dispatch runs (main, already
+# merged) there is no PR verdict to wait for and the barrier passes straight through.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA. Never reintroduce a tag or a branch ref.
 name: gate-perf
 
 on:
@@ -19,42 +25,132 @@ concurrency:
   group: gate-perf-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  pull-requests: write
+# No ambient permissions; each job grants itself the minimum it needs.
+permissions: {}
 
 env:
   WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Cross-workflow ordering barrier — identical to the one in gate-tests.yml. Fails closed: an
+  # unknown, pending-forever, failed, cancelled or skipped diff-policy run stops the benchmarks
+  # before this runner builds the change.
+  wait-for-policy:
+    name: gate-perf / wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: require gate-diff-policy / policy = success on this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          CHECK_NAME: gate-diff-policy / policy
+          WAIT_SECONDS: "1500"
+          POLL_SECONDS: "15"
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+          event = os.environ.get("EVENT", "")
+          if event not in ("pull_request", "merge_group"):
+              print(f"event '{event}' does not carry a diff-policy verdict; nothing to wait for.")
+              sys.exit(0)
+
+          repo, sha = os.environ["REPO"], os.environ["SHA"]
+          name, token = os.environ["CHECK_NAME"], os.environ["GH_TOKEN"]
+          deadline = time.time() + float(os.environ["WAIT_SECONDS"])
+          poll = float(os.environ["POLL_SECONDS"])
+          url = (
+              f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs"
+              f"?per_page=100&check_name={urllib.parse.quote(name)}"
+          )
+
+          def check_runs():
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp).get("check_runs", [])
+
+          while True:
+              try:
+                  runs = check_runs()
+              except (urllib.error.URLError, TimeoutError, ValueError) as err:
+                  print(f"checks API query failed ({err}); will retry")
+                  runs = None
+              if runs:
+                  runs.sort(key=lambda r: (r.get("started_at") or "", r.get("id") or 0))
+                  latest = runs[-1]
+                  status, conclusion = latest.get("status"), latest.get("conclusion")
+                  print(f"{name}: status={status} conclusion={conclusion}")
+                  if status == "completed":
+                      if conclusion == "success":
+                          print("diff-policy passed; gate-perf may now build this change.")
+                          sys.exit(0)
+                      print(
+                          f"::error::{name} concluded '{conclusion}' on {sha}. gate-perf will not "
+                          "build or benchmark this change until the diff-policy gate passes."
+                      )
+                      sys.exit(1)
+              elif runs is not None:
+                  print(f"{name} has not reported on {sha} yet; waiting.")
+              if time.time() >= deadline:
+                  print(
+                      f"::error::Timed out waiting for {name} on {sha}. Failing closed: PR code is "
+                      "never built before the diff-policy verdict is in."
+                  )
+                  sys.exit(1)
+              time.sleep(poll)
+          PY
+
   instructions:
     name: gate-perf / instructions
+    needs: wait-for-policy
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+          persist-credentials: false
+      # `@stable` used to name the toolchain through the action's ref. Pinned by SHA the ref carries
+      # no such meaning, so the toolchain is stated explicitly instead of resting on an input default
+      # that a future pin bump could change.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
       - name: install valgrind
         run: sudo apt-get update -y && sudo apt-get install -y valgrind
-      - uses: taiki-e/install-action@v2 # TODO(pin)
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: iai-callgrind-runner
       # Base and PR are measured in the same job (A/B) to cancel runner drift.
       - name: bench base
         working-directory: ${{ env.WORKSPACE_DIR }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git checkout -q "origin/${{ github.base_ref }}"
+          git checkout -q "origin/$BASE_REF"
           cargo bench --locked --bench iai -- --save-baseline=base || echo "no iai bench on base yet"
       # iai-callgrind enforces the limit itself: any benchmark more than +2% instructions (Ir)
       # against the base baseline fails the run.
       - name: bench PR (fail on > 2% instruction regression)
         working-directory: ${{ env.WORKSPACE_DIR }}
+        env:
+          HEAD_SHA: ${{ github.sha }}
         run: |
-          git checkout -q "${{ github.sha }}"
+          git checkout -q "$HEAD_SHA"
           if ! grep -q 'name *= *"iai"' Cargo.toml */Cargo.toml 2>/dev/null; then
             echo "::warning::No iai benchmark target yet; add a [[bench]] named iai to make this gate meaningful."
             exit 0
@@ -63,16 +159,24 @@ jobs:
 
   macro:
     name: gate-perf / macro
+    needs: wait-for-policy
     if: >-
       github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'perf:macro'))
     # One fixed bare-metal box: pinned governor, SMT off, isolcpus, ASLR off.
     runs-on: [self-hosted, perf-bare-metal]
     timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
-      - uses: bencherdev/bencher@main # TODO(pin) — Bencher CLI
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
+      - uses: bencherdev/bencher@bacd5ad380b5895652569ae8f08d089c2f78dbbb # v0.6.9 — Bencher CLI
       - name: build bench binaries (fixed target, fat LTO)
         working-directory: ${{ env.WORKSPACE_DIR }}
         env:
@@ -85,15 +189,17 @@ jobs:
         env:
           BENCHER_API_TOKEN: ${{ secrets.BENCHER_API_TOKEN }}
           BENCHER_PROJECT: ${{ vars.BENCHER_PROJECT || 'agentreksdb' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+          START_POINT: ${{ github.base_ref || 'main' }}
         run: |
-          branch="${{ github.head_ref || github.ref_name }}"
           bencher run \
-            --branch "$branch" \
-            --start-point "${{ github.base_ref || 'main' }}" \
+            --branch "$BRANCH" \
+            --start-point "$START_POINT" \
             --start-point-reset \
             --testbed perf-bare-metal \
             --threshold-measure latency --threshold-test t_test --threshold-max-sample-size 64 --threshold-upper-boundary 0.99 \
             --threshold-measure throughput --threshold-test percentage --threshold-lower-boundary 0.05 \
             --err \
-            --github-actions "${{ secrets.GITHUB_TOKEN }}" \
+            --github-actions "$GH_TOKEN" \
             "./scripts/bench-macro.sh"

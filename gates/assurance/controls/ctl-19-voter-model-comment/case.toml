@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-19-voter-model-comment"
+category = "control"
+kind = "diff"
+title = "Explain the voter's tie-break rule"
+description = "Comment plus a named constant in the consensus module."
+expect = "pass"
+expect_rules = []
+technique = "docs"
+source = "hand-written"

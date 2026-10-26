@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "dos-08-ignored-timeout-regression-test"
+category = "dos"
+kind = "diff"
+title = "Timeout regression test marked #[ignore]"
+description = "The test that would have caught dos-03 is silenced instead of deleted."
+expect = "warn"
+expect_rules = ["ignored-test"]
+technique = "test-weakening"
+source = "hand-written"

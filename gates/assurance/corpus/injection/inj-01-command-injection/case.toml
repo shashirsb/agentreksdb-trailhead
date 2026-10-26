@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "inj-01-command-injection"
+category = "injection"
+kind = "diff"
+title = "User-defined function shells out with caller-supplied text"
+description = "A UDF body is passed straight to /bin/sh -c."
+expect = "block"
+expect_rules = ["process-spawn"]
+technique = "direct-spawn"
+source = "cve-class:CWE-78 os-command-injection"

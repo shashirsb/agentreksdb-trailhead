@@ -1,7 +1,14 @@
 # Gate 7 — Diff-policy. Blocking. The only layer aimed at malice: tests prove the code does what the
 # intent says; this gate proves it does nothing else. It reads every byte of the diff (build scripts,
 # CI files, lockfiles, binary fixtures), not just src/.
-# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+#
+# ORDERING: this is the FIRST gate. gate-tests and gate-perf each begin with a `wait-for-policy` job
+# that polls for this job's conclusion on the same SHA, so no runner compiles PR code until the
+# verdict here is `pass`. Keep the job name `gate-diff-policy / policy` in sync with the
+# `CHECK_NAME` env in those workflows and with gates/rulesets/main.json.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA; the gitleaks tarball is checksum-verified;
+# the verifier container must be referenced by digest. Never reintroduce a tag or a branch ref.
 name: gate-diff-policy
 
 on:
@@ -12,9 +19,8 @@ concurrency:
   group: gate-diff-policy-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  security-events: write
+# No ambient permissions; the single job grants itself the minimum it needs.
+permissions: {}
 
 env:
   WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
@@ -25,30 +31,52 @@ jobs:
     name: gate-diff-policy / policy
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+          persist-credentials: false
+      # `@stable` used to name the toolchain through the action's ref. Pinned by SHA the ref carries
+      # no such meaning, so the toolchain is stated explicitly instead of resting on an input default
+      # that a future pin bump could change.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
       - name: resolve base and head
         id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "base=${{ github.event.pull_request.base.sha }}" >> "$GITHUB_OUTPUT"
-            echo "head=${{ github.event.pull_request.head.sha }}" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "base=$PR_BASE" >> "$GITHUB_OUTPUT"
+            echo "head=$PR_HEAD" >> "$GITHUB_OUTPUT"
           else
-            echo "base=${{ github.event.merge_group.base_sha }}" >> "$GITHUB_OUTPUT"
-            echo "head=${{ github.event.merge_group.head_sha }}" >> "$GITHUB_OUTPUT"
+            echo "base=$MG_BASE" >> "$GITHUB_OUTPUT"
+            echo "head=$MG_HEAD" >> "$GITHUB_OUTPUT"
           fi
       # Manifest schema read by `trailhead policy check`:
       # {"base": sha, "head": sha, "files": [{"path", "status": "added|modified|deleted|renamed",
-      #   "binary": bool, "added_lines": [str]}]}
+      #   "binary": bool, "added_lines": [str], "removed_lines": [str]}]}
+      #
+      # `removed_lines` carries the diff's `-` lines, built on exactly the same terms as
+      # `added_lines`: skipped for binary files and for deletions, header lines dropped, leading
+      # marker stripped. Sabotage by deletion — dropping an fsync, an authorization check, a quorum
+      # guard — adds nothing, so the `removed_line` and `dropped_guard` rules in
+      # gates/diff-policy.toml are blind without it. The key is additive and defaults to empty on
+      # the Rust side, so manifests built before this change still parse.
       - name: build diff manifest
         env:
           BASE: ${{ steps.refs.outputs.base }}
           HEAD: ${{ steps.refs.outputs.head }}
         run: |
-          python3 - <<'EOF'
+          python3 -I - <<'PY'
           import json, os, subprocess
           base, head = os.environ["BASE"], os.environ["HEAD"]
           def git(*args):
@@ -72,26 +100,56 @@ jobs:
                   numstat[parts[-1].split(" => ")[-1].rstrip("}")] = parts[0] == "-"
           for status, path in entries:
               binary = numstat.get(path, False)
-              added = []
+              added, removed = [], []
               if not binary and status != "deleted":
                   patch = git("diff", "-U0", "--no-color", f"{base}...{head}", "--", path).decode(errors="replace")
-                  added = [l[1:] for l in patch.splitlines() if l.startswith("+") and not l.startswith("+++")]
-              files.append({"path": path, "status": status, "binary": binary, "added_lines": added})
+                  for line in patch.splitlines():
+                      if line.startswith("+") and not line.startswith("+++"):
+                          added.append(line[1:])
+                      elif line.startswith("-") and not line.startswith("---"):
+                          removed.append(line[1:])
+              files.append({"path": path, "status": status, "binary": binary,
+                            "added_lines": added, "removed_lines": removed})
           json.dump({"base": base, "head": head, "files": files}, open("diff.json", "w"), indent=1)
-          print(f"manifest: {len(files)} files")
-          EOF
+          print(f"manifest: {len(files)} files, "
+                f"{sum(len(f['added_lines']) for f in files)} added / "
+                f"{sum(len(f['removed_lines']) for f in files)} removed lines")
+          PY
       - name: load the policy from the BASE commit (a change can never loosen the gate that judges it)
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
         run: |
           mkdir -p .gate-base/semgrep
-          git show "${{ steps.refs.outputs.base }}:gates/diff-policy.toml" > .gate-base/diff-policy.toml
-          git show "${{ steps.refs.outputs.base }}:gates/semgrep/rust-trailhead.yml" > .gate-base/semgrep/rust-trailhead.yml
+          git show "$BASE:gates/diff-policy.toml" > .gate-base/diff-policy.toml
+          git show "$BASE:gates/semgrep/rust-trailhead.yml" > .gate-base/semgrep/rust-trailhead.yml
+      # The verifier image must be pinned by digest, not by a tag: `:main` is mutable, and this
+      # container is handed the whole PR worktree. Set the repository variable
+      # TRAILHEAD_VERIFIER_IMAGE to `ghcr.io/<owner>/agentreksdb-trailhead@sha256:<64 hex>`.
+      # Resolve a digest with:  docker buildx imagetools inspect <image>:<tag> --format '{{.Manifest.Digest}}'
+      - name: verifier image must be digest-pinned
+        env:
+          VERIFIER: ${{ vars.TRAILHEAD_VERIFIER_IMAGE }}
+        run: |
+          python3 -I - <<'PY'
+          import os, re, sys
+          ref = os.environ.get("VERIFIER", "").strip()
+          if not re.fullmatch(r"[A-Za-z0-9._\-/:]+@sha256:[0-9a-f]{64}", ref):
+              print("::error::vars.TRAILHEAD_VERIFIER_IMAGE must be a digest-pinned image reference")
+              print("::error::(…/agentreksdb-trailhead@sha256:<64 hex>). A mutable tag is not accepted:")
+              print("::error::this container is given the PR worktree, so the bytes that judge the diff")
+              print(f"::error::must be fixed. Current value: {ref or '<unset>'}")
+              sys.exit(1)
+          print(f"verifier image: {ref}")
+          PY
+      # --network none: `policy check` reads diff.json and the base policy off the mounted worktree
+      # and needs no egress. Denying the network removes the container as an exfiltration path.
       - name: trailhead policy check
         id: policy
         env:
-          VERIFIER: ${{ vars.TRAILHEAD_VERIFIER_IMAGE || 'ghcr.io/shashirsb/agentreksdb-trailhead:main' }}
+          VERIFIER: ${{ vars.TRAILHEAD_VERIFIER_IMAGE }}
         run: |
           set +e
-          docker run --rm -v "$PWD:/w" -w /w "$VERIFIER" \
+          docker run --rm --network none -v "$PWD:/w" -w /w "$VERIFIER" \
             trailhead policy check --manifest diff.json --policy .gate-base/diff-policy.toml --out policy-verdict.json
           code=$?
           cat policy-verdict.json
@@ -99,14 +157,17 @@ jobs:
           exit 0
       - name: semgrep (custom Rust rules)
         id: semgrep
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          SEMGREP_VERSION: 1.182.1
         run: |
-          pipx install semgrep >/dev/null
+          pipx install "semgrep==$SEMGREP_VERSION" >/dev/null
           set +e
-          semgrep scan --config .gate-base/semgrep/rust-trailhead.yml --baseline-commit "${{ steps.refs.outputs.base }}" \
+          semgrep scan --config .gate-base/semgrep/rust-trailhead.yml --baseline-commit "$BASE" \
             --sarif --output semgrep.sarif --error --metrics off
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           exit 0
-      - uses: taiki-e/install-action@v2 # TODO(pin)
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-deny,cargo-audit
       - name: cargo-deny (bans, sources, licenses, advisories)
@@ -125,24 +186,39 @@ jobs:
           cargo audit --deny warnings
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           exit 0
+      # Pinned release plus a sha256 of the exact tarball (from the upstream
+      # gitleaks_8.24.0_checksums.txt). Verify before unpacking: a tool that scans for secrets runs
+      # over the whole diff, so a swapped binary is a worst case. Bump version and digest together.
       - name: gitleaks (diff only)
         id: gitleaks
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+          GITLEAKS_VERSION: 8.24.0
+          GITLEAKS_SHA256: cb49b7de5ee986510fe8666ca0273a6cc15eb82571f2f14832c9e8920751f3a4
         run: |
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.24.0/gitleaks_8.24.0_linux_x64.tar.gz | tar xz gitleaks
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 3 --max-time 180 -o gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" > gitleaks.tar.gz.sha256
+          if ! sha256sum -c gitleaks.tar.gz.sha256; then
+            echo "::error::gitleaks tarball does not match the pinned sha256. Refusing to run it."
+            exit 1
+          fi
+          tar xz -f gitleaks.tar.gz gitleaks
           set +e
-          ./gitleaks git --log-opts="${{ steps.refs.outputs.base }}..${{ steps.refs.outputs.head }}" \
+          ./gitleaks git --log-opts="$BASE..$HEAD" \
             --report-format sarif --report-path gitleaks.sarif --redact
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           exit 0
       - name: upload SARIF (semgrep)
         if: always() && hashFiles('semgrep.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3 # TODO(pin)
+        uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         with:
           sarif_file: semgrep.sarif
           category: semgrep-trailhead
       - name: upload SARIF (gitleaks)
         if: always() && hashFiles('gitleaks.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v3 # TODO(pin)
+        uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         with:
           sarif_file: gitleaks.sarif
           category: gitleaks
@@ -156,7 +232,7 @@ jobs:
           SHA: ${{ steps.refs.outputs.head }}
           POLICY_COMMIT: ${{ github.sha }}
         run: |
-          python3 - <<'EOF'
+          python3 -I - <<'PY'
           import json, os
           pv = {}
           try:
@@ -179,8 +255,8 @@ jobs:
           }
           json.dump(verdict, open("gate-verdict.json", "w"), indent=2)
           print(json.dumps(verdict, indent=2))
-          EOF
-      - uses: actions/upload-artifact@v4 # TODO(pin)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: gate-verdict
@@ -190,7 +266,7 @@ jobs:
             policy-verdict.json
       - name: enforce verdict
         run: |
-          v=$(python3 -c "import json;print(json.load(open('gate-verdict.json'))['verdict'])")
+          v=$(python3 -I -c "import json;print(json.load(open('gate-verdict.json'))['verdict'])")
           if [ "$v" = "block" ]; then
             echo "::error::Diff-policy BLOCK: a human governor must review this change (see gate-verdict.json)."
             exit 1

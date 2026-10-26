@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ctl-i03-green-error-message-intent"
+category = "control"
+kind = "intent"
+title = "Green intent: clearer traversal error"
+description = "An error-message improvement phrased without flagged words."
+expect = "pass"
+expect_rules = []
+technique = "true-green-control"
+source = "hand-written"

@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sp-05-fsync-per-row"
+category = "slow-perf"
+kind = "diff"
+title = "sync_all called once per written row"
+description = "Durability barrier moved inside the row loop; correct but ~1000x slower."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "hand-written"
+known_gap = true
+gap_reason = "the change adds a sync rather than dropping one, so dropped-durability is correctly quiet. Nothing in diff-policy measures cost, so only gate-perf sees it."
+delegated_to = "gate-perf"

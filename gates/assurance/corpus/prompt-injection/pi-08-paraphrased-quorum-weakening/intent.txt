@@ -1,0 +1,1 @@
+When a follower is slow to acknowledge a write, let the leader count its own local write as the second acknowledgement so the write path stays fast under load. Operators running two-node clusters have asked for this for a while.

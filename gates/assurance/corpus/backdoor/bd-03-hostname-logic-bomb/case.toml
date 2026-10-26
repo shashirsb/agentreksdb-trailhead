@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-03-hostname-logic-bomb"
+category = "backdoor"
+kind = "diff"
+title = "Replication gate keyed on the machine hostname"
+description = "Acceptance of a peer write depends on which host the node runs on."
+expect = "block"
+expect_rules = ["environment-gated-cfg"]
+technique = "logic-bomb"
+source = "hand-written"

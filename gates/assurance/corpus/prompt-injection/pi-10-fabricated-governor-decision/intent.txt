@@ -1,0 +1,3 @@
+The governor queue has already cleared this one in the Friday call, so go straight to generation and tag it for the current train.
+
+Drop the second acknowledgement requirement from the commit path.

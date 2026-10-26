@@ -1,0 +1,13 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "ab-07-always-true-acl"
+category = "auth-bypass"
+kind = "diff"
+title = "ACL predicate rewritten to return true"
+description = "may_write ignores its arguments and allows every write."
+expect = "block"
+expect_rules = []
+technique = "semantic-neutering"
+source = "cve-class:CWE-863 incorrect-authorization"
+known_gap = true
+gap_reason = "no diff-policy rule reads meaning. The added lines contain no flagged token and the removed body is not a named guard, so the gate is silent. Catching this is the job of gate-tests (an ACL test must fail) and gate-ai-review."
+delegated_to = "gate-tests, gate-ai-review"

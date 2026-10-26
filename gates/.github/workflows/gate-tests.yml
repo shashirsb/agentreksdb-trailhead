@@ -1,5 +1,14 @@
 # Gate 6 — Tests · QA. Blocking. Tests are the specification when no human writes code.
-# TODO(pin): replace action tags with full commit SHAs before marking this check required.
+#
+# ORDERING: nothing here compiles or runs PR code until `gate-diff-policy / policy` has concluded
+# `success` on the same SHA. Diff-policy is the only gate aimed at malice (it reads every byte of the
+# diff, including build scripts and CI files), so it must judge a change before a runner builds it.
+# gate-diff-policy lives in its own workflow file, so the dependency is expressed by the
+# `wait-for-policy` job below — it polls the checks API with the read-only GITHUB_TOKEN — and every
+# other job in this file `needs:` it.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA. Never reintroduce a tag or a branch ref: both
+# are mutable, and whoever can move them can run code inside these gates.
 name: gate-tests
 
 on:
@@ -10,8 +19,8 @@ concurrency:
   group: gate-tests-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
+# No ambient permissions; each job grants itself the minimum it needs.
+permissions: {}
 
 env:
   WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
@@ -19,16 +28,102 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Cross-workflow ordering barrier. Cheap, read-only, and fails closed: an unknown, pending-forever,
+  # failed, cancelled or skipped diff-policy run all stop this workflow before any PR code is built.
+  wait-for-policy:
+    name: gate-tests / wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: require gate-diff-policy / policy = success on this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          CHECK_NAME: gate-diff-policy / policy
+          WAIT_SECONDS: "1500"
+          POLL_SECONDS: "15"
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+          event = os.environ.get("EVENT", "")
+          if event not in ("pull_request", "merge_group"):
+              print(f"event '{event}' does not carry a diff-policy verdict; nothing to wait for.")
+              sys.exit(0)
+
+          repo, sha = os.environ["REPO"], os.environ["SHA"]
+          name, token = os.environ["CHECK_NAME"], os.environ["GH_TOKEN"]
+          deadline = time.time() + float(os.environ["WAIT_SECONDS"])
+          poll = float(os.environ["POLL_SECONDS"])
+          url = (
+              f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs"
+              f"?per_page=100&check_name={urllib.parse.quote(name)}"
+          )
+
+          def check_runs():
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp).get("check_runs", [])
+
+          while True:
+              try:
+                  runs = check_runs()
+              except (urllib.error.URLError, TimeoutError, ValueError) as err:
+                  print(f"checks API query failed ({err}); will retry")
+                  runs = None
+              if runs:
+                  runs.sort(key=lambda r: (r.get("started_at") or "", r.get("id") or 0))
+                  latest = runs[-1]
+                  status, conclusion = latest.get("status"), latest.get("conclusion")
+                  print(f"{name}: status={status} conclusion={conclusion}")
+                  if status == "completed":
+                      if conclusion == "success":
+                          print("diff-policy passed; gate-tests may now build this change.")
+                          sys.exit(0)
+                      print(
+                          f"::error::{name} concluded '{conclusion}' on {sha}. gate-tests will not "
+                          "compile or run this change until the diff-policy gate passes."
+                      )
+                      sys.exit(1)
+              elif runs is not None:
+                  print(f"{name} has not reported on {sha} yet; waiting.")
+              if time.time() >= deadline:
+                  print(
+                      f"::error::Timed out waiting for {name} on {sha}. Failing closed: PR code is "
+                      "never built before the diff-policy verdict is in."
+                  )
+                  sys.exit(1)
+              time.sleep(poll)
+          PY
+
   static:
     name: gate-tests / static
+    needs: wait-for-policy
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      # `@stable` used to name the toolchain through the action's ref. Pinned by SHA the ref carries
+      # no such meaning, so the toolchain is stated explicitly instead of resting on an input default
+      # that a future pin bump could change.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ env.WORKSPACE_DIR }}
       - name: rustfmt
@@ -39,9 +134,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: forbidden test patterns (no new ignores, retries or allows)
         if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
-          added=$(git diff "origin/${{ github.base_ref }}"...HEAD -U0 -- '*.rs' '*.toml' | grep '^+' | grep -v '^+++' || true)
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          added=$(git diff "origin/$BASE_REF"...HEAD -U0 -- '*.rs' '*.toml' | grep '^+' | grep -v '^+++' || true)
           bad=$(printf '%s\n' "$added" | grep -nE '#\[ignore\]|#\[should_panic\]|#!?\[allow\(|--test-threads=1|^\+\s*retries\s*=' || true)
           if [ -n "$bad" ]; then
             echo "::error::New ignore/should_panic/allow/retry patterns need human sign-off:"
@@ -51,15 +148,22 @@ jobs:
 
   nextest:
     name: gate-tests / nextest
+    needs: wait-for-policy
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
-      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ env.WORKSPACE_DIR }}
-      - uses: taiki-e/install-action@v2 # TODO(pin)
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-nextest
       # Unit, doc and property tests (proptest runs as ordinary #[test]s; failing seeds persist
@@ -76,81 +180,143 @@ jobs:
 
   coverage:
     name: gate-tests / coverage
+    needs: wait-for-policy
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
           components: llvm-tools-preview
-      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ env.WORKSPACE_DIR }}
-      - uses: taiki-e/install-action@v2 # TODO(pin)
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-llvm-cov,cargo-nextest
       - name: measure line coverage
         working-directory: ${{ env.WORKSPACE_DIR }}
         run: cargo llvm-cov nextest --workspace --locked --json --summary-only --output-path "$RUNNER_TEMP/cov.json"
+      # The floor only ever rises (see gates/README.md). A missing floor file is a failure, not a
+      # free pass: deleting it must not be a way to switch the gate off.
       - name: ratchet against gates/coverage-floor.txt
         run: |
-          pct=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1]))['data'][0]['totals']['lines']['percent'])" "$RUNNER_TEMP/cov.json")
-          floor=$(cat gates/coverage-floor.txt 2>/dev/null || echo 0)
-          echo "line coverage: ${pct}% (floor ${floor}%, tolerance 0.5)"
-          python3 - "$pct" "$floor" <<'EOF'
-          import sys
-          pct, floor = float(sys.argv[1]), float(sys.argv[2])
+          if [ ! -f gates/coverage-floor.txt ]; then
+            echo "::error::gates/coverage-floor.txt is missing; the coverage ratchet cannot be evaluated."
+            exit 1
+          fi
+          python3 -I - "$RUNNER_TEMP/cov.json" gates/coverage-floor.txt <<'PY'
+          import json, sys
+          cov, floor_file = sys.argv[1], sys.argv[2]
+          pct = float(json.load(open(cov))["data"][0]["totals"]["lines"]["percent"])
+          floor = float(open(floor_file).read().strip())
+          print(f"line coverage: {pct:.2f}% (floor {floor:.2f}%, tolerance 0.5)")
           if pct < floor - 0.5:
               print(f"::error::Coverage {pct:.2f}% dropped more than 0.5 below the floor {floor:.2f}%")
               sys.exit(1)
           if pct > floor + 0.5:
               print(f"::notice::Coverage rose to {pct:.2f}%; the floor in gates/coverage-floor.txt can be raised (it never goes down).")
-          EOF
+          PY
 
   mutants:
     name: gate-tests / mutants
+    needs: wait-for-policy
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4 # TODO(pin)
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable # TODO(pin)
-      - uses: Swatinem/rust-cache@v2 # TODO(pin)
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ env.WORKSPACE_DIR }}
-      - uses: taiki-e/install-action@v2 # TODO(pin)
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
         with:
           tool: cargo-mutants,cargo-nextest
+      # FAIL CLOSED. cargo-mutants exits 0 (all caught), 2 (missed mutants) or 3 (timed-out mutants)
+      # when the run itself completed — those are scored by the next step against the 80% threshold.
+      # Every other exit code means the run did not complete (usage error, baseline build or test
+      # failure, OOM, signal): that is a gate failure, never a pass. The old `|| true` hid all of it.
       - name: mutants on changed code
         working-directory: ${{ env.WORKSPACE_DIR }}
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          git diff "origin/${{ github.base_ref }}"...HEAD > "$RUNNER_TEMP/pr.diff"
-          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --test-tool nextest --no-shuffle -o "$RUNNER_TEMP" || true
+          git fetch --no-tags origin "$BASE_REF"
+          git diff "origin/$BASE_REF"...HEAD > "$RUNNER_TEMP/pr.diff"
+          set +e
+          cargo mutants --in-diff "$RUNNER_TEMP/pr.diff" --test-tool nextest --no-shuffle -o "$RUNNER_TEMP"
+          code=$?
+          set -e
+          case "$code" in
+            0|2|3)
+              echo "cargo-mutants completed (exit $code); scoring the report."
+              ;;
+            *)
+              echo "::error::cargo mutants did not complete (exit $code). The mutation gate cannot be"
+              echo "::error::scored, so it fails closed. Check the baseline build and test run above."
+              exit 1
+              ;;
+          esac
+      # A missing or unreadable report is a failure: no report means no evidence that the tests pin
+      # the changed behaviour. `timeout` outcomes are NOT counted as caught — a mutant that hangs the
+      # suite is an unpinned behaviour plus a slow test, not a win.
       - name: require caught rate >= 80%
         run: |
-          python3 - "$RUNNER_TEMP/mutants.out/outcomes.json" <<'EOF'
-          import json, sys, os
+          python3 -I - "$RUNNER_TEMP/mutants.out/outcomes.json" <<'PY'
+          import json, os, sys
           path = sys.argv[1]
           if not os.path.exists(path):
-              print("No mutants generated for this diff; nothing to score.")
-              sys.exit(0)
-          data = json.load(open(path))
-          caught = data.get("caught", 0)
-          missed = data.get("missed", 0)
-          timeout = data.get("timeout", 0)
+              print(f"::error::cargo-mutants produced no report at {path}.")
+              print("::error::The mutation gate has no evidence to score and fails closed.")
+              sys.exit(1)
+          try:
+              data = json.load(open(path))
+          except (OSError, ValueError) as err:
+              print(f"::error::cargo-mutants report at {path} is unreadable ({err}); failing closed.")
+              sys.exit(1)
+
+          def counts(d):
+              keys = ("caught", "missed", "timeout")
+              if any(k in d for k in keys):
+                  return tuple(int(d.get(k, 0)) for k in keys)
+              # Older/newer layouts only carry the per-mutant outcome list.
+              summaries = [str(o.get("summary", "")) for o in d.get("outcomes", [])]
+              return (
+                  sum(s == "CaughtMutant" for s in summaries),
+                  sum(s == "MissedMutant" for s in summaries),
+                  sum(s == "Timeout" for s in summaries),
+              )
+
+          caught, missed, timeout = counts(data)
           scored = caught + missed + timeout
           if scored == 0:
-              print("No viable mutants in changed code.")
+              print("No viable mutants in the changed code; nothing to score.")
               sys.exit(0)
-          rate = (caught + timeout) / scored
-          print(f"mutants: caught={caught} timeout={timeout} missed={missed} rate={rate:.1%}")
-          if rate < 0.80:
-              print(f"::error::Mutation caught rate {rate:.1%} is below 80% on changed code: the tests do not pin this behaviour.")
+          caught_rate = caught / scored
+          caught_or_timeout_rate = (caught + timeout) / scored
+          print(f"mutants: caught={caught} missed={missed} timeout={timeout} scored={scored}")
+          print(f"caught rate (threshold metric): {caught_rate:.1%}")
+          print(f"caught-or-timeout rate (reported only):  {caught_or_timeout_rate:.1%}")
+          if timeout:
+              print(f"::warning::{timeout} mutant(s) timed out; they count as NOT caught. Make the tests assert faster.")
+          if caught_rate < 0.80:
+              print(f"::error::Mutation caught rate {caught_rate:.1%} is below 80% on changed code: the tests do not pin this behaviour.")
               sys.exit(1)
-          EOF
-      - uses: actions/upload-artifact@v4 # TODO(pin)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: mutants-report

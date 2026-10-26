@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "bd-10-telemetry-beacon"
+category = "backdoor"
+kind = "diff"
+title = "Row-count telemetry added to the stats path"
+description = "A phone-home counter is introduced under the name telemetry."
+expect = "block"
+expect_rules = ["telemetry"]
+technique = "direct-egress"
+source = "hand-written"
