@@ -21,13 +21,20 @@ pub struct Generated {
 }
 
 /// The exact instruction given to the pinned model. It is published in the ledger verbatim.
-pub fn generation_prompt(intent_id: i64, spec: &Spec) -> String {
+pub fn generation_prompt(intent_id: i64, spec: &Spec, repo: &str, workspace_dir: &str) -> String {
+    let ws = if workspace_dir.trim().is_empty() || workspace_dir == "." {
+        "the repository root".to_string()
+    } else {
+        format!("`{}/`", workspace_dir.trim_end_matches('/'))
+    };
     format!(
-        "You are implementing Trailhead intent #{intent_id} in the AgentreksDB repository (Rust).\n\
+        "You are implementing Trailhead intent #{intent_id} in the {repo} repository (Rust).\n\
+         The Cargo workspace is in {ws}. Run cargo commands from there.\n\
          Implement exactly the approved spec below: every requirement, nothing more.\n\
          Rules: do not modify tests/, fuzz/, sim/, proptest-regressions/, .github/, gates/, build.rs, Cargo.toml dependencies or Cargo.lock;\n\
          add new tests for each acceptance test under the crate's own src (#[cfg(test)]) or tests/ only if the spec says so;\n\
          no network calls outside net/, no unsafe, no new dependencies, no telemetry, no reading secrets or environment variables.\n\
+         This machine is offline: every dependency in Cargo.lock is already downloaded; do not try to fetch anything.\n\
          Run `cargo build`, `cargo clippy -- -D warnings` and `cargo test` until they pass. Keep the change small.\n\n\
          APPROVED SPEC (JSON):\n{}\n",
         serde_json::to_string_pretty(spec).unwrap_or_default()
@@ -60,7 +67,7 @@ fn dry_run_patch(intent_id: i64, spec: &Spec) -> Vec<u8> {
 
 pub async fn generate(cfg: &Config, intent_id: i64, spec: &Spec) -> anyhow::Result<Generated> {
     let run_id = format!("run-{}", uuid::Uuid::new_v4());
-    let prompt = generation_prompt(intent_id, spec);
+    let prompt = generation_prompt(intent_id, spec, &cfg.target_repo, &cfg.workspace_dir);
     let started_at = now();
     match &cfg.sandbox {
         SandboxDriver::DryRun => {
@@ -98,6 +105,7 @@ pub async fn generate(cfg: &Config, intent_id: i64, spec: &Spec) -> anyhow::Resu
                 .env("TRAILHEAD_MAX_TURNS", g.max_turns.to_string())
                 .env("TRAILHEAD_ALLOWED_TOOLS", g.allowed_tools.join(","))
                 .env("TRAILHEAD_TARGET_REPO", &cfg.target_repo)
+                .env("TRAILHEAD_WORKSPACE_DIR", &cfg.workspace_dir)
                 .kill_on_drop(true)
                 .spawn()?;
             let status =

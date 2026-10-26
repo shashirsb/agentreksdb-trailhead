@@ -9,6 +9,11 @@
 #    model could have tampered with) over the pristine checkout and diff against the recorded base.
 #    The sandbox's own out/base and out/patch are ignored.
 #
+# Dependencies: the sandbox has no internet, so the host downloads every crate in the target's Cargo.lock
+# first (a separate, networked container that runs no project code: `cargo fetch` executes no build
+# scripts) into a persistent cache, and copies the downloaded archives into the run. The lockfile is the
+# one on main, and diff-policy blocks dependency changes, so the copy is always sufficient.
+#
 # This Docker profile is the small-deployment default. For untrusted public traffic, replace the
 # `docker run` with a Firecracker microVM (one kernel per run); the contract is the same.
 set -euo pipefail
@@ -21,6 +26,21 @@ mkdir -p "$HOST" "$RUN/out"
 git clone --quiet --depth 1 "https://github.com/${TRAILHEAD_TARGET_REPO}.git" "$HOST/pristine"
 BASE=$(git -C "$HOST/pristine" rev-parse HEAD)
 cp -a "$HOST/pristine" "$RUN/repo"
+
+WS="${TRAILHEAD_WORKSPACE_DIR:-.}"
+# Must live under the runs directory: it is the only host path the Trailhead container shares with the
+# Docker daemon at the same location, so both `docker run -v` and the copy below see the same files.
+CACHE="${TRAILHEAD_CARGO_CACHE:-$(dirname "$RUN")/.cargo-cache}"
+mkdir -p "$CACHE" "$RUN/cargo/registry"
+if [ -f "$HOST/pristine/$WS/Cargo.lock" ]; then
+  docker run --rm -u 0 --network bridge --cap-drop ALL --cap-add DAC_OVERRIDE --security-opt no-new-privileges \
+    -v "$HOST/pristine:/src:ro" -v "$CACHE:/cargo" -e CARGO_HOME=/cargo \
+    --entrypoint cargo "$IMAGE" fetch --locked --manifest-path "/src/$WS/Cargo.toml" >/dev/null
+  # Archives and index only (~80 MB for AgentreksDB); the sandbox unpacks them into its own copy,
+  # so nothing it does can touch the shared cache.
+  cp -a "$CACHE/registry/cache" "$CACHE/registry/index" "$RUN/cargo/registry/"
+  [ -d "$CACHE/git" ] && cp -a "$CACHE/git" "$RUN/cargo/" || true
+fi
 # The sandbox runs as an unprivileged user; let it write the run directory (and nothing else on the host).
 chmod -R a+rwX "$RUN"
 DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null || echo "$IMAGE")
@@ -38,6 +58,8 @@ docker run --rm \
   -e ANTHROPIC_BASE_URL=http://model-proxy:8888 \
   -e ANTHROPIC_API_KEY="$TRAILHEAD_PROXY_TOKEN" \
   -e CARGO_NET_OFFLINE=true \
+  -e CARGO_HOME=/run/trailhead/cargo \
+  -e TRAILHEAD_WORKSPACE_DIR="$WS" \
   -e ANTHROPIC_MODEL="$TRAILHEAD_MODEL_ID" \
   -e ANTHROPIC_SMALL_FAST_MODEL="$TRAILHEAD_MODEL_ID" \
   -e ANTHROPIC_DEFAULT_HAIKU_MODEL="$TRAILHEAD_MODEL_ID" \
@@ -53,5 +75,6 @@ find "$HOST/pristine" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
 ( cd "$HOST/pristine" && git add -A && git diff --cached --binary ) > "$RUN/out/patch"
 echo "$BASE" > "$RUN/out/base"
 echo "$DIGEST" > "$RUN/out/image_digest"
-rm -rf "$HOST"
+# Keep the outputs (patch, transcript, cost); drop the bulky build state.
+rm -rf "$HOST" "$RUN/cargo" "$RUN/repo"
 exit $STATUS

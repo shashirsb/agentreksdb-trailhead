@@ -47,6 +47,8 @@ pub struct Config {
     pub github_installation_id: Option<String>,
     pub webhook_secret: Option<String>,
     pub target_repo: String,
+    /// Where the Cargo workspace lives inside the target repo ("." or e.g. "agentreksdb").
+    pub workspace_dir: String,
     pub trailhead_repo: String,
     pub bot_login: String,
     pub tick_token: Option<String>,
@@ -109,6 +111,7 @@ impl Config {
             webhook_secret: env("GITHUB_WEBHOOK_SECRET"),
             target_repo: env("TRAILHEAD_TARGET_REPO")
                 .unwrap_or_else(|| "shashirsb/agentreksdb".into()),
+            workspace_dir: env("TRAILHEAD_WORKSPACE_DIR").unwrap_or_else(|| ".".into()),
             trailhead_repo: env("TRAILHEAD_REPO")
                 .unwrap_or_else(|| "shashirsb/agentreksdb-trailhead".into()),
             bot_login: env("TRAILHEAD_BOT_LOGIN")

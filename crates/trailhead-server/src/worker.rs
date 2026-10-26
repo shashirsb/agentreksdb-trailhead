@@ -313,7 +313,7 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
             Some(id),
             "backend",
             json!({"model_id": st.cfg.agent.generation.model_id, "harness": st.cfg.agent.generation.harness,
-                   "prompt": sandbox::generation_prompt(id, &spec), "spec_hash": sha256_hex(&spec_bytes)}),
+                   "prompt": sandbox::generation_prompt(id, &spec, &st.cfg.target_repo, &st.cfg.workspace_dir), "spec_hash": sha256_hex(&spec_bytes)}),
         )
         .await?;
         tx.commit().await?;
