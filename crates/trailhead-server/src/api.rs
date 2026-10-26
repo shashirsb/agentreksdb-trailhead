@@ -120,6 +120,7 @@ pub fn router(st: AppState) -> Router {
         .route("/api/ledger/checkpoint", get(ledger_checkpoint))
         .route("/api/credits", get(my_credits))
         .route("/api/stats", get(stats))
+        .route("/api/releases", get(releases))
         .route("/api/verify/{sha}", get(verify_sha))
         .route("/api/bundles/{id}", get(bundle))
         .route("/api/webhooks/github", post(webhook))
@@ -954,6 +955,76 @@ async fn stats(State(st): State<AppState>) -> R<Value> {
         "kill_switch": db::setting(&st.pool, "kill_switch").await?.as_deref() == Some("on"),
         "train": s.review.map(|r| r.train).unwrap_or(s.intake.train),
         "model_id": st.cfg.agent.generation.model_id,
+        "target_repo": st.cfg.target_repo,
+        "target_repo_url": format!("https://github.com/{}", st.cfg.target_repo),
+    })))
+}
+
+/// Release notes: one release per weekly train, listing what the governor merged (and how many
+/// branches were held or declined), with links into the target repo.
+async fn releases(State(st): State<AppState>) -> R<Value> {
+    type Row = (
+        String,
+        i64,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<i64>,
+        String,
+        String,
+        chrono::DateTime<Utc>,
+    );
+    let merged: Vec<Row> = sqlx::query_as(
+        "SELECT d.train, i.id, i.title, i.area, u.login, i.commit_sha, i.pr_number, d.reason, d.governor, d.created_at
+         FROM decisions d JOIN intents i ON i.id = d.intent_id JOIN users u ON u.id = i.author_id
+         WHERE d.decision = 'merge' AND i.status = 'merged' AND d.train <> ''
+         ORDER BY d.train DESC, d.created_at",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let others: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT train, decision, count(*) FROM decisions WHERE decision <> 'merge' AND train <> '' GROUP BY train, decision",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let repo = format!("https://github.com/{}", st.cfg.target_repo);
+    let mut trains: Vec<String> = merged
+        .iter()
+        .map(|r| r.0.clone())
+        .chain(others.iter().map(|o| o.0.clone()))
+        .collect();
+    trains.sort();
+    trains.dedup();
+    trains.reverse();
+    let out: Vec<Value> = trains
+        .iter()
+        .map(|t| {
+            let changes: Vec<Value> = merged
+                .iter()
+                .filter(|r| &r.0 == t)
+                .map(|r| {
+                    json!({
+                        "intent_id": r.1, "title": r.2, "area": r.3, "author": r.4,
+                        "commit_sha": r.5, "commit_url": r.5.as_ref().filter(|c| c.len() >= 7 && c.as_str() != "simulated").map(|c| format!("{repo}/commit/{c}")),
+                        "pr_number": r.6, "pr_url": r.6.map(|n| format!("{repo}/pull/{n}")),
+                        "reason": r.7, "governor": r.8, "merged_at": r.9,
+                    })
+                })
+                .collect();
+            let count = |k: &str| others.iter().filter(|o| &o.0 == t && o.1 == k).map(|o| o.2).sum::<i64>();
+            json!({"train": t, "version": format!("v0.{}", t.replace("-W", ".w")), "changes": changes,
+                   "held": count("hold"), "declined": count("reject")})
+        })
+        .collect();
+    Ok(Json(json!({
+        "target_repo": st.cfg.target_repo,
+        "repo_url": repo,
+        "download_zip": format!("{repo}/archive/refs/heads/main.zip"),
+        "clone": format!("git clone {repo}.git"),
+        "releases": out,
     })))
 }
 

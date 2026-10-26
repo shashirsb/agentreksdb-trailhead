@@ -317,6 +317,18 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
 @keyframes revealtrail{to{transform:scaleY(1)}}
 @keyframes spin{to{transform:rotate(360deg)}}
 @keyframes twinkle{0%,100%{opacity:.3}50%{opacity:1}}
+
+/* releases */
+.codebox{padding:20px;margin-bottom:18px}
+.codebox h3{margin:4px 0 6px;font-size:20px;overflow-wrap:anywhere}
+.clone{margin:14px 0 0;padding:10px 12px;border:2px dashed var(--line);border-radius:10px;background:var(--surface-2);overflow-x:auto;font-family:"JetBrains Mono",monospace;font-size:13px}
+:root[data-brand="blueprint"] .clone{border-radius:0}
+.release{padding:20px;margin-bottom:16px}
+.rel-h{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+.rel-h h3{font-size:22px;margin:0}
+.rel-list{list-style:none;padding:0;margin:12px 0 0;display:grid;gap:12px}
+.rel-list li{border-left:4px solid var(--teal);padding:4px 0 4px 12px}
+.rel-r{font-size:13.5px;margin-top:3px}.rel-l{font-size:13px;margin-top:4px}
 </style>
 </head>
 <body>
@@ -344,9 +356,11 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
       <a href="#home" data-v="home">Home</a>
       <a href="#portal" data-v="portal">Portal</a>
       <a href="#train" data-v="train">Train</a>
+      <a href="#releases" data-v="releases">Releases</a>
       <a href="#ledger" data-v="ledger">Ledger</a>
       <a href="#how" data-v="how">How it works</a>
       <a href="#charter" data-v="charter">Charter</a>
+      <a id="navCode" href="https://github.com/shashirsb/agentreksdb-trailhead-helloworld" target="_blank" rel="noopener" title="The code Trailhead builds, on GitHub">Code ↗</a>
       <a href="#governor" data-v="governor" id="navGov" hidden>Governor</a>
     </nav>
     <a class="btn primary sm hide-sm" href="#portal/new">Request a feature</a>
@@ -442,6 +456,15 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
   <div class="wrap">
     <div class="sec-head"><p class="eyebrow">The weekly train</p><h2>Cutoff Sunday, decision Friday.</h2><p>Every new merge request joins the next train. At Sunday 00:00 Pacific the train closes; the governing body then has until Friday 00:00 Pacific to check, review, and merge each branch or put it on hold. Silence is a hold, never a merge.</p></div>
     <div id="trainBody"></div>
+  </div>
+</section>
+
+<!-- RELEASES -->
+<section class="view" id="v-releases" hidden>
+  <div class="wrap">
+    <div class="sec-head"><p class="eyebrow">Releases</p><h2>What each train delivered.</h2><p>Every Friday the governing body closes a train. Each release lists the changes it merged, who asked for them, why the governor approved them, and links to the signed commit and pull request. Held and declined branches are counted too.</p></div>
+    <div id="relCode"></div>
+    <div id="relBody"></div>
   </div>
 </section>
 
@@ -698,7 +721,9 @@ function renderHome(){
       '<div class="card stat"><div class="v">'+num(s.open)+'</div><div class="l">Open intents</div></div>'+
       '<div class="card stat"><div class="v">'+num(s.in_review)+'</div><div class="l">In review</div></div>'+
       '<div class="card stat"><div class="v">'+num(s.merged)+'</div><div class="l">Merged all-time</div></div>'+
-      '<div class="card stat"><div class="v">'+num(s.credits_staked)+'</div><div class="l">Credits staked · '+num(s.credits_spent)+' spent</div></div></div>';
+      '<div class="card stat"><div class="v">'+num(s.credits_staked)+'</div><div class="l">Credits staked · '+num(s.credits_spent)+' spent</div></div></div>'+
+      (s.target_repo_url?'<div class="cta-row" style="margin:-4px 0 18px"><a class="btn" href="'+esc(s.target_repo_url)+'" target="_blank" rel="noopener">Get the code: '+esc(s.target_repo)+' ↗</a><a class="btn ghost" href="#releases">Release notes</a></div>':'');
+    if(s.target_repo_url){var nc=$("navCode");if(nc)nc.href=s.target_repo_url;}
   },function(e){$("homeStats").innerHTML=errBox(e);});
   api("/api/train").then(function(t){TRAIN=t;drawHomeTrain(t);},function(e){drawHomeTrain(null,e);});
 }
@@ -708,6 +733,41 @@ function drawHomeTrain(t,e){
     '<div><p class="eyebrow">Next cutoff'+(g.intakeTrain?' · train '+esc(g.intakeTrain):'')+'</p><div class="cd" data-countdown="'+g.cutoff+'">'+countdownText(g.cutoff)+'</div><div class="cd-l">until Sunday 00:00 Pacific</div><div class="cd-t">'+esc(fmtPt(g.cutoff))+'</div></div>'+
     '<div><p class="eyebrow">Next decision'+(g.reviewTrain?' · train '+esc(g.reviewTrain):'')+'</p><div class="cd" data-countdown="'+g.decision+'">'+countdownText(g.decision)+'</div><div class="cd-l">until Friday 00:00 Pacific · '+(g.phase==="review"?"review in progress":"intake open")+'</div><div class="cd-t">'+esc(fmtPt(g.decision))+'</div></div>'+
   '</div>';
+}
+
+
+/* ---------- releases + get the code ---------- */
+function codePanel(r){
+  return '<div class="card codebox">'+
+    '<div><p class="eyebrow">Get the code</p><h3>'+esc(r.target_repo)+'</h3>'+
+    '<p class="muted">The code Trailhead builds. Every change in it after the seed commit was written by the pinned model from a public intent and signed by the pipeline.</p></div>'+
+    '<div class="cta-row" style="margin-top:12px">'+
+      '<a class="btn primary" href="'+esc(r.repo_url)+'" target="_blank" rel="noopener">View on GitHub ↗</a>'+
+      '<a class="btn" href="'+esc(r.download_zip)+'">Download ZIP</a>'+
+    '</div>'+
+    '<pre class="clone"><code>'+esc(r.clone)+'</code></pre>'+
+  '</div>';
+}
+function releaseCard(rel){
+  var items=rel.changes.length?rel.changes.map(function(c){
+    var links=[];
+    if(c.pr_url) links.push('<a href="'+esc(c.pr_url)+'" target="_blank" rel="noopener">PR #'+esc(c.pr_number)+'</a>');
+    if(c.commit_url) links.push('<a class="mono" href="'+esc(c.commit_url)+'" target="_blank" rel="noopener">'+esc(String(c.commit_sha).slice(0,10))+'</a>');
+    links.push('<a href="#i'+esc(c.intent_id)+'">intent #'+esc(c.intent_id)+'</a>');
+    return '<li><div class="rel-t"><b>'+esc(c.title)+'</b> <span class="muted">· '+esc(c.area)+' · requested by '+esc(c.author)+'</span></div>'+
+      '<div class="muted rel-r">Governor '+esc(c.governor)+': “'+esc(c.reason)+'”</div><div class="rel-l">'+links.join(' · ')+'</div></li>';
+  }).join(""):'<li class="muted">Nothing merged in this train.</li>';
+  return '<div class="card release"><div class="rel-h"><h3>'+esc(rel.version)+'</h3><span class="pill st-merged">train '+esc(rel.train)+'</span></div>'+
+    '<p class="muted">'+rel.changes.length+' merged · '+rel.held+' held · '+rel.declined+' declined</p><ul class="rel-list">'+items+'</ul></div>';
+}
+function renderReleases(){
+  $("relCode").innerHTML="";
+  $("relBody").innerHTML=loading("Loading releases…");
+  api("/api/releases").then(function(r){
+    $("relCode").innerHTML=codePanel(r);
+    $("relBody").innerHTML=r.releases.length?r.releases.map(releaseCard).join(""):
+      '<div class="card empty">No releases yet. The first one is published when the governing body closes its first train (Friday 00:00 Pacific). Follow it on the <a href="#train">Train</a> page.</div>';
+  },function(e){$("relBody").innerHTML=errBox(e);});
 }
 
 /* ---------- portal ---------- */
@@ -1031,7 +1091,7 @@ $("verifyBtn").onclick=function(){
 };
 
 /* ---------- routing ---------- */
-var VIEWS=["home","portal","intent","train","governor","ledger","how","charter"];
+var VIEWS=["home","portal","intent","train","releases","governor","ledger","how","charter"];
 function show(v){
   VIEWS.forEach(function(x){$("v-"+x).hidden=(x!==v);});
   Array.prototype.forEach.call(document.querySelectorAll("#nav a"),function(a){a.classList.toggle("active",a.dataset.v===v||(v==="intent"&&a.dataset.v==="portal"));});
@@ -1045,6 +1105,7 @@ function route(){
   show(h);window.scrollTo(0,0);
   if(h==="home") renderHome();
   else if(h==="train") renderTrain();
+  else if(h==="releases") renderReleases();
   else if(h==="governor") renderGovernor();
   else if(h==="ledger") renderLedger(false);
 }
@@ -1061,6 +1122,7 @@ window.addEventListener("hashchange",route);
 })();
 
 renderUser();
+api("/api/stats").then(function(s){var nc=$("navCode");if(nc&&s.target_repo_url)nc.href=s.target_repo_url;},function(){});
 loadMe().then(route,route);
 })();
 </script>
