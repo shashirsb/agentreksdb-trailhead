@@ -265,7 +265,10 @@ pub async fn turn(
                 .ok()
                 .and_then(|v| v["error"]["message"].as_str().map(String::from))
                 .unwrap_or_else(|| text_body.chars().take(300).collect());
-            anyhow::bail!("anthropic {status}: {msg} (model {})", cfg.agent.chat.model_id);
+            anyhow::bail!(
+                "anthropic {status}: {msg} (model {})",
+                cfg.agent.chat.model_id
+            );
         }
         let resp: Value = serde_json::from_str(&text_body)?;
         let text = resp["content"][0]["text"].as_str().unwrap_or_default();
