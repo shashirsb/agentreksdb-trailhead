@@ -260,7 +260,7 @@ ok "secrets stored in Secret Manager (readable only by the VM's service account)
 META="trailhead-repo=$TRAILHEAD_REPO,backup-bucket=$BUCKET"
 if gcloud compute instances describe "$VM" --zone="$ZONE" >/dev/null 2>&1; then
   gcloud compute instances add-metadata "$VM" --zone="$ZONE" --metadata="$META" \
-    --metadata-from-file=startup-script="$HERE/startup.sh" >/dev/null
+    --metadata-from-file=startup-script="$HERE/boot.sh" >/dev/null
   gcloud compute instances reset "$VM" --zone="$ZONE" >/dev/null
   ok "VM updated and restarted"
 else
@@ -269,7 +269,7 @@ else
     --boot-disk-size=30GB --boot-disk-type=pd-standard \
     --address="$IP" --tags=trailhead \
     --service-account="$SA" --scopes=cloud-platform \
-    --metadata="$META" --metadata-from-file=startup-script="$HERE/startup.sh" >/dev/null
+    --metadata="$META" --metadata-from-file=startup-script="$HERE/boot.sh" >/dev/null
   ok "VM $VM (e2-micro, free tier) created"
 fi
 

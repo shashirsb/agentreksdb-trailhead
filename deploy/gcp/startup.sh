@@ -64,4 +64,7 @@ find /var/backups/trailhead -name 'trailhead-*.sql.gz' -mtime +7 -delete
 BACKUP
 chmod 755 /usr/local/bin/trailhead-backup
 echo '20 3 * * * root /usr/local/bin/trailhead-backup >> /var/log/trailhead-backup.log 2>&1' > /etc/cron.d/trailhead-backup
-echo "=== trailhead up"
+# Development mode: deploy every push to main automatically (see update.sh). Remove this cron entry
+# to go back to manual releases.
+echo '*/2 * * * * root /opt/trailhead/deploy/gcp/update.sh' > /etc/cron.d/trailhead-update
+echo "=== trailhead up (auto-update every 2 minutes)"
