@@ -305,7 +305,24 @@ ok "ledger public key $PUBKEY"
 bold "9. Lock the test repo's main branch with the Trailhead ruleset"
 if ! gh api "repos/$TARGET_REPO/rulesets" -q '.[].name' 2>/dev/null | grep -q .; then
   read -r -p "   Apply gates/rulesets/main.json to $TARGET_REPO now (no human pushes to main after this)? [y/N] " yn
-  [ "$yn" = "y" ] && gh api -X POST "repos/$TARGET_REPO/rulesets" --input "$HERE/../../gates/rulesets/main.json" >/dev/null && ok "ruleset applied"
+  if [ "$yn" = "y" ]; then
+    # Merge queues exist only for organization-owned repos; on a personal account drop that rule
+    # (Trailhead then merges directly, and every required check still applies).
+    rs="$STATE/ruleset.json"
+    python3 - "$HERE/../../gates/rulesets/main.json" "$rs" "$(gh api "users/$OWNER" -q .type)" <<'PY'
+import json, sys
+src, out, owner_type = sys.argv[1:]
+r = json.load(open(src))
+if owner_type != "Organization":
+    r["rules"] = [x for x in r["rules"] if x["type"] != "merge_queue"]
+json.dump(r, open(out, "w"), indent=2)
+PY
+    if gh api -X POST "repos/$TARGET_REPO/rulesets" --input "$rs" >/dev/null 2>"$STATE/ruleset.err"; then
+      ok "ruleset applied"
+    else
+      printf '   \033[33m!\033[0m ruleset not applied: %s\n' "$(cat "$STATE/ruleset.err")"
+    fi
+  fi
 else
   ok "a ruleset already exists"
 fi

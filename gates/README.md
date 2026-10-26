@@ -66,6 +66,9 @@ Not required: `gate-ai-review / pr-agent` (advisory), `gate-perf / macro` (runs 
 - `required_approving_review_count` is 0: the governor's decision is enforced by `train-gate`
   (`decision:merge` label, set only by the Trailhead App). Code-owner review is still required for
   sensitive paths (tests, CI, gates, crypto/auth/net), which diff-policy also blocks.
+- Merge queues exist only for organization-owned repos. On a personal account, drop the `merge_queue`
+  rule (`deploy/gcp/setup.sh` does this automatically); Trailhead then merges directly, and all required
+  checks still apply. Move the repos to a GitHub organization to get batched merges.
 - `bypass_actors` is empty on purpose, including for org admins. Changing it is a governance decision and
   shows in the ruleset history.
 - Add `benches/iai.rs` (iai-callgrind) to the workspace so the instruction-count gate measures something;
