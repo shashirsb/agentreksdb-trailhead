@@ -124,6 +124,10 @@ pub fn router(st: AppState) -> Router {
         .route("/api/pools/{id}/pledge", post(pledge))
         .route("/api/priority", get(priority_board))
         .route("/api/me/signals", get(my_signals).post(set_signals_opt_out))
+        .route(
+            "/api/intents/{id}/evidence",
+            get(get_evidence).post(post_evidence),
+        )
         .route("/api/stats", get(stats))
         .route("/api/releases", get(releases))
         .route("/api/verify/{sha}", get(verify_sha))
@@ -1639,4 +1643,294 @@ async fn set_signals_opt_out(
     let u = auth::require_user(&st, &h).await?;
     signals::set_opt_out(&st.pool, u.id, b.opted_out).await?;
     Ok(Json(json!({"opted_out": b.opted_out})))
+}
+
+// ---------- per-feature evidence ----------
+//
+// "The suite is green" says nothing about whether the suite tested what was asked for. The
+// evidence tables are append-only, so a result cannot be rewritten after the fact, and every
+// run records enough to re-run it: toolchain, versions, command, seeds and the hash of each
+// raw report.
+
+#[derive(Deserialize)]
+struct EvidenceBody {
+    head_sha: String,
+    parent_sha: Option<String>,
+    gate: String,
+    check_name: String,
+    #[serde(default)]
+    run_url: String,
+    #[serde(default)]
+    env: Value,
+    manifest_sha256: String,
+    #[serde(default)]
+    tests: Vec<EvidenceTest>,
+    #[serde(default)]
+    mutants: Vec<EvidenceMutant>,
+    #[serde(default)]
+    links: Vec<EvidenceLink>,
+    #[serde(default)]
+    blobs: Vec<EvidenceBlob>,
+}
+
+#[derive(Deserialize)]
+struct EvidenceTest {
+    id: String,
+    #[serde(default = "unit_kind")]
+    kind: String,
+    status: String,
+    #[serde(default)]
+    attempts: Value,
+    duration_ms: Option<i64>,
+    output_sha256: Option<String>,
+    #[serde(default)]
+    added_in_diff: bool,
+    #[serde(default = "na")]
+    fail_before: String,
+}
+fn unit_kind() -> String {
+    "unit".into()
+}
+fn na() -> String {
+    "n/a".into()
+}
+
+#[derive(Deserialize)]
+struct EvidenceMutant {
+    mutant: String,
+    file: String,
+    line: Option<i32>,
+    outcome: String,
+    caught_by: Option<String>,
+    diff_sha256: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EvidenceLink {
+    acceptance_id: String,
+    requirement_id: String,
+    test_id: String,
+    #[serde(default = "tag_source")]
+    source: String,
+}
+fn tag_source() -> String {
+    "tag".into()
+}
+
+#[derive(Deserialize)]
+struct EvidenceBlob {
+    sha256: String,
+    media_type: String,
+    size: i64,
+    uri: String,
+}
+
+/// Ingest one gate run's raw results. Authenticated with the tick token, because this is the
+/// CI pipeline talking, not a person.
+async fn post_evidence(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<EvidenceBody>,
+) -> R<Value> {
+    let want = st
+        .cfg
+        .tick_token
+        .clone()
+        .ok_or_else(|| ApiError::not_found("Endpoint"))?;
+    let got = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !constant_eq(got.as_bytes(), want.as_bytes()) {
+        return Err(ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "bad_token",
+            "Bad tick token.",
+            "",
+        ));
+    }
+    load_intent(&st, id).await?;
+
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    let seq = db::append_event(
+        &mut tx,
+        "evidence.recorded",
+        Some(id),
+        "ci",
+        json!({"gate": b.gate, "check": b.check_name, "head": b.head_sha,
+               "manifest_sha256": b.manifest_sha256, "tests": b.tests.len(),
+               "mutants": b.mutants.len()}),
+    )
+    .await?;
+    let run_id: i64 = sqlx::query_scalar(
+        "INSERT INTO evidence_runs
+           (intent_id, head_sha, parent_sha, gate, check_name, run_url, env, manifest_sha256, ledger_seq)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
+    )
+    .bind(id)
+    .bind(&b.head_sha)
+    .bind(&b.parent_sha)
+    .bind(&b.gate)
+    .bind(&b.check_name)
+    .bind(&b.run_url)
+    .bind(&b.env)
+    .bind(&b.manifest_sha256)
+    .bind(seq.seq)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    for t in &b.tests {
+        sqlx::query(
+            "INSERT INTO test_results
+               (run_id, test_id, kind, status, attempts, duration_ms, output_sha256, added_in_diff, fail_before)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(&t.id)
+        .bind(&t.kind)
+        .bind(&t.status)
+        .bind(&t.attempts)
+        .bind(t.duration_ms)
+        .bind(&t.output_sha256)
+        .bind(t.added_in_diff)
+        .bind(&t.fail_before)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    for m in &b.mutants {
+        sqlx::query(
+            "INSERT INTO mutant_results (run_id, mutant, file, line, outcome, caught_by, diff_sha256)
+             VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(&m.mutant)
+        .bind(&m.file)
+        .bind(m.line)
+        .bind(&m.outcome)
+        .bind(&m.caught_by)
+        .bind(&m.diff_sha256)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    for l in &b.links {
+        sqlx::query(
+            "INSERT INTO acceptance_links (run_id, acceptance_id, requirement_id, test_id, source)
+             VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+        )
+        .bind(run_id)
+        .bind(&l.acceptance_id)
+        .bind(&l.requirement_id)
+        .bind(&l.test_id)
+        .bind(&l.source)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    for bl in &b.blobs {
+        sqlx::query(
+            "INSERT INTO evidence_blobs (sha256, media_type, size, uri) VALUES ($1,$2,$3,$4)
+             ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(&bl.sha256)
+        .bind(&bl.media_type)
+        .bind(bl.size)
+        .bind(&bl.uri)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    }
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"run_id": run_id, "ledger_seq": seq.seq})))
+}
+
+/// The public evidence page for one feature: what was tested, what the results were, and
+/// which acceptance criterion each test proves.
+async fn get_evidence(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value> {
+    let it = load_intent(&st, id).await?;
+    type RunRow = (
+        i64,
+        String,
+        Option<String>,
+        String,
+        String,
+        String,
+        Value,
+        String,
+        Option<i64>,
+        bool,
+        chrono::DateTime<Utc>,
+    );
+    let runs: Vec<RunRow> = sqlx::query_as(
+        "SELECT id, head_sha, parent_sha, gate, check_name, run_url, env, manifest_sha256,
+                ledger_seq, simulated, created_at
+         FROM evidence_runs WHERE intent_id = $1 ORDER BY id DESC",
+    )
+    .bind(id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+
+    let mut out = Vec::new();
+    for r in &runs {
+        let tests: Vec<(String, String, String, Option<i64>, bool, String)> = sqlx::query_as(
+            "SELECT test_id, kind, status, duration_ms, added_in_diff, fail_before
+             FROM test_results WHERE run_id = $1 ORDER BY test_id",
+        )
+        .bind(r.0)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        let links: Vec<(String, String, String, String)> = sqlx::query_as(
+            "SELECT acceptance_id, requirement_id, test_id, source FROM acceptance_links
+             WHERE run_id = $1 ORDER BY acceptance_id",
+        )
+        .bind(r.0)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+        let mutants: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT mutant, file, outcome, caught_by FROM mutant_results WHERE run_id = $1
+             ORDER BY outcome, mutant",
+        )
+        .bind(r.0)
+        .fetch_all(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+
+        let passed = tests.iter().filter(|t| t.2 == "pass").count();
+        let failed = tests.iter().filter(|t| t.2 == "fail").count();
+        // A test that already passed on the parent commit proves nothing about this change.
+        let discriminating = tests.iter().filter(|t| t.5 == "fail").count();
+        let caught = mutants.iter().filter(|m| m.2 == "caught").count();
+        out.push(json!({
+            "run_id": r.0, "head_sha": r.1, "parent_sha": r.2, "gate": r.3,
+            "check_name": r.4, "run_url": r.5, "env": r.6,
+            "manifest_sha256": r.7, "ledger_seq": r.8,
+            // Never show a local dry run as a real pass.
+            "simulated": r.9, "created_at": r.10,
+            "totals": {"tests": tests.len(), "passed": passed, "failed": failed,
+                       "discriminating": discriminating,
+                       "mutants": mutants.len(), "mutants_caught": caught},
+            "tests": tests.iter().map(|t| json!({"id": t.0, "kind": t.1, "status": t.2,
+                "duration_ms": t.3, "added_in_diff": t.4, "fail_before": t.5})).collect::<Vec<_>>(),
+            "acceptance_links": links.iter().map(|l| json!({"acceptance_id": l.0,
+                "requirement_id": l.1, "test_id": l.2, "source": l.3})).collect::<Vec<_>>(),
+            "mutants": mutants.iter().map(|m| json!({"mutant": m.0, "file": m.1,
+                "outcome": m.2, "caught_by": m.3})).collect::<Vec<_>>(),
+        }));
+    }
+
+    let spec: Spec = serde_json::from_value(it.spec.clone()).unwrap_or_default();
+    Ok(Json(json!({
+        "intent_id": id,
+        "requirements": spec.requirements,
+        "acceptance_tests": spec.acceptance_tests,
+        "runs": out,
+        "note": "Evidence rows are append-only: once written, a result cannot be edited or deleted."
+    })))
 }

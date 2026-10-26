@@ -202,7 +202,38 @@ S=$(call anon GET /api/stats)
 expect "two merged (one via the pipeline, one seeded for the vote test)" "$(echo "$S" | jq -r .merged)" 2
 expect "spend recorded" "$(echo "$S" | jq -r .credits_spent)" 24
 
-echo "11. sabotage by deletion"
+echo "11. evidence — what was tested, and did it prove anything"
+cat > "$TMP/spec.json" <<'JSON'
+{"requirements":[{"id":"R1","ears":"WHEN filtered THE SYSTEM SHALL read only matching records","rationale":"perf"}],
+ "acceptance_tests":[{"id":"T1","requirement_id":"R1","given":"10k rows","when":"filtered","then":"only matching","negative":false},
+                     {"id":"T2","requirement_id":"R1","given":"empty filter","when":"queried","then":"an error","negative":true}]}
+JSON
+echo '[{"id":"core::q at_t1_filter","covers":[],"added_in_diff":true,"fail_before":"fail"}]' > "$TMP/tests.json"
+if ./target/debug/trailhead trace --spec "$TMP/spec.json" --tests "$TMP/tests.json" >/dev/null 2>&1; then
+  fail "trace accepted a spec with an untested acceptance criterion"
+else pass "an untested acceptance criterion blocks"; fi
+echo '[{"id":"core::q at_t1_filter","covers":[],"fail_before":"fail"},{"id":"core::q at_t2_empty","covers":["T2"],"fail_before":"fail"}]' > "$TMP/tests2.json"
+./target/debug/trailhead trace --spec "$TMP/spec.json" --tests "$TMP/tests2.json" >/dev/null && pass "a fully traced spec passes"
+echo '[{"id":"a","covers":["T1"],"fail_before":"pass"},{"id":"b","covers":["T2"],"fail_before":"pass"}]' > "$TMP/tests3.json"
+NOTDISC=$(./target/debug/trailhead trace --spec "$TMP/spec.json" --tests "$TMP/tests3.json" | jq -r '[.findings[]|select(.gap=="not_discriminating")]|length')
+expect "tests that already passed on the parent are flagged as proving nothing" "$NOTDISC" 2
+
+EV='{"head_sha":"abc","parent_sha":"par","gate":"tests","check_name":"gate-tests / nextest","manifest_sha256":"deadbeef",
+ "tests":[{"id":"core::q at_t1_filter","status":"pass","fail_before":"fail","added_in_diff":true},
+          {"id":"core::q tests::old","status":"pass","fail_before":"pass"}],
+ "links":[{"acceptance_id":"T1","requirement_id":"R1","test_id":"core::q at_t1_filter"}]}'
+expect "evidence ingestion needs the CI token" \
+  "$(curl -s -X POST -H 'content-type: application/json' -d "$EV" "$API/api/intents/$ID/evidence" | jq -r .error.code)" bad_token
+curl -sf -X POST -H 'authorization: Bearer tick-secret' -H 'content-type: application/json' -d "$EV" "$API/api/intents/$ID/evidence" >/dev/null \
+  && pass "a gate run can file its evidence"
+E=$(call anon GET "/api/intents/$ID/evidence")
+expect "every test is recorded, passing ones included" "$(echo "$E" | jq -r '.runs[0].totals.tests')" 2
+expect "only the test that failed on the parent counts as proving the change" "$(echo "$E" | jq -r '.runs[0].totals.discriminating')" 1
+expect "evidence is tied to the ledger" "$(echo "$E" | jq -r '.runs[0].ledger_seq != null')" true
+if psql "$DATABASE_URL" -qc "UPDATE test_results SET status='fail'" 2>/dev/null; then fail "test results accepted an UPDATE"; else pass "test results refuse an UPDATE"; fi
+if psql "$DATABASE_URL" -qc "UPDATE gate_results SET verdict='pass'" 2>/dev/null; then fail "gate results accepted an UPDATE"; else pass "gate results refuse an UPDATE"; fi
+
+echo "12. sabotage by deletion"
 # The gate used to read only added lines, so removing a durability barrier or an authorization
 # check raised nothing at all. These are the deletion-only diffs that must now block.
 cat > "$TMP/drop-fsync.json" <<JSON
