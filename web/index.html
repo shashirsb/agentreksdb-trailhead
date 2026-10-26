@@ -104,7 +104,7 @@ body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset
 .st-draft{background:var(--parch);color:#6a5416}
 .st-submitted,.st-guardrails{background:var(--glacier);color:#0d3a55}
 .st-generating,.st-gates{background:var(--ember);color:#5a2e08}
-.st-review{background:var(--violet);color:#fff}
+.st-review,.st-merging{background:var(--violet);color:#fff}
 .st-flagged,.st-held{background:var(--coral);color:#fff}
 .st-merged{background:var(--teal);color:#063e36}
 .st-on_hold{background:var(--accent);color:#1F2A44}
@@ -545,7 +545,7 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
 
 /* ---------- helpers ---------- */
 var STAGES=["Portal","Intent chat","Guardrails","Generation","Signed commit","Tests · perf","Diff-policy","Governor"];
-var STATUS_LABEL={draft:"Draft",submitted:"Submitted",guardrails:"Guardrails",held:"Held",generating:"Generating",gates:"Gates",review:"In review",flagged:"Flagged",merged:"Merged",on_hold:"On hold",rejected:"Rejected"};
+var STATUS_LABEL={draft:"Draft",submitted:"Submitted",guardrails:"Guardrails",held:"Held",generating:"Generating",gates:"Gates",review:"In review",merging:"Merging",flagged:"Flagged",merged:"Merged",on_hold:"On hold",rejected:"Rejected"};
 var AREAS=["Engine","Search & vector","Graph","Memory","Events","Console","Deploy","Docs"];
 var ME=null, TRAIN=null, PORTAL_FILTER="all", INTENTS=[], LEDGER_AFTER=0;
 
@@ -585,7 +585,7 @@ function stepState(i,stage,status){
   if(status==="flagged") return i<stage?"done":(i===stage?"blk":"pending");
   if(status==="rejected") return i<stage?"done":(i===stage?"blk":"pending");
   if(status==="on_hold") return i<8?"done":"hold";
-  if(status==="review") return i<8?"done":"cur";
+  if(status==="review"||status==="merging") return i<8?"done":"cur";
   if(status==="draft") return i===1?"done":(i===2?"cur":"pending");
   if(i<stage) return "done";
   if(i===stage) return "cur";
@@ -870,7 +870,7 @@ function drawPipe(){
     if(s==="done"&&(n===5||n===6)&&!i.commit_sha){s="pending";d="Not reached: stopped before a commit existed";}
     else if(s==="done"&&(n===5||n===6)&&i.commit_sha==="simulated"){ic=ICON.check;d="Simulated: no GitHub App configured";}
     else if(s==="done"){ic=ICON.check;d="Passed";}
-    else if(s==="cur"){ic=ICON.spin;d=n===8?"Waiting for the governor":"In progress";}
+    else if(s==="cur"){ic=ICON.spin;d=n===8?(i.status==="merging"?"Approved: merging once GitHub checks pass":"Waiting for the governor"):"In progress";}
     else if(s==="blk"){ic=ICON.flag;d=i.status==="held"?"Held for a human by guardrails":(i.status==="rejected"?"Rejected":"Blocked: see gates");}
     else if(s==="hold"){ic=ICON.pause;d="On hold: rolls to the next train";}
     return '<div class="step '+s+'"><div class="sx">'+ic+'</div><div><div class="t">'+n+' · '+esc(name)+'</div><div class="d">'+esc(d)+'</div></div></div>';

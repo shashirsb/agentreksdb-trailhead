@@ -1123,6 +1123,11 @@ async fn on_pull_request(st: &AppState, v: &Value) -> Result<(), ApiError> {
                     .map_err(ApiError::internal)?;
             }
         }
+        "closed" if pr["merged"].as_bool() == Some(true) && it.status == "merging" => {
+            tx.commit().await.map_err(ApiError::internal)?;
+            worker::on_pr_merged(st, id).await?;
+            return Ok(());
+        }
         "closed" if pr["merged"].as_bool() == Some(true) && it.status != "merged" => {
             db::append_event(
                 &mut tx,

@@ -49,25 +49,29 @@ pub async fn run(st: AppState) {
     }
 }
 
+/// (id, kind, intent_id, attempts, created_at)
+type JobRow = (i64, String, Option<i64>, i32, chrono::DateTime<Utc>);
+
 /// Claim and run one job. Returns false when the queue is empty.
 pub async fn run_one(st: &AppState) -> anyhow::Result<bool> {
     sqlx::query("UPDATE jobs SET state = 'queued', locked_at = NULL WHERE state = 'running' AND locked_at < now() - interval '1 hour'")
         .execute(&st.pool)
         .await?;
-    let job: Option<(i64, String, Option<i64>, i32)> = sqlx::query_as(
+    let job: Option<JobRow> = sqlx::query_as(
         "UPDATE jobs SET state = 'running', locked_at = now(), attempts = attempts + 1
          WHERE id = (SELECT id FROM jobs WHERE state = 'queued' AND run_after <= now()
                      ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1)
-         RETURNING id, kind, intent_id, attempts",
+         RETURNING id, kind, intent_id, attempts, created_at",
     )
     .fetch_optional(&st.pool)
     .await?;
-    let Some((id, kind, intent_id, attempts)) = job else {
+    let Some((id, kind, intent_id, attempts, job_created)) = job else {
         return Ok(false);
     };
     let result = match (kind.as_str(), intent_id) {
         ("guardrails", Some(i)) => guardrails_job(st, i).await,
         ("generate", Some(i)) => generate_job(st, i).await,
+        ("merge", Some(i)) => merge_job(st, i, job_created).await,
         _ => Err(anyhow::anyhow!("unknown job {kind}")),
     };
     match result {
@@ -732,6 +736,107 @@ pub async fn tick(st: &AppState) -> anyhow::Result<Value> {
     Ok(json!({"done": done, "intake": s.intake.train, "review": s.review.map(|r| r.train)}))
 }
 
+/// Mark an intent merged: status, stake refund and reputation, in the caller's transaction.
+async fn finish_merge(
+    tx: &mut db::Tx<'_>,
+    it: &IntentRow,
+    actor: &str,
+    reason: &str,
+) -> anyhow::Result<()> {
+    db::transition(tx, it.id, "merged", 8, actor, json!({"reason": reason})).await?;
+    db::add_credits(
+        tx,
+        it.author_id,
+        EntryKind::StakeRefund,
+        it.stake_credits,
+        Some(it.id),
+        "merged: stake refunded",
+    )
+    .await?;
+    sqlx::query("UPDATE users SET rep_points = rep_points + 10 WHERE id = $1")
+        .bind(it.author_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// How long a decided merge may wait for GitHub's checks before it is handed back to the governor.
+const MERGE_PATIENCE_MINUTES: i64 = 90;
+
+async fn merge_job(
+    st: &AppState,
+    id: i64,
+    job_created: chrono::DateTime<Utc>,
+) -> anyhow::Result<Retry> {
+    let Some(it) = db::intent(&st.pool, id).await? else {
+        return Ok(Retry::No);
+    };
+    if it.status != "merging" {
+        return Ok(Retry::No); // already merged (e.g. via the PR webhook) or changed
+    }
+    let pr = it
+        .pr_number
+        .ok_or_else(|| anyhow::anyhow!("merging intent has no PR"))?;
+    let result = GitHub {
+        cfg: &st.cfg,
+        http: &st.http,
+    }
+    .merge(pr)
+    .await;
+    let mut tx = st.pool.begin().await?;
+    let Some(cur) = db::lock_intent(&mut tx, id).await? else {
+        return Ok(Retry::No);
+    };
+    if cur.status != "merging" {
+        return Ok(Retry::No);
+    }
+    match result {
+        Ok(()) => {
+            finish_merge(
+                &mut tx,
+                &cur,
+                "github",
+                "merged after all required checks passed",
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(Retry::No)
+        }
+        Err(e) if Utc::now() - job_created < chrono::Duration::minutes(MERGE_PATIENCE_MINUTES) => {
+            tracing::info!("intent {id}: PR #{pr} not mergeable yet ({e}); retrying");
+            Ok(Retry::After(60))
+        }
+        Err(e) => {
+            db::append_event(
+                &mut tx,
+                "merge.failed",
+                Some(id),
+                "worker",
+                json!({"pr": pr, "error": format!("{e:#}")}),
+            )
+            .await?;
+            db::transition(&mut tx, id, "review", 8, "worker",
+                json!({"reason": format!("GitHub would not merge within {MERGE_PATIENCE_MINUTES} minutes; back to the governor")})).await?;
+            tx.commit().await?;
+            Ok(Retry::No)
+        }
+    }
+}
+
+/// The PR merged on GitHub (normally by our merge job): settle it if the job has not yet.
+pub async fn on_pr_merged(st: &AppState, id: i64) -> anyhow::Result<bool> {
+    let mut tx = st.pool.begin().await?;
+    let Some(cur) = db::lock_intent(&mut tx, id).await? else {
+        return Ok(false);
+    };
+    if cur.status != "merging" {
+        return Ok(false);
+    }
+    finish_merge(&mut tx, &cur, "github", "PR merged on GitHub").await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 #[derive(Debug)]
 pub enum DecideError {
     Invalid(&'static str, String),
@@ -774,6 +879,7 @@ pub async fn decide(
             "review",
             "flagged",
             "on_hold",
+            "merging",
         ],
         _ => return invalid("bad_decision", "Decision must be merge, hold or reject."),
     };
@@ -831,31 +937,23 @@ pub async fn decide(
         json!({"decision": decision, "reason": reason, "train": train_label, "spam": spam}),
     )
     .await?;
+    let via_github = st.cfg.github_app_configured() && it.pr_number.is_some();
     match decision {
-        "merge" => {
+        "merge" if via_github => {
+            // Record the decision now; the merge job merges once GitHub's checks (including
+            // train-gate, re-run after the labels below) are green, then refunds the stake.
             db::transition(
                 &mut tx,
                 it.id,
-                "merged",
+                "merging",
                 8,
                 governor,
                 json!({"reason": reason}),
             )
             .await?;
-            db::add_credits(
-                &mut tx,
-                it.author_id,
-                EntryKind::StakeRefund,
-                it.stake_credits,
-                Some(it.id),
-                "merged: stake refunded",
-            )
-            .await?;
-            sqlx::query("UPDATE users SET rep_points = rep_points + 10 WHERE id = $1")
-                .bind(it.author_id)
-                .execute(&mut *tx)
-                .await?;
+            db::enqueue(&mut tx, "merge", Some(it.id)).await?;
         }
+        "merge" => finish_merge(&mut tx, &it, governor, reason).await?,
         "hold" => {
             sqlx::query("UPDATE intents SET holds = holds + 1, train = $2 WHERE id = $1")
                 .bind(it.id)
@@ -928,8 +1026,8 @@ pub async fn decide(
             }
         }
     }
-    // For a merge, the repo's train-gate check needs both labels before the merge queue accepts it.
-    // GitHub is called while the row lock is held: if it refuses, nothing is recorded.
+    // For a merge, the repo's train-gate check needs both labels. GitHub is called while the row lock
+    // is held: if labelling fails, nothing is recorded.
     let gh = GitHub {
         cfg: &st.cfg,
         http: &st.http,
@@ -942,7 +1040,6 @@ pub async fn decide(
                     &[format!("train/{train_label}"), "decision:merge".to_string()],
                 )
                 .await?;
-                gh.merge(pr).await?;
             }
         }
     }

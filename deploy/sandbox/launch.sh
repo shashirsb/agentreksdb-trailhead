@@ -21,6 +21,8 @@ mkdir -p "$HOST" "$RUN/out"
 git clone --quiet --depth 1 "https://github.com/${TRAILHEAD_TARGET_REPO}.git" "$HOST/pristine"
 BASE=$(git -C "$HOST/pristine" rev-parse HEAD)
 cp -a "$HOST/pristine" "$RUN/repo"
+# The sandbox runs as an unprivileged user; let it write the run directory (and nothing else on the host).
+chmod -R a+rwX "$RUN"
 DIGEST=$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE" 2>/dev/null || echo "$IMAGE")
 
 set +e
@@ -36,6 +38,11 @@ docker run --rm \
   -e ANTHROPIC_BASE_URL=http://model-proxy:8888 \
   -e ANTHROPIC_API_KEY="$TRAILHEAD_PROXY_TOKEN" \
   -e CARGO_NET_OFFLINE=true \
+  -e ANTHROPIC_MODEL="$TRAILHEAD_MODEL_ID" \
+  -e ANTHROPIC_SMALL_FAST_MODEL="$TRAILHEAD_MODEL_ID" \
+  -e ANTHROPIC_DEFAULT_HAIKU_MODEL="$TRAILHEAD_MODEL_ID" \
+  -e CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+  -e DISABLE_AUTOUPDATER=1 \
   "$IMAGE" /opt/trailhead/run.sh
 STATUS=$?
 set -e
