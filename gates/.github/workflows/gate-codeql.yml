@@ -1,0 +1,263 @@
+# Gate 10 — CodeQL for Rust. Blocking on high and critical.
+#
+# The other analysis gates match patterns. gates/semgrep/rust-trailhead.yml knows the shapes this
+# project has decided to care about — egress, process spawning, secret env, embedded files, Trojan
+# Source — and diff-policy reads lines. CodeQL does something neither can: it builds a database and
+# follows data through the program, so it answers questions about paths rather than about text. A
+# taint that starts in a request body and ends in a path join is invisible to a line-based rule and
+# is the kind of thing a model writes by accident, or on purpose with a plausible-looking commit.
+#
+# Rust support became generally available in October 2025, so this is a supported analysis and not
+# an experiment; `languages: rust` must be requested explicitly, because CodeQL's language
+# autodetection deliberately does not enable Rust on its own.
+#
+# WHY THE VERDICT IS COMPUTED HERE AND NOT LEFT TO THE SECURITY TAB.
+# `github/codeql-action/analyze` uploads findings and, by itself, succeeds. The alerts appear in the
+# Security tab, where a human might read them, later. That is reporting, not a gate. For a project
+# whose entire claim is that code reaches `main` only through checks, "an alert was filed" is not a
+# check. So the SARIF is also written to disk and scored in this workflow: anything at
+# security-severity 7.0 or above (CodeQL's "high", and "critical" at 9.0) fails the job. Medium and
+# low are printed as notices, because a gate that blocks on everything gets bypassed on everything.
+#
+# ORDERING: building a CodeQL database means resolving and reading PR code, so this waits for
+# `gate-diff-policy / policy` on the same SHA, like gate-tests, gate-perf and gate-supply-chain.
+# Keep the job name `gate-diff-policy / policy` in sync with the `CHECK_NAME` env below.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA with the version in a trailing comment. The
+# codeql-action pin here is the same v3.39.1 the SARIF uploads in gate-diff-policy use, so the whole
+# repository runs one version of it. A v4 exists; bump every gate together or not at all, because
+# two majors of codeql-action in one repository is how a gate ends up analysing nothing.
+name: gate-codeql
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gate-codeql-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# No ambient permissions; each job grants itself the minimum it needs.
+permissions: {}
+
+env:
+  WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+  CARGO_TERM_COLOR: always
+  # CodeQL's qualitative bands, as `security-severity` numbers in the SARIF:
+  #   critical >= 9.0, high >= 7.0, medium >= 4.0, low > 0.0
+  BLOCK_AT_SEVERITY: "7.0"
+
+jobs:
+  # Cross-workflow ordering barrier. Cheap, read-only, and fails closed: an unknown,
+  # pending-forever, failed, cancelled or skipped diff-policy run all stop this workflow before a
+  # runner reads PR code into a database.
+  wait-for-policy:
+    name: gate-codeql / wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: require gate-diff-policy / policy = success on this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          CHECK_NAME: gate-diff-policy / policy
+          WAIT_SECONDS: "1500"
+          POLL_SECONDS: "15"
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+          event = os.environ.get("EVENT", "")
+          if event not in ("pull_request", "merge_group"):
+              print(f"event '{event}' does not carry a diff-policy verdict; nothing to wait for.")
+              sys.exit(0)
+
+          repo, sha = os.environ["REPO"], os.environ["SHA"]
+          name, token = os.environ["CHECK_NAME"], os.environ["GH_TOKEN"]
+          deadline = time.time() + float(os.environ["WAIT_SECONDS"])
+          poll = float(os.environ["POLL_SECONDS"])
+          url = (
+              f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs"
+              f"?per_page=100&check_name={urllib.parse.quote(name)}"
+          )
+
+          def check_runs():
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp).get("check_runs", [])
+
+          while True:
+              try:
+                  runs = check_runs()
+              except (urllib.error.URLError, TimeoutError, ValueError) as err:
+                  print(f"checks API query failed ({err}); will retry")
+                  runs = None
+              if runs:
+                  runs.sort(key=lambda r: (r.get("started_at") or "", r.get("id") or 0))
+                  latest = runs[-1]
+                  status, conclusion = latest.get("status"), latest.get("conclusion")
+                  print(f"{name}: status={status} conclusion={conclusion}")
+                  if status == "completed":
+                      if conclusion == "success":
+                          print("diff-policy passed; gate-codeql may now analyse this change.")
+                          sys.exit(0)
+                      print(
+                          f"::error::{name} concluded '{conclusion}' on {sha}. gate-codeql will not "
+                          "build a database from this change until the diff-policy gate passes."
+                      )
+                      sys.exit(1)
+              elif runs is not None:
+                  print(f"{name} has not reported on {sha} yet; waiting.")
+              if time.time() >= deadline:
+                  print(
+                      f"::error::Timed out waiting for {name} on {sha}. Failing closed: PR code is "
+                      "never analysed before the diff-policy verdict is in."
+                  )
+                  sys.exit(1)
+              time.sleep(poll)
+          PY
+
+  analyze:
+    name: gate-codeql / analyze
+    needs: wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      # Required to upload the analysis so the alerts are also visible in the Security tab. The
+      # blocking decision is made from the local SARIF, not from what the API later reports.
+      security-events: write
+      # codeql-action reads workflow run metadata to label the analysis.
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # `build-mode: none` — the Rust extractor reads the source tree and resolves the crate graph
+      # itself; it does not need, and must not get, a traced `cargo build`. That also means this
+      # gate never executes PR build scripts, which is the point: a build.rs that runs during
+      # analysis would be code execution inside a job holding `security-events: write`.
+      - name: initialize CodeQL (rust)
+        uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          languages: rust
+          build-mode: none
+          # `security-extended` over the default suite: the default is tuned for a low false-positive
+          # rate on human-written code reviewed by its author. Nobody here authored anything, and the
+          # reviewer is a governor reading someone else's generated diff, so the extra queries are
+          # worth the extra noise. The noise lands in notices unless it scores high.
+          queries: security-extended
+      - name: analyze
+        id: analyze
+        uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          category: /language:rust
+          output: ${{ runner.temp }}/codeql-sarif
+          # `always` so the Security tab still receives the findings even when the scoring step
+          # below is about to fail the job. Suppressing the upload on failure would mean the one
+          # run that found something real is the one run that recorded nothing.
+          upload: always
+      # FAIL CLOSED. A missing, empty or unparseable SARIF is a failure: CodeQL claiming to have run
+      # while producing no report is indistinguishable from CodeQL having been quietly disabled, and
+      # that is a change someone would make on purpose.
+      - name: block on high and critical
+        if: always()
+        env:
+          SARIF_DIR: ${{ runner.temp }}/codeql-sarif
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          threshold = float(os.environ["BLOCK_AT_SEVERITY"])
+          sarif_dir = Path(os.environ["SARIF_DIR"])
+          files = sorted(sarif_dir.glob("*.sarif")) if sarif_dir.is_dir() else []
+          if not files:
+              print(f"::error::CodeQL produced no SARIF under {sarif_dir}.")
+              print("::error::The analysis has no result to score, so this gate fails closed. A run")
+              print("::error::that reports nothing is not the same as a run that found nothing.")
+              sys.exit(1)
+
+          def band(score):
+              if score >= 9.0:
+                  return "critical"
+              if score >= 7.0:
+                  return "high"
+              if score >= 4.0:
+                  return "medium"
+              return "low"
+
+          blocking, lesser, total = [], 0, 0
+          for path in files:
+              try:
+                  doc = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, ValueError) as err:
+                  print(f"::error::CodeQL SARIF {path.name} is unreadable ({err}); failing closed.")
+                  sys.exit(1)
+              for run in doc.get("runs", []):
+                  # security-severity lives on the rule, not the result, so build the lookup first.
+                  severities = {}
+                  driver = (run.get("tool") or {}).get("driver") or {}
+                  extensions = (run.get("tool") or {}).get("extensions") or []
+                  for component in [driver, *extensions]:
+                      for rule in component.get("rules") or []:
+                          props = rule.get("properties") or {}
+                          raw = props.get("security-severity")
+                          if raw is not None and rule.get("id"):
+                              try:
+                                  severities[rule["id"]] = float(raw)
+                              except (TypeError, ValueError):
+                                  pass
+                  for result in run.get("results", []):
+                      total += 1
+                      rule_id = result.get("ruleId") or "?"
+                      score = severities.get(rule_id)
+                      if score is None:
+                          # No security-severity: a quality or non-security query. Not blocking, but
+                          # counted and printed so it is not simply invisible.
+                          lesser += 1
+                          continue
+                      msg = ((result.get("message") or {}).get("text") or "").strip().splitlines()
+                      msg = msg[0] if msg else ""
+                      where = ""
+                      for loc in result.get("locations", []):
+                          phys = loc.get("physicalLocation") or {}
+                          uri = (phys.get("artifactLocation") or {}).get("uri")
+                          line = (phys.get("region") or {}).get("startLine")
+                          if uri:
+                              where = f"{uri}:{line}" if line else uri
+                              break
+                      entry = f"[{band(score)} {score:.1f}] {rule_id} — {msg} ({where})"
+                      if score >= threshold:
+                          blocking.append(entry)
+                      else:
+                          lesser += 1
+                          print(f"::notice::CodeQL {entry}")
+
+          print(f"CodeQL: {total} result(s); {len(blocking)} at or above severity {threshold:.1f}, "
+                f"{lesser} below it.")
+          if blocking:
+              print(f"::error::CodeQL found {len(blocking)} high or critical finding(s). This change")
+              print("::error::does not merge on them. Fix the finding; if it is genuinely a false")
+              print("::error::positive, that is a governor's call, recorded in the intent — not a")
+              print("::error::threshold edit in this workflow.")
+              for b in blocking:
+                  print(f"::error::  {b}")
+              sys.exit(1)
+          print("No high or critical CodeQL findings.")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: codeql-sarif
+          path: ${{ runner.temp }}/codeql-sarif
+          if-no-files-found: ignore

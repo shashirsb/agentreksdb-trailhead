@@ -1,0 +1,856 @@
+# Gate 9 — Supply chain. Blocking.
+#
+# The other gates read the diff. This one reads what the diff drags in behind it. A model that is
+# told to add a feature can satisfy every test and every policy rule and still reach `main` with a
+# dependency nobody chose: a crate published last Tuesday by a single owner, named one character
+# away from one the project already trusts. Nothing in gate-diff-policy notices that, because the
+# diff is three lines of `Cargo.toml` and a lockfile entry, and nothing in gate-tests notices it,
+# because the code works. The lockfile is where a generated change is cheapest to attack and
+# hardest to read, so it gets its own gate.
+#
+# ORDERING: every job here builds or resolves PR code, or runs a third-party scanner over the PR
+# worktree, so all of them wait for `gate-diff-policy / policy` to conclude `success` on the same
+# SHA — the same `wait-for-policy` barrier gate-tests and gate-perf use. Diff-policy is the only
+# gate aimed at malice and it must judge a change before a runner touches it. Keep the job name
+# `gate-diff-policy / policy` in sync with the `CHECK_NAME` env below.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA with the version in a trailing comment, and
+# every tool is installed at an exact version. `taiki-e/install-action` is itself pinned by SHA and
+# verifies each tool against a sha256 recorded in its own pinned manifest, so `tool: zizmor@1.31.1`
+# is a checksummed install and not a download of whatever is newest. gitleaks and trufflehog are not
+# in that manifest, so their release tarballs are fetched and checked against a sha256 pinned here
+# before anything is unpacked or run. Never reintroduce a tag, a branch ref or a floating version.
+name: gate-supply-chain
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gate-supply-chain-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+# No ambient permissions; each job grants itself the minimum it needs.
+permissions: {}
+
+env:
+  WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+  CARGO_TERM_COLOR: always
+  # Pinned tool versions. Bump these deliberately, never automatically: a scanner that updates
+  # itself is a scanner someone else controls.
+  ZIZMOR_VERSION: 1.31.1
+  OSV_SCANNER_VERSION: 2.7.0
+  CARGO_DENY_VERSION: 0.20.2
+  CARGO_VET_VERSION: 0.10.3
+
+jobs:
+  # Cross-workflow ordering barrier. Cheap, read-only, and fails closed: an unknown,
+  # pending-forever, failed, cancelled or skipped diff-policy run all stop this workflow before any
+  # third-party scanner is pointed at PR content.
+  wait-for-policy:
+    name: gate-supply-chain / wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      checks: read
+    steps:
+      - name: require gate-diff-policy / policy = success on this SHA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          EVENT: ${{ github.event_name }}
+          CHECK_NAME: gate-diff-policy / policy
+          WAIT_SECONDS: "1500"
+          POLL_SECONDS: "15"
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys, time, urllib.error, urllib.parse, urllib.request
+
+          event = os.environ.get("EVENT", "")
+          if event not in ("pull_request", "merge_group"):
+              print(f"event '{event}' does not carry a diff-policy verdict; nothing to wait for.")
+              sys.exit(0)
+
+          repo, sha = os.environ["REPO"], os.environ["SHA"]
+          name, token = os.environ["CHECK_NAME"], os.environ["GH_TOKEN"]
+          deadline = time.time() + float(os.environ["WAIT_SECONDS"])
+          poll = float(os.environ["POLL_SECONDS"])
+          url = (
+              f"https://api.github.com/repos/{repo}/commits/{sha}/check-runs"
+              f"?per_page=100&check_name={urllib.parse.quote(name)}"
+          )
+
+          def check_runs():
+              req = urllib.request.Request(url, headers={
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp).get("check_runs", [])
+
+          while True:
+              try:
+                  runs = check_runs()
+              except (urllib.error.URLError, TimeoutError, ValueError) as err:
+                  print(f"checks API query failed ({err}); will retry")
+                  runs = None
+              if runs:
+                  runs.sort(key=lambda r: (r.get("started_at") or "", r.get("id") or 0))
+                  latest = runs[-1]
+                  status, conclusion = latest.get("status"), latest.get("conclusion")
+                  print(f"{name}: status={status} conclusion={conclusion}")
+                  if status == "completed":
+                      if conclusion == "success":
+                          print("diff-policy passed; gate-supply-chain may now inspect this change.")
+                          sys.exit(0)
+                      print(
+                          f"::error::{name} concluded '{conclusion}' on {sha}. gate-supply-chain will "
+                          "not resolve or scan this change until the diff-policy gate passes."
+                      )
+                      sys.exit(1)
+              elif runs is not None:
+                  print(f"{name} has not reported on {sha} yet; waiting.")
+              if time.time() >= deadline:
+                  print(
+                      f"::error::Timed out waiting for {name} on {sha}. Failing closed: PR content is "
+                      "never scanned before the diff-policy verdict is in."
+                  )
+                  sys.exit(1)
+              time.sleep(poll)
+          PY
+
+  # CI is code, and in this project it is the code that decides whether all the other code is
+  # allowed in. A change to `.github/` is therefore a change to the gates themselves, and zizmor is
+  # the static analyser for exactly that: unpinned actions, `pull_request_target` with a checkout of
+  # PR code, `${{ }}` interpolated into `run:` blocks, over-broad permissions, cache poisoning.
+  zizmor:
+    name: gate-supply-chain / zizmor
+    needs: wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: zizmor@${{ env.ZIZMOR_VERSION }}
+      - name: did this change touch .github/ ?
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            # In the merge queue the whole combined change is in scope: scan unconditionally.
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE...$HEAD" -- .github/ | grep -q .; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+          fi
+      # zizmor runs OFFLINE on purpose. Its online audits (known-vulnerable-actions,
+      # stale-action-refs) query the GitHub API, which would mean a blocking gate whose verdict
+      # depends on a third-party service being up, and a token handed to a tool whose input is
+      # attacker-controlled YAML. A gate that goes red when an API is slow gets switched off, so
+      # this one is kept deterministic. The cost is real and worth stating: a known-vulnerable
+      # action version is NOT caught here. What is caught is the thing that matters most in this
+      # repo — an unpinned or newly-floating `uses:` — which is a purely static check.
+      - name: zizmor (offline, SARIF)
+        id: zizmor
+        if: steps.scope.outputs.touched == 'true'
+        run: |
+          set +e
+          zizmor --offline --no-progress --persona regular --format sarif .github/ > zizmor.sarif
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      # The verdict is read from the SARIF rather than from zizmor's exit code, so that a change in
+      # how the tool numbers its exits cannot silently turn this gate into a pass. A missing or
+      # unparseable report is a failure: no report means no evidence.
+      - name: block on zizmor findings
+        if: steps.scope.outputs.touched == 'true'
+        env:
+          ZIZMOR_EXIT: ${{ steps.zizmor.outputs.exit }}
+        run: |
+          python3 -I - zizmor.sarif <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if not path.is_file() or path.stat().st_size == 0:
+              print(f"::error::zizmor produced no SARIF at {path} (exit {os.environ.get('ZIZMOR_EXIT')}).")
+              print("::error::The workflow audit has no evidence to score and fails closed.")
+              sys.exit(1)
+          try:
+              doc = json.loads(path.read_text(encoding="utf-8"))
+          except (OSError, ValueError) as err:
+              print(f"::error::zizmor SARIF is unreadable ({err}); failing closed.")
+              sys.exit(1)
+
+          blocking, notes = [], []
+          for run in doc.get("runs", []):
+              for result in run.get("results", []):
+                  level = (result.get("level") or "warning").lower()
+                  rule = result.get("ruleId") or "?"
+                  msg = ((result.get("message") or {}).get("text") or "").strip().splitlines()
+                  msg = msg[0] if msg else ""
+                  where = ""
+                  for loc in result.get("locations", []):
+                      phys = (loc.get("physicalLocation") or {})
+                      art = (phys.get("artifactLocation") or {}).get("uri")
+                      line = (phys.get("region") or {}).get("startLine")
+                      if art:
+                          where = f"{art}:{line}" if line else art
+                          break
+                  entry = f"{level}: {rule} — {msg} ({where})" if where else f"{level}: {rule} — {msg}"
+                  (blocking if level in ("error", "warning") else notes).append(entry)
+
+          for n in notes:
+              print(f"::notice::zizmor {n}")
+          if blocking:
+              print("::error::zizmor found problems in the CI definitions. In this project CI *is* the")
+              print("::error::gate, so a finding here is a finding in the thing that judges every change.")
+              for b in blocking:
+                  print(f"::error::  {b}")
+              sys.exit(1)
+          print(f"zizmor: no error/warning findings ({len(notes)} informational).")
+          PY
+      - name: upload SARIF (zizmor)
+        if: always() && hashFiles('zizmor.sarif') != ''
+        uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          sarif_file: zizmor.sarif
+          category: zizmor
+      - name: note when .github/ was untouched
+        if: steps.scope.outputs.touched != 'true'
+        run: echo "::notice::This change does not touch .github/; the workflow audit had nothing to scan."
+
+  # OSV covers advisories from a wider set of sources than RustSec alone, and it resolves the
+  # lockfile rather than the manifest, so it sees the versions that would actually be built.
+  osv-scanner:
+    name: gate-supply-chain / osv-scanner
+    needs: wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: osv-scanner@${{ env.OSV_SCANNER_VERSION }}
+      # EXIT CODE 128 IS A FAILURE, NOT A PASS.
+      # osv-scanner answers 128 for "no packages found". That is not "nothing is wrong", it is "I
+      # had nothing to look at" — a renamed workspace directory, a moved or deleted Cargo.lock, a
+      # WORKSPACE_DIR variable pointing somewhere empty. Treated as success it is the most useful
+      # exit code an attacker could hope for: delete the lockfile from the scanner's view and the
+      # dependency gate reports green forever. So every outcome except a clean 0 fails, and the
+      # reason is printed.
+      - name: osv-scanner (lockfile)
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          set +e
+          osv-scanner scan source --recursive ./
+          code=$?
+          set -e
+          case "$code" in
+            0)
+              echo "osv-scanner: no known vulnerabilities in the resolved dependency graph."
+              ;;
+            1)
+              echo "::error::osv-scanner found known vulnerabilities in this change's dependencies."
+              echo "::error::Either update the affected crate or record the advisory in deny.toml AND"
+              echo "::error::.cargo/audit.toml with a governor's reason. Do not ignore it here."
+              exit 1
+              ;;
+            128)
+              echo "::error::osv-scanner exited 128: NO PACKAGES FOUND. This is a gate failure, not a"
+              echo "::error::pass. It means the scanner was pointed at something with no lockfile to"
+              echo "::error::resolve, so the dependency graph was never checked at all. Confirm that"
+              echo "::error::vars.WORKSPACE_DIR ('${WORKSPACE_DIR}') still contains Cargo.lock."
+              exit 1
+              ;;
+            *)
+              echo "::error::osv-scanner did not complete (exit $code). The dependency scan has no"
+              echo "::error::result to report, so it fails closed."
+              exit 1
+              ;;
+          esac
+
+  # cargo-deny is the policy half of the dependency question: not only "is this crate known-bad"
+  # but "is this crate allowed here at all". All four checks run, and all four block.
+  cargo-deny:
+    name: gate-supply-chain / cargo-deny
+    needs: wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        with:
+          tool: cargo-deny@${{ env.CARGO_DENY_VERSION }}
+      # `advisories` = known vulnerabilities, unmaintained and yanked crates.
+      # `bans`       = crates the project has decided not to depend on, plus duplicate versions.
+      # `licenses`   = the Apache-2.0 obligations this repo actually has to meet.
+      # `sources`    = registries and git remotes a dependency may come from. This is the one that
+      #                catches a crate pulled from an arbitrary git URL instead of crates.io, which
+      #                is a lockfile edit of about forty characters.
+      # `--locked` so the gate judges the committed lockfile and cannot quietly resolve a different
+      # graph than the one that would be built.
+      - name: cargo-deny check advisories bans licenses sources
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: cargo deny --locked check advisories bans licenses sources
+
+  # cargo-vet records, per dependency, that a human or a trusted upstream has actually looked at the
+  # code. It is the only check here that asks about crates nobody has an advisory for yet, which is
+  # the state every supply-chain attack is in on day one.
+  cargo-vet:
+    name: gate-supply-chain / cargo-vet
+    needs: wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: did this change touch Cargo.lock ?
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$BASE...$HEAD" -- "$WORKSPACE_DIR/Cargo.lock" "$WORKSPACE_DIR/Cargo.toml" '**/Cargo.toml' | grep -q .; then
+            echo "touched=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "touched=false" >> "$GITHUB_OUTPUT"
+          fi
+      # NOT SILENTLY SKIPPED. If `supply-chain/` has never been initialised there is nothing to
+      # check, and a gate with nothing to check must say so loudly rather than report success — a
+      # green tick that means "not configured" is worse than a red one, because it is indistinguish-
+      # able from "audited". So this fails, with the commands to fix it.
+      #
+      # It fails SOFT in the governance sense, not the CI sense: `gate-supply-chain / cargo-vet`
+      # should be left OUT of the required checks in gates/rulesets/main.json until `supply-chain/`
+      # exists, so an uninitialised audit set does not wedge the pipeline. Add it to the required
+      # list in the same change that lands `cargo vet init`. See gates/README.md.
+      - name: cargo-vet audit set must exist
+        id: present
+        if: steps.scope.outputs.touched == 'true'
+        run: |
+          set -euo pipefail
+          if [ -d "$WORKSPACE_DIR/supply-chain" ] && [ -f "$WORKSPACE_DIR/supply-chain/config.toml" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "present=false" >> "$GITHUB_OUTPUT"
+          echo "::error::This change touches the dependency graph, but $WORKSPACE_DIR/supply-chain/"
+          echo "::error::does not exist, so cargo-vet has no audit set and this gate can prove"
+          echo "::error::nothing about the crates being added. It fails rather than passing, because"
+          echo "::error::a green 'not configured' is indistinguishable from a green 'audited'."
+          echo "::error::"
+          echo "::error::To initialise it once, from $WORKSPACE_DIR/:"
+          echo "::error::    cargo install cargo-vet --locked --version ${CARGO_VET_VERSION}"
+          echo "::error::    cargo vet init"
+          echo "::error::    # import the audits the Rust ecosystem already publishes:"
+          echo "::error::    cargo vet import mozilla https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+          echo "::error::    cargo vet import google  https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+          echo "::error::    cargo vet                # lists what still needs a human"
+          echo "::error::Commit supply-chain/ (it is CODEOWNED), then add"
+          echo "::error::'gate-supply-chain / cargo-vet' to the required checks in gates/rulesets/main.json."
+          exit 1
+      - uses: taiki-e/install-action@5488ac5a951645ce95062214902ac4b6bc1a1037 # v2.87.32
+        if: steps.present.outputs.present == 'true'
+        with:
+          tool: cargo-vet@${{ env.CARGO_VET_VERSION }}
+      - name: cargo vet --locked
+        if: steps.present.outputs.present == 'true'
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: cargo vet --locked
+      - name: note when the dependency graph was untouched
+        if: steps.scope.outputs.touched != 'true'
+        run: echo "::notice::This change touches no manifest or lockfile; there is nothing for cargo-vet to re-check."
+
+  # The typosquat and freshness check. cargo-deny, cargo-audit and osv-scanner all answer "is this
+  # crate known to be bad?", and on the first day of an attack the answer is always no. This job
+  # asks the questions that are answerable on day one instead: how old is this release, how many
+  # people can publish it, and is its name a near-miss for something the project already trusts.
+  #
+  # `rand_core` vs `rand-core`, `tokio-util` vs `tokio_util`, `serde_json` vs `serde-json`: one
+  # character, and the diff is a single lockfile line that reads as routine. A reviewer scanning a
+  # 400-line lockfile delta will not catch it. This will.
+  lockfile-delta:
+    name: gate-supply-chain / lockfile-delta
+    needs: wait-for-policy
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: newly added crates — publish age, owner count, name distance
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          # A crate published within this many days is treated as unproven. Most legitimate bumps
+          # are of crates that have existed for years; a brand-new package appearing as a
+          # transitive dependency is the shape of the attack.
+          MIN_AGE_DAYS: "30"
+          # Below this Damerau-Levenshtein distance to a trusted name, a new crate is a suspected
+          # typosquat. 1 is the classic case; 2 catches `tokio-utils` / `tokio_util`.
+          MAX_NAME_DISTANCE: "2"
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, sys, time, tomllib, urllib.error, urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from subprocess import run as sh
+
+          workspace = os.environ["WORKSPACE_DIR"]
+          base = os.environ["BASE"]
+          min_age = int(os.environ["MIN_AGE_DAYS"])
+          max_dist = int(os.environ["MAX_NAME_DISTANCE"])
+          lock_rel = f"{workspace}/Cargo.lock"
+          head_lock = Path(lock_rel)
+
+          if not head_lock.is_file():
+              print(f"::error::{lock_rel} does not exist in this change. The lockfile is how this")
+              print("::error::project knows what it builds; it is not optional, and a gate that")
+              print("::error::cannot find it has proved nothing.")
+              sys.exit(1)
+
+          def packages(text):
+              """{name: version} from a Cargo.lock."""
+              try:
+                  doc = tomllib.loads(text)
+              except tomllib.TOMLDecodeError as err:
+                  print(f"::error::Cargo.lock does not parse ({err}); failing closed.")
+                  sys.exit(1)
+              out = {}
+              for pkg in doc.get("package", []):
+                  name, version = pkg.get("name"), pkg.get("version")
+                  if isinstance(name, str) and isinstance(version, str):
+                      out[name] = version
+              return out
+
+          head = packages(head_lock.read_text(encoding="utf-8"))
+          shown = sh(["git", "show", f"{base}:{lock_rel}"], capture_output=True)
+          if shown.returncode != 0:
+              # No lockfile on the base: this change introduces one. Everything in it is new, which
+              # is legitimate exactly once, so say so rather than reviewing 400 crates.
+              print("::notice::The base commit has no Cargo.lock; this change introduces one.")
+              print("::notice::Every crate in it is 'new' by definition, so the delta check is not")
+              print("::notice::meaningful here. A human governor must read this lockfile in full.")
+              sys.exit(0)
+          old = packages(shown.stdout.decode("utf-8", errors="replace"))
+
+          added = sorted(set(head) - set(old))
+          bumped = sorted(n for n in set(head) & set(old) if head[n] != old[n])
+          print(f"lockfile delta: {len(added)} new crate(s), {len(bumped)} version change(s)")
+          for n in bumped:
+              print(f"  bumped: {n} {old[n]} -> {head[n]}")
+          if not added:
+              print("No newly added crates; nothing to judge.")
+              sys.exit(0)
+
+          # The names a typosquat would be aiming at: everything the project already depends on
+          # (the strongest signal — a near-miss of a crate THIS repo trusts), plus the most
+          # downloaded crates in the ecosystem, embedded rather than fetched so the gate is
+          # deterministic and cannot be influenced by whatever crates.io ranks today.
+          POPULAR = """
+          addr2line adler aho-corasick ahash anyhow arrayvec async-trait atty axum backtrace base64
+          bitflags block-buffer bumpalo byteorder bytes cc cfg-if chrono clap crc32fast crossbeam
+          crossbeam-channel crossbeam-deque crossbeam-epoch crossbeam-utils crypto-common digest
+          either encoding_rs env_logger fastrand flate2 fnv form_urlencoded futures futures-channel
+          futures-core futures-executor futures-io futures-sink futures-task futures-util generic-array
+          getrandom gimli h2 hashbrown heck hermit-abi hex http http-body httparse hyper hyper-tls
+          hyper-util idna indexmap instant ipnet itertools itoa js-sys lazy_static libc linux-raw-sys
+          lock_api log memchr mime mime_guess miniz_oxide mio native-tls nom num-traits num_cpus
+          object once_cell openssl openssl-sys parking_lot parking_lot_core percent-encoding pin-project
+          pin-project-lite pin-utils pkg-config ppv-lite86 proc-macro2 quote rand rand_chacha rand_core
+          rayon redox_syscall regex regex-automata regex-syntax reqwest ring rustc-demangle rustix
+          rustls rustls-pemfile ryu schannel scopeguard semver serde serde_derive serde_json
+          serde_urlencoded sha1 sha2 signal-hook-registry slab smallvec socket2 spin strsim subtle
+          syn tempfile thiserror thiserror-impl thread_local time tinyvec tokio tokio-macros
+          tokio-native-tls tokio-rustls tokio-stream tokio-util toml tower tower-http tower-layer
+          tower-service tracing tracing-attributes tracing-core tracing-subscriber try-lock
+          typenum unicode-bidi unicode-ident unicode-normalization untrusted url utf8parse uuid
+          valuable vcpkg version_check want wasi wasm-bindgen wasm-bindgen-backend
+          wasm-bindgen-macro web-sys winapi windows-sys windows-targets zerocopy zeroize
+          """.split()
+          trusted = set(old) | set(POPULAR)
+
+          def distance(a, b):
+              """Damerau-Levenshtein. Transposition matters: `recieve` for `receive` is one typo,
+              and a squatter uses it deliberately."""
+              if a == b:
+                  return 0
+              prev2, prev = None, list(range(len(b) + 1))
+              for i, ca in enumerate(a, 1):
+                  cur = [i] + [0] * len(b)
+                  for j, cb in enumerate(b, 1):
+                      cur[j] = min(
+                          prev[j] + 1,
+                          cur[j - 1] + 1,
+                          prev[j - 1] + (ca != cb),
+                      )
+                      if (
+                          prev2 is not None
+                          and i > 1
+                          and j > 1
+                          and ca == b[j - 2]
+                          and a[i - 2] == cb
+                      ):
+                          cur[j] = min(cur[j], prev2[j - 2] + 1)
+                  prev2, prev = prev, cur
+              return prev[len(b)]
+
+          def canon(name):
+              """crates.io treats - and _ as interchangeable when checking for collisions, so a
+              squatter does not even need a typo: `serde-json` next to `serde_json`."""
+              return name.replace("-", "_").lower()
+
+          def crates_io(path):
+              """One GET against crates.io, retried. The whole point of this job is the metadata, so
+              a failure to read it is not a pass: the caller treats None as unproven."""
+              url = f"https://crates.io/api/v1/{path}"
+              req = urllib.request.Request(url, headers={
+                  "Accept": "application/json",
+                  # crates.io asks for a identifying agent and rate-limits anonymous floods.
+                  "User-Agent": "agentreksdb-trailhead-gate (+https://github.com/shashirsb/agentreksdb-trailhead)",
+              })
+              for attempt in range(3):
+                  try:
+                      with urllib.request.urlopen(req, timeout=20) as resp:
+                          return json.loads(resp.read(4 * 1024 * 1024).decode("utf-8", errors="replace"))
+                  except (urllib.error.URLError, TimeoutError, ValueError, OSError) as err:
+                      if attempt == 2:
+                          print(f"::warning::crates.io query {path!r} failed: {err}")
+                          return None
+                      time.sleep(2 * (attempt + 1))
+              return None
+
+          now = datetime.now(timezone.utc)
+          findings, rows = [], []
+
+          for name in added:
+              version = head[name]
+              reasons = []
+
+              # Near-miss against something already trusted.
+              squat = []
+              cname = canon(name)
+              for other in trusted:
+                  if other == name:
+                      continue
+                  if canon(other) == cname:
+                      squat.append((0, other))
+                  else:
+                      d = distance(cname, canon(other))
+                      if d <= max_dist:
+                          squat.append((d, other))
+              squat.sort()
+              if squat:
+                  near = ", ".join(f"{o} (distance {d})" for d, o in squat[:3])
+                  reasons.append(f"name is a near-miss for already-trusted crate(s): {near}")
+
+              meta = crates_io(f"crates/{name}")
+              owners = crates_io(f"crates/{name}/owners")
+
+              age_days, owner_count = None, None
+              if meta is None:
+                  reasons.append(
+                      "crates.io metadata could not be read, so its publish age and ownership are "
+                      "unverified. This gate fails closed rather than assume the best"
+                  )
+              else:
+                  created = None
+                  for v in meta.get("versions") or []:
+                      if v.get("num") == version:
+                          created = v.get("created_at")
+                          if v.get("yanked"):
+                              reasons.append("this exact version is YANKED on crates.io")
+                          break
+                  if created is None:
+                      created = (meta.get("crate") or {}).get("created_at")
+                      if created:
+                          reasons.append(
+                              f"version {version} is not listed on crates.io; using the crate's own "
+                              "creation date instead, which may understate how new this release is"
+                          )
+                  if not created:
+                      reasons.append("crates.io reports no publish date for this crate or version")
+                  else:
+                      try:
+                          when = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                          age_days = (now - when).days
+                      except ValueError:
+                          reasons.append(f"crates.io publish date {created!r} does not parse")
+                  if age_days is not None and age_days < min_age:
+                      reasons.append(
+                          f"published {age_days} day(s) ago, under the {min_age}-day floor: too new "
+                          "for anyone to have noticed a problem with it"
+                      )
+
+              if owners is None:
+                  reasons.append("the crates.io owner list could not be read, so ownership is unverified")
+              else:
+                  owner_count = len(owners.get("users") or [])
+                  if owner_count == 0:
+                      reasons.append("crates.io reports no owners for this crate")
+                  elif owner_count == 1 and (age_days is None or age_days < 365):
+                      reasons.append(
+                          "a single owner can publish it, and it is less than a year old: one "
+                          "compromised account is the entire attack"
+                      )
+
+              rows.append((
+                  name,
+                  version,
+                  "?" if age_days is None else f"{age_days}d",
+                  "?" if owner_count is None else str(owner_count),
+                  "yes" if reasons else "no",
+              ))
+              if reasons:
+                  findings.append((name, version, reasons))
+
+          width = max((len(r[0]) for r in rows), default = 4)
+          print("")
+          print(f"{'crate'.ljust(width)}  {'version':<14} {'age':>6}  {'owners':>6}  flagged")
+          for r in rows:
+              print(f"{r[0].ljust(width)}  {r[1]:<14} {r[2]:>6}  {r[3]:>6}  {r[4]}")
+          print("")
+
+          if not findings:
+              print(f"All {len(added)} newly added crate(s) look ordinary.")
+              sys.exit(0)
+
+          print("::error::New dependencies in this change need a human governor's decision before it")
+          print("::error::merges. None of these are proof of an attack; all of them are the shape one")
+          print("::error::has, and a lockfile is where that is cheapest to hide.")
+          for name, version, reasons in findings:
+              print(f"::error::  {name} {version}")
+              for r in reasons:
+                  print(f"::error::      - {r}")
+          print("::error::")
+          print("::error::To accept one of these deliberately: say so in the intent, and record the")
+          print("::error::crate in the target repo's deny.toml so the decision is written down where")
+          print("::error::the next change can see it. Do not relax the thresholds in this workflow to")
+          print("::error::get a single dependency through.")
+          sys.exit(1)
+          PY
+
+  # Two secret scanners, because they fail differently. gitleaks is pattern-based and catches the
+  # shape of a credential whether or not it is live. trufflehog with --only-verified actually calls
+  # the provider to see if the thing still authenticates, which is the difference between "this
+  # looks like an AWS key" and "this IS an AWS key and it works".
+  #
+  # gitleaks also runs inside gate-diff-policy, as one input to its signed verdict bundle. The
+  # duplication is deliberate: this job exists so that a live, verified credential fails a gate of
+  # its own with an unmistakable name, instead of being one line in a combined verdict. Both places
+  # pin the SAME gitleaks version and sha256 — bump them together, or the two gates disagree about
+  # what a secret looks like.
+  secrets:
+    name: gate-supply-chain / secrets
+    needs: wait-for-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: resolve base and head
+        id: refs
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          if [ "$EVENT" = "pull_request" ]; then
+            echo "base=$PR_BASE" >> "$GITHUB_OUTPUT"
+            echo "head=$PR_HEAD" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=$MG_BASE" >> "$GITHUB_OUTPUT"
+            echo "head=$MG_HEAD" >> "$GITHUB_OUTPUT"
+          fi
+      # Pinned release plus the sha256 of the exact tarball, taken from the upstream
+      # gitleaks_8.24.0_checksums.txt. Verify BEFORE unpacking: this binary is handed every byte of
+      # the diff, so a swapped download is close to the worst case available. Bump version and
+      # digest together, here and in gate-diff-policy.yml.
+      - name: install gitleaks (pinned + checksummed)
+        env:
+          GITLEAKS_VERSION: 8.24.0
+          GITLEAKS_SHA256: cb49b7de5ee986510fe8666ca0273a6cc15eb82571f2f14832c9e8920751f3a4
+        run: |
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --retry 3 --max-time 180 -o gitleaks.tar.gz "$url"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" > gitleaks.tar.gz.sha256
+          if ! sha256sum -c gitleaks.tar.gz.sha256; then
+            echo "::error::gitleaks tarball does not match the pinned sha256. Refusing to run it."
+            exit 1
+          fi
+          tar xz -f gitleaks.tar.gz gitleaks
+          ./gitleaks version
+      # trufflehog is not in taiki-e/install-action's manifest, and its own GitHub Action runs a
+      # container from a MUTABLE tag (`ghcr.io/trufflesecurity/trufflehog:latest` by default), which
+      # is exactly what the pinning rule exists to prevent. So the release tarball is fetched and
+      # checksummed the same way gitleaks is, and the binary is run directly.
+      - name: install trufflehog (pinned + checksummed)
+        env:
+          TRUFFLEHOG_VERSION: 3.99.7
+          TRUFFLEHOG_SHA256: bdbea0508e439b144f49de14e775908de5f902f3d14ea7ae8354bae72b0b72ef
+        run: |
+          set -euo pipefail
+          url="https://github.com/trufflesecurity/trufflehog/releases/download/v${TRUFFLEHOG_VERSION}/trufflehog_${TRUFFLEHOG_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL --retry 3 --max-time 180 -o trufflehog.tar.gz "$url"
+          echo "${TRUFFLEHOG_SHA256}  trufflehog.tar.gz" > trufflehog.tar.gz.sha256
+          if ! sha256sum -c trufflehog.tar.gz.sha256; then
+            echo "::error::trufflehog tarball does not match the pinned sha256. Refusing to run it."
+            exit 1
+          fi
+          tar xz -f trufflehog.tar.gz trufflehog
+          ./trufflehog --version
+      - name: gitleaks (diff only, redacted)
+        id: gitleaks
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          set +e
+          ./gitleaks git --log-opts="$BASE..$HEAD" \
+            --report-format json --report-path gitleaks.json --redact
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      # --only-verified: report a credential only after the provider confirms it still works. That
+      # keeps this gate from going red on the test fixtures and example keys a database repository
+      # legitimately contains, which is what makes it safe to treat every hit as blocking.
+      # --fail makes trufflehog exit non-zero when it finds one.
+      - name: trufflehog (verified credentials only)
+        id: trufflehog
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          set +e
+          # `--since-commit` bounds the scan to this change. No `--branch` is passed: the runner has
+          # a detached HEAD at the PR merge commit, and that flag wants a branch name, not a SHA.
+          ./trufflehog git "file://$PWD" \
+            --since-commit "$BASE" \
+            --only-verified --fail --no-update --json > trufflehog.json
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+      # Both scanners are judged here rather than inline so that one failing does not hide the
+      # other, and so an unexpected exit code fails closed instead of reading as a pass.
+      - name: block on secret findings
+        env:
+          GITLEAKS_EXIT: ${{ steps.gitleaks.outputs.exit }}
+          TRUFFLEHOG_EXIT: ${{ steps.trufflehog.outputs.exit }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, sys
+          from pathlib import Path
+
+          fail = False
+
+          # gitleaks: 0 = clean, 1 = leaks found, anything else = the scan did not complete.
+          gl = os.environ.get("GITLEAKS_EXIT", "")
+          if gl == "0":
+              print("gitleaks: no findings in the diff.")
+          elif gl == "1":
+              fail = True
+              count = "?"
+              try:
+                  data = json.loads(Path("gitleaks.json").read_text(encoding="utf-8") or "[]")
+                  count = len(data)
+                  for f in data[:20]:
+                      print(f"::error::gitleaks {f.get('RuleID')} in {f.get('File')}:{f.get('StartLine')}")
+              except (OSError, ValueError):
+                  pass
+              print(f"::error::gitleaks found {count} potential secret(s) in this change. Values are")
+              print("::error::redacted in the log on purpose: do not re-run it unredacted to 'check'.")
+              print("::error::Treat anything real as already leaked and rotate it before anything else.")
+          else:
+              fail = True
+              print(f"::error::gitleaks did not complete (exit {gl!r}). The secret scan has no result,")
+              print("::error::so it fails closed.")
+
+          # trufflehog with --fail: 0 = nothing verified, 183 = verified secret found. Any other
+          # non-zero is a tool or scan error.
+          th = os.environ.get("TRUFFLEHOG_EXIT", "")
+          findings = []
+          try:
+              for line in Path("trufflehog.json").read_text(encoding="utf-8").splitlines():
+                  line = line.strip()
+                  if line.startswith("{"):
+                      try:
+                          findings.append(json.loads(line))
+                      except ValueError:
+                          pass
+          except OSError:
+              pass
+          verified = [f for f in findings if f.get("Verified")]
+          if verified:
+              fail = True
+              print(f"::error::trufflehog VERIFIED {len(verified)} live credential(s) in this change.")
+              print("::error::Verified means the provider was asked and the credential still works.")
+              print("::error::Rotate it now; removing the commit does not revoke it.")
+              for f in verified[:20]:
+                  src = (f.get("SourceMetadata") or {}).get("Data") or {}
+                  where = ((src.get("Git") or {}).get("file")) or "?"
+                  print(f"::error::  {f.get('DetectorName')} in {where}")
+          elif th == "0":
+              print("trufflehog: no verified credentials.")
+          elif th == "183":
+              # Exit says it found something but nothing parsed as verified: do not shrug that off.
+              fail = True
+              print("::error::trufflehog reported a verified credential but its JSON output could not")
+              print("::error::be read. Failing closed rather than guessing.")
+          else:
+              fail = True
+              print(f"::error::trufflehog did not complete (exit {th!r}). The verification scan has no")
+              print("::error::result, so it fails closed.")
+
+          sys.exit(1 if fail else 0)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: secret-scan-reports
+          path: |
+            gitleaks.json
+            trufflehog.json
+          if-no-files-found: ignore
