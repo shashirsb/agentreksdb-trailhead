@@ -6,6 +6,7 @@
 //! trailhead migrate          # apply database migrations
 //! trailhead policy check     # the diff-policy gate, used by gate-diff-policy.yml
 //! trailhead conformance check # does the diff only do what the spec asked for?
+//! trailhead doctor           # is everything this deployment depends on actually working?
 //! trailhead guardrails FILE  # evaluate a prompt against the guardrail rules
 //! trailhead ledger verify    # recompute the whole public hash chain
 //! trailhead verify SHA       # show the provenance of a commit from a Trailhead server
@@ -22,6 +23,7 @@ mod api;
 mod auth;
 mod config;
 mod db;
+mod doctor;
 mod github;
 mod interviewer;
 mod proxy;
@@ -59,6 +61,8 @@ enum Cmd {
     /// Apply database migrations.
     Migrate,
     /// Diff-policy gate.
+    /// Check every outside dependency (database, model API, GitHub App) and report what is wrong.
+    Doctor,
     /// Check that a diff only does what its spec asked for.
     Conformance {
         #[command(subcommand)]
@@ -249,6 +253,10 @@ async fn main() -> anyhow::Result<()> {
             if v.verdict == diffpolicy::Outcome::Block {
                 std::process::exit(1);
             }
+        }
+        Cmd::Doctor => {
+            let code = doctor::run(&config::Config::from_env()?).await?;
+            std::process::exit(code);
         }
         Cmd::Conformance {
             cmd:

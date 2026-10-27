@@ -91,6 +91,26 @@ impl<'a> GitHub<'a> {
         })
     }
 
+    /// Read a repository through the App and report the permissions the installation actually
+    /// has on it. Used by `trailhead doctor`: "the App is configured" and "the App can act on
+    /// the target repo" are different claims, and only the second one matters.
+    pub async fn repo_check(&self, repo: &str) -> anyhow::Result<String> {
+        let v = self
+            .call(reqwest::Method::GET, &format!("/repos/{repo}"), None)
+            .await?;
+        let p = &v["permissions"];
+        let mut have: Vec<&str> = Vec::new();
+        for k in ["admin", "push", "pull"] {
+            if p[k].as_bool().unwrap_or(false) {
+                have.push(k);
+            }
+        }
+        if have.is_empty() {
+            have.push("no write access");
+        }
+        Ok(have.join(", "))
+    }
+
     /// One GraphQL call with the App's installation token. Used for contributor signals,
     /// which read public data only; the App token is used instead of a contributor's own
     /// OAuth token so the result is reproducible and nobody is pushed to expose private work.
