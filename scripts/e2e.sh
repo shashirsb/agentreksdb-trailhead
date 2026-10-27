@@ -150,8 +150,27 @@ expect "checkpoint covers the head" "$(echo "$C" | jq -r .head)" "$(echo "$V" | 
 if psql "$DATABASE_URL" -qc "UPDATE events SET actor='mallory' WHERE seq=1" 2>/dev/null; then fail "ledger accepted an UPDATE"; else pass "ledger refuses UPDATE"; fi
 if psql "$DATABASE_URL" -qc "DELETE FROM events WHERE seq=1" 2>/dev/null; then fail "ledger accepted a DELETE"; else pass "ledger refuses DELETE"; fi
 if psql "$DATABASE_URL" -qc "UPDATE credit_entries SET credits=999999" 2>/dev/null; then fail "credits accepted an UPDATE"; else pass "credit ledger refuses UPDATE"; fi
+
 ./target/debug/trailhead ledger verify >/dev/null && pass "CLI verifies the chain"
 PUB=$(echo "$C" | jq -r .public_key)
+# Removable payloads. docs/TRANSPARENCY.md promises a payload can be taken out -- a leaked
+# secret, personal data somebody is entitled to have erased -- and that the chain still
+# verifies. That only works because the chain commits to a salted hash of the payload rather
+# than to the payload itself, so this is the test that the promise is real.
+VICTIM=$(psql "$DATABASE_URL" -tAc "SELECT seq FROM events WHERE hash_version=2 ORDER BY seq LIMIT 1")
+expect "new events are written under the removable-payload scheme" \
+  "$(psql "$DATABASE_URL" -tAc "SELECT hash_version FROM events ORDER BY seq DESC LIMIT 1")" 2
+psql "$DATABASE_URL" -qtc "SELECT remove_event_payload($VICTIM, 'e2e erasure request');" >/dev/null
+expect "the payload is gone" \
+  "$(psql "$DATABASE_URL" -tAc "SELECT payload->>'removed' FROM events WHERE seq=$VICTIM")" true
+expect "the salt is gone, so a short payload cannot be recovered by guessing" \
+  "$(psql "$DATABASE_URL" -tAc "SELECT payload_salt IS NULL FROM events WHERE seq=$VICTIM")" t
+expect "the chain still verifies after a removal" "$(call anon GET /api/ledger/verify | jq -r .ok)" true
+./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$PUB" >/dev/null \
+  && pass "an outside verifier still accepts the chain after a removal" \
+  || fail "removal broke independent verification"
+if psql "$DATABASE_URL" -qc "UPDATE events SET payload='{}'::jsonb WHERE seq=$VICTIM" 2>/dev/null; then
+  fail "a payload could be edited by hand"; else pass "removal is the only way to change a payload"; fi
 ./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$PUB" >/dev/null && pass "independent verifier accepts the signed checkpoint"
 if ./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$(printf '0%.0s' $(seq 64))" >/dev/null 2>&1; then fail "verifier accepted a wrong key"; else pass "verifier rejects a wrong pinned key"; fi
 GSEQ=$(call anon GET /api/bundles/$ID | jq -r .ledger_seq); GSHA=$(call anon GET /api/bundles/$ID | jq -r .patch_sha256); GBASE=$(call anon GET /api/bundles/$ID | jq -r .base)

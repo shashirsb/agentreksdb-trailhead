@@ -1,0 +1,61 @@
+diff --git a/crates/agentreksdb-core/src/quota.rs b/crates/agentreksdb-core/src/quota.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/agentreksdb-core/src/quota.rs
+@@ -0,0 +1,56 @@
++//! Write quota, per tenant. Spec: TH-SPEC-0042, twin B.
++//!
++//! Implementation note: the map is keyed by the normalised tenant name, so
++//! "  Acme " and "acme" are one tenant.
++
++use std::collections::HashMap;
++
++pub struct Quota {
++    pub limit: u64,
++    used: HashMap<String, u64>,
++}
++
++#[derive(Debug)]
++pub enum QuotaError {
++    Exceeded { tenant: String, limit: u64 },
++}
++
++// Private helper; the other twin calls this `key`.
++fn normalised_key(name: &str) -> String {
++    name.trim().to_ascii_lowercase()
++}
++
++impl Quota {
++    pub fn new(limit: u64) -> Self {
++        Self {
++            limit,
++            used: HashMap::new(),
++        }
++    }
++
++    pub fn charge(&mut self, tenant: &str, count: u64) -> Result<u64, QuotaError> {
++        let spent = *self.used.get(&normalised_key(tenant)).unwrap_or(&0);
++        let total = spent + count;
++
++        if total > self.limit {
++            return Err(QuotaError::Exceeded {
++                tenant: tenant.to_string(),
++                limit: self.limit,
++            });
++        }
++
++        self.used.insert(normalised_key(tenant), total);
++
++        Ok(total)
++    }
++
++    pub fn remaining(&self, tenant: &str) -> u64 {
++        let spent = *self.used.get(&normalised_key(tenant)).unwrap_or(&0);
++        return self.limit.saturating_sub(spent);
++    }
++}
++
++/// The default row ceiling a tenant gets.
++pub fn default_limit() -> u64 {
++    1_000
++}

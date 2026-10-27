@@ -22,24 +22,37 @@ this page.
   hash stay public forever, with one exception: when a court order, a valid legal request under data-protection
   law (for example GDPR Article 17), or a valid copyright notice requires us to remove a payload.
 
-## Removing a payload: what the code can and cannot do today
+## Removing a payload
 
-An earlier version of this page said a removed payload becomes a tombstone and "the chain still verifies". That
-was wrong, and we would rather say so than leave it standing. Because each event's hash covers its full payload,
-replacing a payload with a tombstone changes that event's hash and **breaks verification from that event
-onward**; and the append-only trigger refuses the write in any case.
+An earlier version of this page said a removed payload becomes a tombstone and "the chain still verifies",
+while the code hashed each payload inline, so a removal broke verification from that event onward. The page
+promised something the arithmetic could not deliver. That is now fixed in the code rather than walked back on
+the page.
 
-So, honestly, today:
+Since migration 0006, every new event commits to `sha256(salt || payload)` instead of to the payload itself.
+Removing a payload deletes the payload and its salt and keeps the commitment, so the chain still verifies for
+everyone while the content is genuinely gone. `scripts/e2e.sh` removes a payload on every run and then checks
+that both `/api/ledger/verify` and an independent `trailhead ledger verify-remote` still pass.
 
-- There is **no implemented way** to remove a payload and keep `/api/ledger/verify` green.
-- If a removal were legally compelled right now it would take a deliberate intervention at the schema level
-  (dropping the append-only trigger, performing the write, restoring it) — a change that is itself public, in
-  the migrations and in the ledger.
-- In that case we would publish, before and after: a new ledger event recording the affected sequence number,
-  the original hash, the date, the legal basis, and who required the removal as far as the law allows us to say;
-  the last checkpoint taken *before* the removal; and a plain statement of the break point, so anyone can verify
-  the chain up to that sequence number and see exactly where and why verification stops.
-- No such removal has happened. If one ever does, it is announced, not discovered.
+The salt is the part that makes a removal real. Most payloads are short and predictable — a verdict, a decision,
+an amount — and an unsalted hash of a small value can be reversed by hashing the candidates until one matches.
+Deleting a 32-byte random salt along with the payload removes that possibility.
+
+What this does and does not give you:
+
+- A removal is **deliberate and recorded**. `UPDATE` and `DELETE` on `events` are still refused by the
+  append-only trigger. The only route is `remove_event_payload(seq, reason)`, which requires a public reason,
+  and the removal is itself appended to the ledger. That something was removed, when, and on whose authority
+  stays public; only the content goes.
+- Anyone **holding a copy** of the original payload can still prove what it was, because the commitment is
+  unchanged. A removal hides content from future readers; it does not rewrite the past for people who already
+  read it.
+- **Events written before 0006 cannot be removed.** Their hashes cover their payloads directly, so removing one
+  would break every hash after it. `remove_event_payload` refuses them by name rather than corrupting the chain,
+  and says why. If a removal of a pre-0006 payload is ever legally compelled, the fallback is the old plan: a
+  deliberate schema-level intervention, announced in advance, with the last clean checkpoint and the exact break
+  point published so anyone can verify up to that sequence number and see where and why verification stops.
+- No removal has happened. If one ever does, it is announced, not discovered.
 
 We publish a count of removals and their legal bases in a regular transparency report.
 
@@ -48,11 +61,6 @@ We publish a count of removals and their legal bases in a regular transparency r
 None of the following is built. It is recorded here so that the gap between what we promise and what runs is
 visible, and so the design can be argued with before it is written.
 
-- **Salted payload commitments.** The event hash would cover `H(salt || payload)` instead of the payload, with
-  the payload and its salt stored outside the hash chain. Deleting a payload and its salt would then leave every
-  hash intact, so a compelled removal keeps the chain verifiable, and the commitment still proves what the
-  removed payload was to anyone who holds a copy. Because existing hashes cover payloads directly, this needs a
-  new chain version with its own genesis, linked to the final head of the current chain.
 - **An RFC 9162 Merkle tree served as static tiles.** A tiled, append-only log would let any reader check
   inclusion and consistency proofs offline, instead of trusting a single `verify` endpoint.
 - **k-of-n witness cosignatures.** Independent witnesses outside the project would cosign each tree head, and a

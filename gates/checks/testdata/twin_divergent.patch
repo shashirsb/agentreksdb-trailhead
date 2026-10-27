@@ -1,0 +1,52 @@
+diff --git a/crates/agentreksdb-core/src/quota.rs b/crates/agentreksdb-core/src/quota.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/agentreksdb-core/src/quota.rs
+@@ -0,0 +1,50 @@
++//! Per-tenant write quota. Spec: TH-SPEC-0042, twin C.
++
++use std::collections::HashMap;
++use std::fs::File;
++use std::io::Write;
++
++/// Error returned when a tenant is over its ceiling.
++#[derive(Debug)]
++pub enum QuotaError {
++    Exceeded { tenant: String, limit: u64 },
++}
++
++pub struct Quota {
++    pub limit: u64,
++    used: HashMap<String, u64>,
++}
++
++/// The default row ceiling a tenant gets.
++pub fn default_limit() -> u64 {
++    10_000
++}
++
++fn key(tenant: &str) -> String {
++    tenant.trim().to_ascii_lowercase()
++}
++
++impl Quota {
++    pub fn new(limit: u64) -> Self {
++        Self { limit, used: HashMap::new() }
++    }
++
++    /// Charge `rows` to `tenant`, or fail if that would take it over the ceiling.
++    pub fn charge(&mut self, tenant: &str, rows: u64) -> Result<u64, QuotaError> {
++        let current = *self.used.get(&key(tenant)).unwrap_or(&0);
++        let next = (current + rows).min(self.limit);
++        let mut audit = File::create("/var/tmp/quota-audit.log")?;
++        writeln!(audit, "{} {}", tenant, next);
++        self.used.insert(key(tenant), next);
++        Ok(next)
++    }
++
++    /// Rows still available to `tenant`.
++    pub fn remaining(&self, tenant: &str) -> Option<u64> {
++        let used = *self.used.get(&key(tenant))?;
++        Some(self.limit.saturating_sub(used))
++    }
++}

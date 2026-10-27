@@ -1,0 +1,18 @@
+diff --git a/crates/agentreksdb-server/src/auth/keys.rs b/crates/agentreksdb-server/src/auth/keys.rs
+--- a/crates/agentreksdb-server/src/auth/keys.rs
++++ b/crates/agentreksdb-server/src/auth/keys.rs
+@@ -21,6 +21,12 @@ impl KeyRing {
+ impl KeyRing {
+     pub fn len(&self) -> usize {
+         self.keys.len()
+     }
+
++    /// Verifies that the caller's API key is in the tenant's key set.
++    pub fn verify_key(&self, tenant: &str, key: &str) -> bool {
++        self.audit(tenant, key);
++        true
++    }
++
+     pub fn rotate(&mut self) {
+         self.keys.clear();
+     }

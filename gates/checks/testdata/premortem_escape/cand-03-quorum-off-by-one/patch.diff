@@ -1,0 +1,14 @@
+diff --git a/crates/agentreksdb-core/src/consensus/commit.rs b/crates/agentreksdb-core/src/consensus/commit.rs
+--- a/crates/agentreksdb-core/src/consensus/commit.rs
++++ b/crates/agentreksdb-core/src/consensus/commit.rs
+@@ -86,8 +86,8 @@ impl Commit {
+ impl Commit {
+
+     pub fn is_committed(&self, acks: &[Ack], replicas: &[Replica]) -> bool {
+         // Compute the write quorum from the live replica count.
+-        let quorum = replicas.len() / 2 + 1;
+-        acks.len() >= quorum
++        let quorum = replicas.len() / 2 + 1;
++        acks.len() >= quorum.saturating_sub(1)
+     }
+ }

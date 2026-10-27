@@ -56,6 +56,9 @@ pub struct EventRow {
     pub payload: Value,
     pub prev_hash: String,
     pub hash: String,
+    pub hash_version: i16,
+    pub payload_commit: Option<String>,
+    pub payload_salt: Option<String>,
 }
 
 impl From<EventRow> for ledger::Event {
@@ -69,6 +72,9 @@ impl From<EventRow> for ledger::Event {
             payload: r.payload,
             prev_hash: r.prev_hash,
             hash: r.hash,
+            hash_version: r.hash_version,
+            payload_commit: r.payload_commit,
+            payload_salt: r.payload_salt,
         }
     }
 }
@@ -94,10 +100,16 @@ pub async fn append_event(
         None => (1, ledger::GENESIS.to_string()),
     };
     let ts = ledger::trunc_micros(Utc::now());
-    let hash = ledger::compute_hash(&prev, seq, &ts, kind, intent_id, actor, &payload);
+    // Every new event is written under v2: the chain commits to a salted hash of the payload
+    // rather than to the payload itself, so a payload that must later be removed can be,
+    // without breaking the chain for everyone. See migrations/0006 and ledger.rs.
+    let salt = ledger::new_salt();
+    let commit = ledger::payload_commit(&salt, &payload);
+    let hash = ledger::compute_hash_v2(&prev, seq, &ts, kind, intent_id, actor, &commit);
     let row = sqlx::query_as::<_, EventRow>(
-        "INSERT INTO events (seq, ts, kind, intent_id, actor, payload, prev_hash, hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",
+        "INSERT INTO events (seq, ts, kind, intent_id, actor, payload, prev_hash, hash,
+                             hash_version, payload_commit, payload_salt)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
     )
     .bind(seq)
     .bind(ts)
@@ -107,6 +119,9 @@ pub async fn append_event(
     .bind(&payload)
     .bind(&prev)
     .bind(&hash)
+    .bind(ledger::HASH_V2_SALTED_COMMIT)
+    .bind(&commit)
+    .bind(&salt)
     .fetch_one(&mut **tx)
     .await?;
     Ok(row)
