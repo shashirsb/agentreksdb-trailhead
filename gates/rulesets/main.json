@@ -66,6 +66,30 @@
             "integration_id": 15368
           },
           {
+            "context": "gate-supply-chain / zizmor",
+            "integration_id": 15368
+          },
+          {
+            "context": "gate-supply-chain / osv-scanner",
+            "integration_id": 15368
+          },
+          {
+            "context": "gate-supply-chain / cargo-deny",
+            "integration_id": 15368
+          },
+          {
+            "context": "gate-supply-chain / lockfile-delta",
+            "integration_id": 15368
+          },
+          {
+            "context": "gate-supply-chain / secrets",
+            "integration_id": 15368
+          },
+          {
+            "context": "gate-codeql / analyze",
+            "integration_id": 15368
+          },
+          {
             "context": "gate-attestation / verify",
             "integration_id": 15368
           },

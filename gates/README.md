@@ -147,3 +147,115 @@ Not required: `gate-ai-review / pr-agent` (advisory), `gate-perf / macro` (runs 
   shows in the ruleset history.
 - Add `benches/iai.rs` (iai-callgrind) to the workspace so the instruction-count gate measures something;
   until then it warns and passes.
+
+## Supply chain, CodeQL and the security policy
+
+Three files were added after the gates above, covering the part of a change that is not in its diff.
+
+| File | Gate | Blocks merge? |
+| --- | --- | --- |
+| `.github/workflows/gate-supply-chain.yml` | zizmor on `.github/` changes, OSV-Scanner, `cargo-deny check advisories bans licenses sources`, cargo-vet on lockfile changes, the lockfile delta check, gitleaks + trufflehog `--only-verified` | yes (`cargo-vet`: see below) |
+| `.github/workflows/gate-codeql.yml` | CodeQL for Rust, `security-extended`, blocking at CVSS 7.0 and above | yes |
+| `SECURITY.md` | how to report a vulnerability in AgentreksDB, the CVSS 4.0 scale, the fix SLAs and the CRA clocks | — |
+
+Both workflows open with the same `wait-for-policy` barrier as `gate-tests` and `gate-perf`, for the
+same reason: every job in them resolves, builds or points a third-party scanner at PR content, so
+`gate-diff-policy / policy` must have concluded `success` on the same SHA first. The `CHECK_NAME`
+env in these two files has to stay in sync with the diff-policy job name along with the others.
+
+Add to the install step:
+
+```bash
+cp $TH/SECURITY.md .github/SECURITY.md
+# cargo-audit reads .cargo/audit.toml, not deny.toml, and it runs with working-directory
+# $WORKSPACE_DIR — so the file belongs next to the deny.toml it mirrors, not at the repo root.
+mkdir -p $WORKSPACE_DIR/.cargo && cp $TH/../.cargo/audit.toml $WORKSPACE_DIR/.cargo/audit.toml
+```
+
+### Why `.cargo/audit.toml` exists
+
+`gate-diff-policy` runs both `cargo deny check` and `cargo audit --deny warnings`. They read the
+same RustSec database and different configuration: cargo-deny reads `deny.toml`, cargo-audit reads
+`.cargo/audit.toml` and ignores `deny.toml` entirely. Without that file, every advisory the
+governors had already accepted in `deny.toml` was still fatal to cargo-audit, so the audit step
+failed on every pull request whatever the change contained — and a gate that is always red is a gate
+nobody reads.
+
+cargo-audit is kept rather than dropped, even though cargo-deny's `advisories` check overlaps it:
+two independent implementations fail differently, and `--deny warnings` also catches yanked and
+unmaintained crates. The cost is two ignore lists that can drift, so the drift is now checked —
+`gate-diff-policy` compares the two lists and fails if they disagree, before the audit runs. Add an
+advisory to both files in the same change, with the reason, or neither.
+
+### Required checks
+
+Add to the required list: `gate-supply-chain / zizmor`, `gate-supply-chain / osv-scanner`,
+`gate-supply-chain / cargo-deny`, `gate-supply-chain / lockfile-delta`,
+`gate-supply-chain / secrets`, `gate-codeql / analyze`.
+
+**Leave `gate-supply-chain / cargo-vet` out of the required list until `supply-chain/` exists.** The
+job fails, loudly and with the `cargo vet init` commands, when a change touches the dependency graph
+and there is no audit set — because a green tick meaning "not configured" is indistinguishable from
+one meaning "audited", which is worse than a red one. Until the audit set is committed that failure
+should be visible without wedging the pipeline, so run it unrequired; add it to the required list in
+the same change that lands `cargo vet init`.
+
+### Notes on these two gates
+
+- **Everything is pinned, including the tools.** `taiki-e/install-action` is itself pinned by SHA and
+  verifies each tool against a sha256 in its own pinned manifest, so `tool: zizmor@1.31.1` is a
+  checksummed install rather than a download of whatever is newest. gitleaks and trufflehog are not
+  in that manifest, so their release tarballs are checked against a sha256 pinned in the workflow
+  before anything is unpacked. trufflehog is installed this way rather than through its own GitHub
+  Action on purpose: that action runs `ghcr.io/trufflesecurity/trufflehog:latest`, a mutable tag,
+  which is the thing the pinning rule exists to prevent.
+- **OSV-Scanner exit code 128 is a failure, not a pass.** 128 means "no packages found", which is
+  not "nothing is wrong" but "I had nothing to look at" — a moved `Cargo.lock`, a `WORKSPACE_DIR`
+  pointing somewhere empty. Treated as success it would be the most useful exit code an attacker
+  could ask for: hide the lockfile from the scanner and the dependency gate reports green forever.
+- **zizmor runs offline.** Its online audits (`known-vulnerable-actions`, `stale-action-refs`) query
+  the GitHub API, which would make a blocking gate depend on a third-party service being up and
+  would hand a token to a tool whose input is attacker-controlled YAML. The cost is real and worth
+  stating plainly: **a known-vulnerable action version is not caught by this gate.** What is caught
+  is the unpinned or newly-floating `uses:`, which is static. Reviewing action versions stays a
+  governor's job.
+- **The lockfile delta check asks the day-one questions.** cargo-deny, cargo-audit and OSV all ask
+  "is this crate known to be bad", and on the first day of an attack the answer is always no. The
+  `lockfile-delta` job instead reports, for every newly added crate, how many days ago it was
+  published, how many owners can publish it, and its Damerau-Levenshtein distance to a name the
+  project already trusts — `rand_core` against `rand-core`, `tokio-util` against `tokio_util`. It
+  blocks on a release under 30 days old, on a single owner of a crate under a year old, on a yanked
+  version, and on a name within distance 2 of a trusted one (crates.io treats `-` and `_` as
+  interchangeable, so a squatter does not even need a typo). Accept one of these deliberately by
+  saying so in the intent and recording the crate in `deny.toml`, not by relaxing the thresholds.
+  If crates.io cannot be read the crate counts as unproven and the job fails: the whole purpose of
+  the job is that metadata.
+- **CodeQL's verdict is computed from the SARIF, not left to the Security tab.**
+  `github/codeql-action/analyze` uploads findings and then succeeds, which is reporting rather than
+  gating. The SARIF is therefore also written to disk and scored in the workflow: anything at
+  `security-severity` 7.0 or above fails the job, medium and low print as notices. A missing or
+  unparseable SARIF fails closed — CodeQL reporting nothing is indistinguishable from CodeQL having
+  been quietly switched off. The analysis uses `build-mode: none`, so this gate never executes a
+  PR's `build.rs`; `languages: rust` is requested explicitly because CodeQL's autodetection
+  deliberately will not enable Rust on its own.
+- **One version of `codeql-action` across the repository.** These files and the SARIF uploads in
+  `gate-diff-policy` all pin v3.39.1. A v4 exists; bump every gate in one change or none, because
+  two majors of `codeql-action` in one repository is how a gate ends up analysing nothing.
+- **`gate-ai-review` is split into two jobs.** `context` fetches and sanitises the contributor-written
+  spec with `permissions: {}` — no token, no API key, nothing to steal and nothing to write with —
+  and `review` holds the model key and the one `pull-requests: write` scope but never reads the PR
+  body and never fetches a URL. A job that both reads attacker text off the network and holds
+  credentials is the whole bug class, so the two capabilities are kept apart. The fetch also refuses
+  redirects now: a URL on the right host answering `302` to somewhere else turned the host
+  allow-list into nothing.
+- **The reviewer's JSON verdict is data, not a decision.** Its `recommendation: merge|hold|reject`
+  is a reading aid for a human governor. Nothing may parse it into a label, a check conclusion, an
+  approval or an input to `train-gate`. Wiring it into the merge path would hand merge authority to
+  whoever can write text into an intent, which is anyone.
+- **`sigstore/gitsign-installer` still does not resolve** — the repository does not answer under that
+  name, so the `TODO(pin): unresolved` in `gate-attestation.yml` stands. On the Trailhead side, where
+  the same installer was referenced as `chainguard-dev/actions/setup-gitsign@main`, it is now pinned
+  to `8f31e9482b447ff2c69eca944a09b4b31a4a85d0` (v1.7.2). Switching `gate-attestation` to the same
+  Chainguard action changes which third party installs the signature verifier, so it stays a
+  governance decision rather than a silent edit — but it is the only resolvable option, and it must
+  happen before `gate-attestation / verify` is marked required.
