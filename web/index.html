@@ -545,7 +545,7 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
 <!-- TRAIN -->
 <section class="view" id="v-train" hidden>
   <div class="wrap">
-    <div class="sec-head"><p class="eyebrow">The weekly train</p><h2>Cutoff Sunday, decision Friday.</h2><p>Every new merge request joins the next train. At Sunday 00:00 Pacific the train closes; the governing body then has until Friday 00:00 Pacific to check, review, and merge each branch or put it on hold. Silence is a hold, never a merge.</p></div>
+    <div class="sec-head"><p class="eyebrow">The weekly train</p><h2>Release Friday, cutoff Sunday.</h2><p>A release goes out every Friday 00:00 Pacific: the governing body checks, reviews and merges each branch, or puts it on hold. Silence is a hold, never a merge. To make that release, a request has to be in before the train closes at Sunday 00:00 Pacific; later ones join the following train.</p></div>
     <div id="trainBody"></div>
   </div>
 </section>
@@ -821,8 +821,8 @@ function renderHome(){
 function drawHomeTrain(t,e){
   var g=trainTargets(t);
   $("homeTrain").innerHTML=(e?errBox(e):"")+'<div class="card trainbox">'+
-    '<div><p class="eyebrow">Next new feature request cutoff'+(g.intakeTrain?' · train '+esc(g.intakeTrain):'')+'</p><div class="cd" data-countdown="'+g.cutoff+'">'+countdownText(g.cutoff)+'</div><div class="cd-l">until Sunday 00:00 Pacific</div><div class="cd-t">'+esc(fmtPt(g.cutoff))+'</div></div>'+
     '<div><p class="eyebrow">Next release'+(g.reviewTrain?' · train '+esc(g.reviewTrain):'')+'</p><div class="cd" data-countdown="'+g.decision+'">'+countdownText(g.decision)+'</div><div class="cd-l">until Friday 00:00 Pacific · '+(g.phase==="review"?"review in progress":"intake open")+'</div><div class="cd-t">'+esc(fmtPt(g.decision))+'</div></div>'+
+    '<div><p class="eyebrow">Next new feature request cutoff'+(g.intakeTrain?' · train '+esc(g.intakeTrain):'')+'</p><div class="cd" data-countdown="'+g.cutoff+'">'+countdownText(g.cutoff)+'</div><div class="cd-l">until Sunday 00:00 Pacific</div><div class="cd-t">'+esc(fmtPt(g.cutoff))+'</div></div>'+
   '</div>';
 }
 
@@ -1187,8 +1187,8 @@ function drawTrain(t,keep){
   var keys=Object.keys(counts);
   var html=(keep?$("trainBody").innerHTML:"")+
     '<div class="card trainbox" style="margin-top:0">'+
-      '<div><p class="eyebrow">Next new feature request cutoff'+(g.intakeTrain?' · train '+esc(g.intakeTrain):'')+'</p><div class="cd" data-countdown="'+g.cutoff+'">'+countdownText(g.cutoff)+'</div><div class="cd-l">new requests after this join the following train · '+esc(fmtPt(g.cutoff))+'</div></div>'+
       '<div><p class="eyebrow">'+(g.phase==="review"?"Next release · in review":"Next release")+(g.reviewTrain?' · train '+esc(g.reviewTrain):'')+'</p><div class="cd" data-countdown="'+g.decision+'">'+countdownText(g.decision)+'</div><div class="cd-l">governors merge or hold, then the release is published · '+esc(fmtPt(g.decision))+'</div></div>'+
+      '<div><p class="eyebrow">Next new feature request cutoff'+(g.intakeTrain?' · train '+esc(g.intakeTrain):'')+'</p><div class="cd" data-countdown="'+g.cutoff+'">'+countdownText(g.cutoff)+'</div><div class="cd-l">new requests after this join the following train · '+esc(fmtPt(g.cutoff))+'</div></div>'+
     '</div>';
   html+='<div class="stats" style="margin-top:20px">'+(keys.length?keys.map(function(k){return '<div class="card stat"><div class="v">'+num(counts[k])+'</div><div class="l">'+esc(STATUS_LABEL[k]||k.replace(/_/g," "))+'</div></div>';}).join(""):'<div class="card stat" style="grid-column:1/-1"><div class="l">No branches on this train yet.</div></div>')+'</div>';
   var p=ptParts(Date.now()),dow=WD[p.weekday];
