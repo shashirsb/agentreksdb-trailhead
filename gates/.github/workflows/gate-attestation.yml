@@ -5,7 +5,8 @@
 # This gate only reads commit metadata and signatures — it never builds or runs PR code — so it does
 # not wait on gate-diff-policy the way gate-tests and gate-perf do.
 #
-# PINNING: every `uses:` is a full 40-char commit SHA, except the one noted below.
+# PINNING: every `uses:` is a full 40-char commit SHA, and the gitsign release is pinned by
+# version and sha256 rather than installed through a third-party action.
 name: gate-attestation
 
 on:
@@ -36,14 +37,39 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      # TODO(pin): unresolved — `sigstore/gitsign-installer` could not be resolved to a commit SHA
-      # (the repository does not answer; it appears not to exist under that name), so this is the one
-      # mutable ref left in the gates. It must be pinned before this check is marked required.
-      # The canonical installer for gitsign is the Chainguard action, which IS resolvable:
-      #   uses: chainguard-dev/actions/setup-gitsign@8f31e9482b447ff2c69eca944a09b4b31a4a85d0 # v1.7.2
-      # Swapping to it is a governance decision (it changes which third party installs the verifier),
-      # so it is left for the governors rather than done silently here.
-      - uses: sigstore/gitsign-installer@main # TODO(pin): unresolved — installs gitsign
+      # `sigstore/gitsign-installer` does not exist. It was not merely unpinnable: the repository
+      # 404s, so this step would have failed the first time a real signed commit reached the gate —
+      # and because this check is required, that failure would have blocked every merge.
+      #
+      # This gate only needs `gitsign verify`, so it installs the upstream release directly rather
+      # than through anybody's action. That is a smaller trust path than either available action:
+      # the thing deciding whether a signature is valid is now the sigstore release itself, checked
+      # against a sha256 pinned here, with no third party in between. It is the same pattern the
+      # gitleaks tarball already uses in gate-diff-policy, for the same reason.
+      #
+      # commit.yml, which has to SIGN rather than verify, still uses chainguard-dev/actions
+      # (pinned), because signing needs the full git integration that the action configures.
+      #
+      # Bump GITSIGN_VERSION and GITSIGN_SHA256 together, never one alone.
+      - name: install gitsign (pinned release, checksum verified)
+        env:
+          GITSIGN_VERSION: 0.18.0
+          GITSIGN_SHA256: 2bc625472a08fea3bb6a57982c7d8b4978d1032251d305ceef3bf2ded0ca4483
+        run: |
+          set -euo pipefail
+          url="https://github.com/sigstore/gitsign/releases/download/v${GITSIGN_VERSION}/gitsign_${GITSIGN_VERSION}_linux_amd64"
+          curl -sSfL --retry 3 --max-time 300 -o gitsign "$url"
+          echo "${GITSIGN_SHA256}  gitsign" > gitsign.sha256
+          if ! sha256sum -c gitsign.sha256; then
+            echo "::error::gitsign does not match the pinned sha256. Refusing to run it: this binary"
+            echo "::error::decides whether a commit is signed by the pipeline, so a swapped one would"
+            echo "::error::let anything through."
+            exit 1
+          fi
+          chmod +x gitsign
+          mkdir -p "$RUNNER_TEMP/bin" && mv gitsign "$RUNNER_TEMP/bin/gitsign"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/gitsign" version
       - name: resolve range
         id: refs
         env:

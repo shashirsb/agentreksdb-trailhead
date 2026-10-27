@@ -61,8 +61,17 @@ cp $TH/checks/*.py gates/checks/
 # real code the gates run but prove little. See gates/templates/fuzz/README.md.
 mkdir -p benches fuzz && cp $TH/templates/benches/iai.rs benches/
 cp -r $TH/templates/fuzz/. fuzz/
+# cargo-audit reads this, not deny.toml, and gate-diff-policy fails if the two ignore lists drift.
+mkdir -p "$WORKSPACE_DIR/.cargo" && cp $TH/../.cargo/audit.toml "$WORKSPACE_DIR/.cargo/audit.toml"
+# Initialise the cargo-vet audit set. `init` records today's dependency graph as exempted, so it
+# takes seconds and changes nothing; what it buys is that every FUTURE lockfile change has to be
+# audited. Do it here, in the install commit, because `gate-supply-chain / cargo-vet` becomes a
+# required check in the same ruleset below, and an uninitialised audit set would wedge the queue.
+cargo install --locked cargo-vet
+( cd "$WORKSPACE_DIR" && cargo vet init )
 # This install commit is human-authored, so it is the one commit that goes in before the ruleset:
-git add .github gates && git commit -s -m "Install Trailhead gates" && git push
+git add .github gates benches fuzz "$WORKSPACE_DIR/supply-chain" "$WORKSPACE_DIR/.cargo" \
+  && git commit -s -m "Install Trailhead gates" && git push
 gh api -X POST repos/shashirsb/agentreksdb/rulesets --input $TH/rulesets/main.json
 ```
 
@@ -193,7 +202,10 @@ Add to the required list: `gate-supply-chain / zizmor`, `gate-supply-chain / osv
 `gate-supply-chain / cargo-deny`, `gate-supply-chain / lockfile-delta`,
 `gate-supply-chain / secrets`, `gate-codeql / analyze`.
 
-**Leave `gate-supply-chain / cargo-vet` out of the required list until `supply-chain/` exists.** The
+**`gate-supply-chain / cargo-vet` is in the required list, and the install block above runs
+`cargo vet init` so that it can pass from the first commit.** Do not install the ruleset without
+running `cargo vet init` first: the check would then fail on the first dependency change and, being
+required, block every merge. The reasoning behind the job's design follows. The
 job fails, loudly and with the `cargo vet init` commands, when a change touches the dependency graph
 and there is no audit set — because a green tick meaning "not configured" is indistinguishable from
 one meaning "audited", which is worse than a red one. Until the audit set is committed that failure
