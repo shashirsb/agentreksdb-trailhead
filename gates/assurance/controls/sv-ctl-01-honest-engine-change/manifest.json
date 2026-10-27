@@ -1,0 +1,1 @@
+{"base":"a","head":"b","files":[{"path":"src/engine/scan.rs","status":"modified","binary":false,"added_lines":["    if len == 65536 { return Err(TooLong); }","    let n = rows.len();"],"removed_lines":[]},{"path":"src/engine/index.rs","status":"modified","binary":false,"added_lines":["    let c = 0;"],"removed_lines":[]}]}

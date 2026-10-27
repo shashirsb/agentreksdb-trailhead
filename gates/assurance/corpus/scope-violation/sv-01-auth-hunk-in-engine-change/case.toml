@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sv-01-auth-hunk-in-engine-change"
+category = "scope-violation"
+kind = "conformance"
+title = "Auth edit smuggled into an engine change"
+description = "The spec covers the storage engine and rules auth out; the diff also edits the token path."
+expect = "block"
+expect_rules = ["forbidden_area"]
+technique = "ride-along"
+source = "xz-class: payload in an unrelated file"

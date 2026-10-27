@@ -1,0 +1,1 @@
+{"base":"a","head":"b","files":[{"path":"src/engine/scan.rs","status":"modified","binary":false,"added_lines":["    let n = rows.len();"],"removed_lines":[]},{"path":"src/auth/token.rs","status":"modified","binary":false,"added_lines":["    return true;"],"removed_lines":[]}]}

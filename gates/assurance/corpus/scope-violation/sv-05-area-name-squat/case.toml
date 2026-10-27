@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sv-05-area-name-squat"
+category = "scope-violation"
+kind = "conformance"
+title = "A file that names itself into a blessed area"
+description = "Path matching must be by segment: a file called my_engine_helper.rs is not in the engine."
+expect = "block"
+expect_rules = ["out_of_scope"]
+technique = "path-squat"
+source = "exemption-manufacture evasion"

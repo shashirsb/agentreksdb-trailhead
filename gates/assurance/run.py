@@ -7,6 +7,10 @@ compares the outcome to the expectation recorded in the case's `case.toml`:
   * kind = "diff"   -> `trailhead policy check --manifest <manifest.json>
                         --policy gates/diff-policy.toml`
   * kind = "intent" -> `trailhead guardrails <intent.txt>`
+  * kind = "conformance" -> `trailhead conformance check --manifest <manifest.json>
+                             --spec <spec.json>`: does the diff do only what the
+                             spec asked for? The case supplies both files, because
+                             the attack is the relationship between them.
 
 Then replays gates/assurance/controls, which are clean patches and honest intents
 that must produce no finding at all, to measure the false-positive rate.
@@ -194,13 +198,19 @@ def load_dir(d: str) -> dict | None:
         meta = tomllib.load(fh)
     meta["dir"] = d
     kind = meta.get("kind")
-    if kind not in ("diff", "intent"):
+    if kind not in ("diff", "intent", "conformance"):
         kind = "intent" if os.path.isfile(os.path.join(d, "intent.txt")) else "diff"
         meta["kind"] = kind
     payload = "intent.txt" if kind == "intent" else "manifest.json"
     meta["payload"] = os.path.join(d, payload)
     if not os.path.isfile(meta["payload"]):
         sys.exit("case %s declares kind=%s but has no %s" % (d, kind, payload))
+    # A conformance case is the pair: the same diff is honest under one spec and sabotage
+    # under another, so the spec is part of the case rather than context around it.
+    if kind == "conformance":
+        meta["spec"] = os.path.join(d, "spec.json")
+        if not os.path.isfile(meta["spec"]):
+            sys.exit("case %s declares kind=conformance but has no spec.json" % d)
     return meta
 
 
@@ -245,6 +255,14 @@ def evaluate(case: dict, runner: list[str]) -> dict:
         outcome = raw["verdict"]
         fired = [f["rule"] for f in raw.get("blocked_by", [])]
         fired_warn = [f["rule"] for f in raw.get("warned", [])]
+    elif case["kind"] == "conformance":
+        raw = run_json(runner + ["conformance", "check",
+                                 "--manifest", case["payload"],
+                                 "--spec", case["spec"]])
+        findings = raw.get("findings", [])
+        fired = [f["rule"] for f in findings if f["severity"] == "block"]
+        fired_warn = [f["rule"] for f in findings if f["severity"] == "warn"]
+        outcome = "block" if fired else ("warn" if fired_warn else "pass")
     else:
         raw = run_json(runner + ["guardrails", case["payload"]])
         outcome = GUARDRAIL_TO_OUTCOME[raw["risk"]]

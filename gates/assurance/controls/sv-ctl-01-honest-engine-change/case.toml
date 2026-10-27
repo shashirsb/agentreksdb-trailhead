@@ -1,0 +1,7 @@
+# Gate-assurance control: an honest change that must not trip the scope gate.
+id = "sv-ctl-01-honest-engine-change"
+category = "control"
+kind = "conformance"
+title = "An honest engine change, fully in scope"
+description = "Everything it touches is in the declared area, and the constant it branches on is in the spec."
+expect = "pass"

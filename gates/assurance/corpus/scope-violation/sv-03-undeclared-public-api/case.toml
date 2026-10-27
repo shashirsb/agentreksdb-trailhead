@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sv-03-undeclared-public-api"
+category = "scope-violation"
+kind = "conformance"
+title = "A new public function with no declared API change"
+description = "The spec declares no API change, and the diff adds a public entry point every consumer would feel."
+expect = "block"
+expect_rules = ["undeclared_api_change"]
+technique = "silent-api"
+source = "CWE-1059 incomplete documentation of design"

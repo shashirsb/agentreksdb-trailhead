@@ -316,21 +316,28 @@ def judge(results: list[dict], count_advisory: bool) -> tuple[str, list[str]]:
 # --------------------------------------------------------------------------- reporting
 
 
+def table_cell(r: dict, count_advisory: bool) -> str:
+    """The `checks that fired` column: blocking firings, then advisory ones in brackets
+    so that a candidate 'caught' only by an advisory check cannot be mistaken for caught."""
+    fired = ", ".join(r["fired"]) or "—"
+    advisory = [x["check"] for x in r["checks"] if x["status"] == "fired" and x["advisory"]]
+    if advisory and not count_advisory:
+        return (f"{fired} (advisory: {', '.join(advisory)})" if r["fired"]
+                else f"— (advisory only: {', '.join(advisory)})")
+    return fired
+
+
 def print_table(rows: list[dict], plans: list[CheckPlan], args) -> None:
-    id_w = max([len("candidate")] + [len(r["id"]) for r in rows])
-    fired_w = max([len("checks that fired")] + [len(", ".join(r["fired"]) or "—") for r in rows])
-    fired_w = min(fired_w, 60)
+    cells = [(r["id"], table_cell(r, args.count_advisory),
+              r["verdict"] + ("  [known gap]" if r["verdict"] != "caught" and r["known_gap"] else ""))
+             for r in rows]
+    id_w = max([len("candidate")] + [len(c[0]) for c in cells])
+    fired_w = max([len("checks that fired")] + [len(c[1]) for c in cells])
     print()
     print(f"{'candidate'.ljust(id_w)}  {'checks that fired'.ljust(fired_w)}  verdict")
-    print(f"{'-' * id_w}  {'-' * fired_w}  -------")
-    for r in rows:
-        fired = ", ".join(r["fired"]) or "—"
-        advisory = [x["check"] for x in r["checks"] if x["status"] == "fired" and x["advisory"]]
-        if advisory and not args.count_advisory:
-            fired = (fired + f" (advisory: {', '.join(advisory)})") if r["fired"] else \
-                f"— (advisory only: {', '.join(advisory)})"
-        mark = "" if r["verdict"] == "caught" else ("  [known gap]" if r["known_gap"] else "")
-        print(f"{r['id'].ljust(id_w)}  {fired[:fired_w].ljust(fired_w)}  {r['verdict']}{mark}")
+    print(f"{'-' * id_w}  {'-' * fired_w}  {'-' * 7}")
+    for cid, cell, verdict in cells:
+        print(f"{cid.ljust(id_w)}  {cell.ljust(fired_w)}  {verdict}")
     print()
 
 

@@ -1,0 +1,1 @@
+{"title":"Range scan","affected_areas":["engine"],"out_of_scope":["secondary indexes"],"requirements":[{"id":"R1","ears":"WHEN a range filter is given THE SYSTEM SHALL read only matching records","rationale":"scan cost"}]}

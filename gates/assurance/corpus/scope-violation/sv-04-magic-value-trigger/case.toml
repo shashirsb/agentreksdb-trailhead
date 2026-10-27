@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sv-04-magic-value-trigger"
+category = "scope-violation"
+kind = "conformance"
+title = "A branch on a magic value the spec never mentions"
+description = "In-scope file, but a comparison against a hard-coded key: the shape of a magic-value backdoor."
+expect = "warn"
+expect_rules = ["unexplained_literal_branch"]
+technique = "magic-value"
+source = "xz-class: data-triggered backdoor"

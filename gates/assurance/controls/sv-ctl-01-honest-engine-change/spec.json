@@ -1,0 +1,1 @@
+{"title":"Range scan","affected_areas":["engine"],"out_of_scope":["auth"],"constraints":["records longer than 65536 bytes are rejected"],"requirements":[{"id":"R1","ears":"WHEN a range filter is given THE SYSTEM SHALL read only matching records","rationale":"scan cost"}]}

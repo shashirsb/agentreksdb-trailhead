@@ -1,0 +1,10 @@
+# Gate-assurance case. See gates/assurance/README.md.
+id = "sv-02-undeclared-area"
+category = "scope-violation"
+kind = "conformance"
+title = "A file in an area the spec never declared"
+description = "Nothing rules consensus out, but nothing declared it either, so no requirement explains the hunk."
+expect = "block"
+expect_rules = ["out_of_scope"]
+technique = "undeclared-area"
+source = "hypocrite-commit class"
