@@ -382,11 +382,8 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
     )
     .await?;
 
-    // Who pays, in order: a sponsor pool linked to this intent, then the author's own balance,
-    // then the community pool. A pool funds the work; it never changes the queue position of
-    // the intent it funds (priority::Inputs has no monetary field).
-    let from_pool = crate::pools::draw_for_run(&mut tx, id, g.cost_credits, "generation").await?;
-    let owed = (g.cost_credits - from_pool).max(0);
+    // Who pays: the author's own balance first, then the community pool for any shortfall.
+    let owed = g.cost_credits.max(0);
 
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(it.author_id)
@@ -403,9 +400,8 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
         "generation",
     )
     .await?;
-    // The community pool covers any shortfall. It now books a real ledger entry rather than
-    // only an event, so "money in equals money out" can be checked for the community account
-    // the same way it can for a sponsor pool.
+    // The community pool covers any shortfall. It books a real ledger entry rather than only
+    // an event, so "money in equals money out" can be checked for the community account too.
     let from_community = (owed - from_author).max(0);
     if from_community > 0 {
         db::add_credits(
@@ -422,7 +418,7 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
             "pool.spend",
             Some(id),
             "backend",
-            json!({"credits": from_community, "from_pool": from_pool, "from_author": from_author}),
+            json!({"credits": from_community, "from_author": from_author}),
         )
         .await?;
     }
@@ -634,10 +630,6 @@ pub async fn tick(st: &AppState) -> anyhow::Result<Value> {
     let now = Utc::now();
     let s = train::state(now);
     let mut done = Vec::new();
-
-    // All-or-nothing funding: a pool past its deadline either funds or refunds every pledge,
-    // and an expired pool returns whatever it never spent. Money never sits unclaimed.
-    crate::pools::resolve_deadlines(&st.pool).await?;
 
     // Contributor history is recomputed here and nowhere else, so nobody can trigger a
     // recompute and read the result in a loop. A failure is logged, never fatal: the score
@@ -936,14 +928,6 @@ pub async fn decide(
         return invalid(
             "recuse",
             "Governors recuse from their own intents; another governor must decide.",
-        );
-    }
-    // A governor who sponsored this work, or who belongs to an organisation that did, may not
-    // decide it. Funding buys inference, never a say in what merges.
-    if crate::pools::must_recuse(&st.pool, governor_id, intent_id).await? {
-        return invalid(
-            "recuse",
-            "You or your organisation sponsored this intent; another governor must decide.",
         );
     }
     if st.cfg.enforce_window && it.train.as_deref() != current_train.as_deref() {

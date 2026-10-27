@@ -27,8 +27,8 @@ No feature is withheld, delayed or gated behind payment, license keys or a hoste
 private feature, a private branch, vote weight, review approval or a governor seat. Every feature funded by
 credits is merged into the public codebase or not at all.
 
-2.4 A strengthened replacement for 2.3, and new clauses on sponsor pools, are recorded in section 10. They are
-not yet part of this charter; section 10 states their status and why.
+2.4 A strengthened replacement for 2.3 is recorded in section 10. It is not yet part of this charter; section
+10 states its status and why. Earmarked sponsorship of a named feature was considered and rejected: see 10.4.
 
 ## 3. No CLA
 
@@ -79,13 +79,13 @@ official.
 
 ## 7. Funding
 
-7.1 The project is funded by donations, sponsorship and paid inference credits, with every transaction public.
+7.1 The project is funded by unrestricted donations and paid inference credits, with every transaction public.
+No donation may be earmarked for a named feature, module or release.
 
 7.2 The project may sell support or services to users only if doing so needs no proprietary code and gives the
 payer no control over the roadmap or merges.
 
-7.3 Additions to this section covering sponsor pools are recorded in section 10 and are not yet part of this
-charter.
+7.3 An addition to this section is recorded in section 10 and is not yet part of this charter.
 
 ## 8. Amendment
 
@@ -132,19 +132,19 @@ buys, in whole or in part:
 No ranking term in Trailhead is a function of money, and there is no paid tier, expedited lane, sponsored slot
 or paid placement. Every feature funded by credits is merged into the public codebase or not at all.
 
-10.4 Proposed new clause 2.5 on sponsor pools. An organization may donate credits to a sponsor pool that funds
-the inference for a named feature which other contributors specify and the pinned model builds. A sponsor pool:
+10.4 Proposed new clause 2.5: no earmarked funding. Nobody may pay for a named feature, module or release.
+Donations are unrestricted, and the project spends them where the public queue already points.
 
-- (a) carries zero priority, zero vote weight, zero review influence and zero merge rights;
-- (b) is refundable and all-or-nothing: it either funds the work it names or is returned to its sponsors in
-  full, and is never partly spent and partly kept;
-- (c) is publicly disclosed per sponsor, each sponsor's identity and amount appearing in the public ledger,
-  with no anonymous or aggregated pools;
-- (d) entitles its sponsors to nothing in review: nobody employed or paid by a sponsor may review, approve or
-  decide an intent that sponsor's pool funded (GOVERNANCE.md section 6).
+An earlier draft of this charter proposed "sponsor pools": an organization could fund the inference for a
+feature it wanted, under rules that gave it no priority, no vote, no review influence and no merge rights.
+That design was built and then removed before any sponsor pledged. The rules were sound on paper and held in
+the code, but they needed auditing, recusal, refunds and disclosure to stay true, and every one of those is a
+place where the promise could quietly fail. A project whose whole claim is that it cannot be bought is better
+served by having nothing to audit: the surest way to keep money out of the queue is to refuse earmarked money
+at the door. Unrestricted donations pay for whatever the queue puts first, which is what the votes decided.
 
-10.5 Proposed new clause 7.4. Donations, sponsorship, sponsor pools and paid inference credits give the payer
-no control over the roadmap, the queue order, reviews or merges, and no naming rights.
+10.5 Proposed new clause 7.4. Donations and paid inference credits give the payer no control over the roadmap,
+the queue order, reviews or merges, and no naming rights.
 
-10.6 Proposed addition to 9.1: clause 10.3 (a) to (f) and clause 10.4 (a) to (d), once adopted, may only be
-amended to make them stronger for users and contributors.
+10.6 Proposed addition to 9.1: clauses 10.3 (a) to (f) and 10.4, once adopted, may only be amended to make them
+stronger for users and contributors.

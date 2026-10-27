@@ -18,7 +18,6 @@ mod config;
 mod db;
 mod github;
 mod interviewer;
-mod pools;
 mod proxy;
 mod sandbox;
 mod signals;

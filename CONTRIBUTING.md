@@ -142,24 +142,21 @@ Organizations that need a feature can buy credits for their account: $0.015 per 
 approval, no merge rights, no roadmap say and no naming rights, and they are an input to no term of the queue
 score. The work they fund is public. Purchases and spend appear in the public ledger.
 
-### Sponsor pools
+### No earmarked funding
 
-An organization that wants a feature built but will not write the spec itself can donate credits to a **sponsor
-pool**: a named fund that pays for the inference on a feature other contributors specify and the pinned model
-then builds.
+Nobody can pay for a named feature. Donations are unrestricted, and the project spends them wherever the
+public queue already points.
 
-A sponsor pool gives **zero priority, zero vote weight, zero review influence and zero merge rights**. It does
-not move the intent up the queue; the queue has no term it could move. In addition:
+An earlier version of Trailhead let an organization open a **sponsor pool** that paid the inference for a
+feature it wanted. Its rules gave the sponsor nothing: no priority, no vote, no review influence, no merge
+rights. The code enforced that, because the queue score has no monetary term for money to reach. It was still
+removed before anyone pledged. Keeping that promise true needed disclosure, recusal, refunds and an audit of
+every pool, and each of those is a place where it could quietly stop being true. A project whose central claim
+is that it cannot be bought is safer with nothing to audit.
 
-- **Refundable and all-or-nothing.** The pool either funds the work it names or is returned to its sponsors in
-  full. It is never partly spent and partly kept.
-- **Publicly disclosed per sponsor.** Each sponsor's identity and amount appear in the public ledger. There are
-  no anonymous pools and no aggregated "various sponsors" entries.
-- **No reviewing your own pool's work.** Nobody employed or paid by a sponsor may review, approve or decide an
-  intent that sponsor's pool funded (GOVERNANCE.md section 6).
-
-Sponsor pools are policy, not yet code: the credit ledger has no pool entry kind today, so no pool can be
-opened until that is built.
+So if your organization wants a feature, the route is the same as everyone else's: file the intent, or back
+one that already exists. If you want to help pay for the work in general, an unrestricted donation funds
+whatever the votes put first.
 
 ## Conduct
 

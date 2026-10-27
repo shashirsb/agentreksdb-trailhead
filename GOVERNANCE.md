@@ -59,7 +59,7 @@ All times are America/Los_Angeles wall-clock time, which follows US daylight sav
 A governor does not vote on, and does not review, an intent that:
 
 - they authored or co-authored;
-- their employer or a paying client sponsored or funded with credits;
+- their employer or a paying client asked them to pursue, or stands to gain commercially from;
 - touches a feature they or their employer are paid to deliver.
 
 Recusals are recorded in the ledger.

@@ -1,10 +1,10 @@
 //! Queue priority (formula v2).
 //!
 //! Money is **not** an input. Credits buy inference and nothing else: no priority, no vote
-//! weight, no review influence, no merge rights. A sponsor pool changes who pays for a
-//! feature's inference, never where it sits in the queue. The paid term that formula v1
-//! carried (`0.25 · log(1 + credits)`) was deleted outright; there is deliberately no field
-//! on [`Inputs`] that any amount of money can move.
+//! weight, no review influence, no merge rights. The paid term that formula v1 carried
+//! (`0.25 · log(1 + credits)`) was deleted outright, and earmarked sponsorship of a named
+//! feature was removed with it. There is deliberately no field on [`Inputs`] that any amount
+//! of money can move, and `no_monetary_field` below fails the build if one is ever added.
 //!
 //! ```text
 //! S = D · [ 55·V + 9·R + 4·O + 17·Fit + 9·K + 6·E ] · P      (0..=100)
