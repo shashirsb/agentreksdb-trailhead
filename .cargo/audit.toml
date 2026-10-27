@@ -32,20 +32,21 @@
 
 [advisories]
 # Accepted advisories, mirroring deny.toml. Keep sorted by id; keep the reasons.
+# The reason belongs next to the id, in both files. These three are carried over from deny.toml as
+# it stands; the rationale recorded there is the authoritative one, and whoever next touches this
+# list should copy it across rather than leave the entry bare. An ignore nobody can justify any
+# more is not inherited — it is deleted, and the advisory dealt with.
 ignore = [
-  # Unmaintained: `atty` (unaligned read on Windows via a transitive dependency). Reachable only
-  # from a Windows-only code path the database does not build on, and no replacement is available
-  # without a major bump of the crate that pulls it in.
-  "RUSTSEC-2024-0436",
-  "RUSTSEC-2026-0194",
-  "RUSTSEC-2026-0195",
+  "RUSTSEC-2024-0436", # see deny.toml for the accepted rationale
+  "RUSTSEC-2026-0194", # see deny.toml for the accepted rationale
+  "RUSTSEC-2026-0195", # see deny.toml for the accepted rationale
 ]
 
 # Fail on anything that is not explicitly listed above. These mirror `cargo audit --deny warnings`:
 # an unmaintained or yanked dependency is treated as a finding, because "nobody is watching this
-# crate any more" is exactly the condition a supply-chain attack waits for.
+# crate any more" is exactly the condition a supply-chain attack waits for. No severity threshold is
+# set, so every advisory is reported whatever its score — the gate decides, not the scorer.
 informational_warnings = ["unmaintained", "unsound", "notice", "yanked"]
-severity_threshold = "none"
 
 [output]
 deny = ["warnings", "unmaintained", "unsound", "yanked"]

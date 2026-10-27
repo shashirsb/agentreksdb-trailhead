@@ -62,6 +62,10 @@
             "integration_id": 15368
           },
           {
+            "context": "gate-conformance / scope",
+            "integration_id": 15368
+          },
+          {
             "context": "gate-attestation / verify",
             "integration_id": 15368
           },

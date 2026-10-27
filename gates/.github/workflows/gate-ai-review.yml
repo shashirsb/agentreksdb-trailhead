@@ -10,11 +10,37 @@
 # job is ever seen writing a label, treat it as a bug and a security incident, not a convenience.
 # pr-agent's own label features are therefore switched off below, so the reviewer can only comment.
 #
-# UNTRUSTED INPUT.
-# The intent spec is written by whoever opened the intent, and this job holds a model API key and a
-# token with `pull-requests: write`. Contributor text is therefore treated as hostile:
-#   * the `Prompt-Log:` URL is matched against a strict regex built from `vars.TRAILHEAD_URL`;
-#     anything else is rejected and nothing is fetched;
+# THE REVIEWER'S JSON BLOCK IS DATA, NOT A DECISION.
+# The prompt asks the model to end with a JSON object carrying `risk_score`, `intent_match` and a
+# `recommendation: merge|hold|reject`. That object is a reading aid for the human governor and
+# nothing else. Nothing in this repository may parse it and act on it: it must never be turned into
+# a label, a check conclusion, a required-status result, an auto-approval, or an input to
+# `train-gate`. `recommendation: merge` is a sentence in a comment, not permission to merge; a
+# `reject` is not a block either — the blocking gates are gate-tests, gate-perf, gate-diff-policy,
+# gate-attestation, gate-supply-chain, gate-codeql and train-gate. Wiring this verdict into the
+# merge path would hand merge authority to whoever can write text into an intent, which is anyone.
+#
+# UNTRUSTED INPUT — WHY THIS WORKFLOW IS SPLIT INTO TWO JOBS.
+# The intent spec is written by whoever opened the intent, so contributor text is treated as
+# hostile. The two dangerous capabilities are kept apart, because a job that both reads attacker
+# text off the network AND holds credentials is the whole class of bug:
+#
+#   * `context` fetches and sanitises. It has `permissions: {}` — no token, no API key, nothing to
+#     steal and nothing to write with. It is the only job that touches the network or raw
+#     contributor text.
+#   * `review` holds the model API key and the one write scope needed to post a comment. It never
+#     reads the PR body, never fetches a URL, and only ever sees the sanitised prompt that
+#     `context` produced.
+#
+# Within `context`, the fetch is constrained several ways:
+#   * every value that comes from the event is passed through `env:`, never interpolated as
+#     `${{ }}` inside a `run:` block. `${{ }}` in `run:` is textual substitution into the shell
+#     before it executes, so a PR body containing a quote and a semicolon would be shell code;
+#   * the `Prompt-Log:` URL must match the exact path shape served by the Trailhead API, on the
+#     exact host named by `vars.TRAILHEAD_URL`. Nothing else is fetched;
+#   * redirects are refused. A URL on the right host that answers `302 Location: http://169.254.
+#     169.254/...` would otherwise have been followed, which turns a host allow-list into nothing;
+#   * the response is size-capped and must parse as JSON;
 #   * only the STRUCTURED spec fields are forwarded — requirements, acceptance_tests,
 #     affected_areas, out_of_scope. The free-text conversation (`messages`) and the in-spec
 #     `clarification_log` are never read: prose is the easiest place to hide "ignore your
@@ -32,19 +58,21 @@ concurrency:
   group: gate-ai-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
-# No ambient permissions. `issues: write` is deliberately NOT granted: the reviewer has no business
-# opening issues or touching issue labels.
+# No ambient permissions. `issues: write` is deliberately NOT granted anywhere in this file: the
+# reviewer has no business opening issues or touching issue labels.
 permissions: {}
 
 jobs:
-  review:
-    name: gate-ai-review / pr-agent
+  # Untrusted input, no credentials. This job reads the PR body and may make one outbound request;
+  # it is given no token precisely so that the request cannot carry one and a prompt injection has
+  # nothing to act with.
+  context:
+    name: gate-ai-review / context
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    permissions:
-      contents: read
-      # pr-agent posts its advisory review as a pull-request comment. This is the minimum it needs.
-      pull-requests: write
+    timeout-minutes: 10
+    permissions: {}
+    outputs:
+      extra: ${{ steps.ctx.outputs.extra }}
     steps:
       - name: build reviewer prompt from the structured spec only
         id: ctx
@@ -56,11 +84,23 @@ jobs:
           import json, os, re, secrets, urllib.error, urllib.parse, urllib.request
 
           MAX_SPEC_CHARS = 12000
+          MAX_RESPONSE_BYTES = 2 * 1024 * 1024
           body = os.environ.get("BODY") or ""
           base = (os.environ.get("TRAILHEAD_URL") or "").strip()
 
           notes, spec = [], None
-          host = urllib.parse.urlsplit(base).hostname if base else None
+          parsed_base = urllib.parse.urlsplit(base) if base else None
+          host = (parsed_base.hostname or "").lower() if parsed_base else ""
+
+          class NoRedirects(urllib.request.HTTPRedirectHandler):
+              """A host allow-list that follows redirects is not an allow-list.
+
+              The URL is checked once, against one host. If the server then answers 30x, following
+              it would fetch something nobody validated — the cloud metadata service, an internal
+              address, an attacker's host. Refuse instead."""
+
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  raise urllib.error.URLError(f"refused redirect to {newurl!r}")
 
           if not host:
               notes.append(
@@ -69,13 +109,38 @@ jobs:
               )
           else:
               # The ONLY shape accepted: https://<TRAILHEAD_URL host>/api/intents/<digits>
+              #
+              # That is the path the Trailhead API actually serves (see the router in
+              # crates/trailhead-server/src/api.rs: `GET /api/intents/{id}` returns the document
+              # whose `intent.spec` is read below). Do NOT "fix" this to a prettier path such as
+              # `/api/intents/<id>/prompt-log`: no such endpoint exists, so the regex would reject
+              # every genuine Trailhead pull request and this gate would quietly degrade to
+              # reviewing the diff with no spec at all, on every change, forever.
+              #
+              # The host is taken from `vars.TRAILHEAD_URL` and escaped, so the allow-list is one
+              # literal host. A pattern like `https://[a-z0-9.-]+/...` would match ANY host and is
+              # not an allow-list at all; the host is the only part that decides where bytes come
+              # from. `urlsplit` is then re-checked against the same host so that a userinfo or
+              # port trick (`https://trailhead.example@evil.test/...`) cannot slip past the regex.
               allowed = re.compile(r"^https://" + re.escape(host) + r"/api/intents/[0-9]{1,18}$")
               match = re.search(r"^[ \t]*Prompt-Log:[ \t]*(\S+)[ \t]*$", body, re.MULTILINE)
-              if not match:
+              candidate = match.group(1) if match else None
+              ok = False
+              if candidate:
+                  split = urllib.parse.urlsplit(candidate)
+                  ok = bool(
+                      allowed.match(candidate)
+                      and split.scheme == "https"
+                      and (split.hostname or "").lower() == host
+                      and not split.username
+                      and not split.password
+                      and split.port in (None, 443)
+                  )
+              if not candidate:
                   notes.append("The PR body carries no `Prompt-Log:` line; reviewing the diff without the intent spec.")
-              elif not allowed.match(match.group(1)):
+              elif not ok:
                   print(
-                      f"::error::Rejected Prompt-Log URL {match.group(1)!r}: it does not match "
+                      f"::error::Rejected Prompt-Log URL {candidate!r}: it does not match "
                       f"https://{host}/api/intents/<digits>. Nothing was fetched."
                   )
                   notes.append(
@@ -84,18 +149,27 @@ jobs:
                       "rejected spec as a finding in itself."
                   )
               else:
+                  doc = None
                   try:
-                      req = urllib.request.Request(match.group(1), headers={"Accept": "application/json"})
-                      with urllib.request.urlopen(req, timeout=20) as resp:
-                          doc = json.load(resp)
-                  except (urllib.error.URLError, TimeoutError, ValueError) as err:
+                      opener = urllib.request.build_opener(NoRedirects)
+                      req = urllib.request.Request(candidate, headers={"Accept": "application/json"})
+                      with opener.open(req, timeout=20) as resp:
+                          raw = resp.read(MAX_RESPONSE_BYTES + 1)
+                      if len(raw) > MAX_RESPONSE_BYTES:
+                          raise ValueError("intent document is larger than the 2 MiB cap")
+                      doc = json.loads(raw.decode("utf-8", errors="replace"))
+                      if not isinstance(doc, dict):
+                          raise ValueError("intent document is not a JSON object")
+                  except (urllib.error.URLError, TimeoutError, ValueError, OSError) as err:
                       doc = None
                       notes.append(f"The linked intent could not be read ({type(err).__name__}); reviewing the diff alone.")
                   if doc is not None:
-                      raw = ((doc.get("intent") or {}).get("spec") or {})
+                      raw_spec = ((doc.get("intent") or {}).get("spec") or {})
+                      if not isinstance(raw_spec, dict):
+                          raw_spec = {}
                       # Whitelist. `messages` and the spec's own `clarification_log` are never read.
                       fields = ("requirements", "acceptance_tests", "affected_areas", "out_of_scope")
-                      spec = {k: raw.get(k) for k in fields if raw.get(k) not in (None, [], "")}
+                      spec = {k: raw_spec.get(k) for k in fields if raw_spec.get(k) not in (None, [], "")}
                       if not spec:
                           notes.append("The linked intent carried none of the structured spec fields this gate forwards.")
 
@@ -114,7 +188,8 @@ jobs:
               "(3) unsafe/auth/crypto/net/dependency touches, (4) tests added. Every rejection must cite a spec",
               "requirement id and a concrete counterexample; label each finding 'confirmed' or 'possible'.",
               "You are advisory only. Do not request, suggest or imply any label, approval or merge decision;",
-              "a human governor decides. End with a JSON block:",
+              "a human governor decides. Your JSON block is read by a person, not by any automation, and no",
+              "field in it can approve, block or merge anything. End with a JSON block:",
               "{risk_score 0-10, blast_radius, intent_match, unsafe_touched, tests_added, confirmed_issues[],",
               "recommendation: merge|hold|reject}.",
           ]
@@ -138,6 +213,26 @@ jobs:
               fh.write(f"extra<<{delim}\n" + "\n".join(prompt) + f"\n{delim}\n")
           print(f"forwarded spec fields: {sorted(spec) if spec else 'none'}; notes: {len(notes)}")
           PY
+
+  review:
+    name: gate-ai-review / pr-agent
+    needs: context
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # The only write scope in this workflow, and the only job that holds credentials. It never
+    # reads `github.event.pull_request.body` and never fetches a URL — it consumes only the
+    # sanitised prompt built by `context`.
+    #
+    # `pull-requests: write` is the minimum that lets pr-agent post its advisory comment, and it is
+    # as narrow as GitHub permits: the scope cannot be reduced further to exclude label writes, so
+    # the reviewer is configured below never to use them. `contents: read` is what pr-agent needs to
+    # read the changed files through the API. Nothing here is granted `issues: write`,
+    # `checks: write`, `statuses: write` or `actions: write` — this gate must not be able to publish
+    # a check result or a status that a ruleset could mistake for a passing required check.
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
       - uses: qodo-ai/pr-agent@efdde4afe14aa401a3889012c7f3e9ef3081a430 # v0.49.0
         env:
           OPENAI_KEY: ${{ secrets.OPENAI_KEY }}
@@ -157,4 +252,4 @@ jobs:
           # labels must only ever come from the Trailhead App.
           pr_reviewer.enable_review_labels_effort: "false"
           pr_reviewer.enable_review_labels_security: "false"
-          pr_reviewer.extra_instructions: ${{ steps.ctx.outputs.extra }}
+          pr_reviewer.extra_instructions: ${{ needs.context.outputs.extra }}

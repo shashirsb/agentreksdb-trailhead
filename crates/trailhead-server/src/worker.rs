@@ -20,12 +20,13 @@ use crate::sandbox;
 pub const DIFF_POLICY: &str = include_str!("../../../gates/diff-policy.toml");
 /// Every check that must report green, from GitHub Actions, before the governor sees an intent.
 /// Names match the job names in gates/.github/workflows. Perf and AI review are advisory inputs.
-pub const EXPECTED_CHECKS: [(&str, &str); 6] = [
+pub const EXPECTED_CHECKS: [(&str, &str); 7] = [
     ("tests", "gate-tests / static"),
     ("tests", "gate-tests / nextest"),
     ("tests", "gate-tests / coverage"),
     ("tests", "gate-tests / mutants"),
     ("diff-policy", "gate-diff-policy / policy"),
+    ("conformance", "gate-conformance / scope"),
     ("attestation", "gate-attestation / verify"),
 ];
 
@@ -591,6 +592,8 @@ pub async fn evaluate_gates(st: &AppState, id: i64, head_sha: &str) -> anyhow::R
         let stage = match *gate {
             "attestation" => 5,
             "tests" => 6,
+            // diff-policy and conformance are both stage 7: one asks whether the diff does
+            // anything forbidden, the other whether it does anything unasked for.
             _ => 7,
         };
         db::transition(

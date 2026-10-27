@@ -1,0 +1,188 @@
+# Gate 7b — Scope conformance. Blocking.
+#
+# Every other gate asks whether the code is bad. This one asks whether it was asked for.
+#
+# That question is only answerable here because contributors never write code. A spec is agreed,
+# public and specific before a single token is generated, so by the time a diff exists the project
+# already has a written statement of what the change was allowed to touch. A backdoor has to live
+# somewhere, and the spec that justified the work almost never mentions that place: the xz payload
+# sat in test fixtures, and the Linux "hypocrite commits" fixed a real bug in one hunk and weakened
+# something in another. Both were off-topic for the change they travelled with, and off-topic is
+# checkable without understanding the code at all.
+#
+# ORDERING: this runs beside gate-diff-policy rather than after it. The two are independent
+# questions and neither compiles PR code, so there is nothing to serialise. `wait-for-policy` in
+# gate-tests and gate-perf continues to gate on gate-diff-policy alone.
+#
+# TRUST: the spec is fetched from Trailhead over HTTPS, and only its STRUCTURED fields are used —
+# affected_areas, out_of_scope, requirements, acceptance_tests, api_or_data_changes. The free-text
+# conversation never reaches this job, for the same reason gate-ai-review refuses it: a contributor
+# who can write prose into a gate's input can talk to the gate. Here the prose could only widen the
+# declared scope, which is precisely the thing being enforced.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA. Never reintroduce a tag or a branch ref.
+name: gate-conformance
+
+on:
+  pull_request:
+  merge_group:
+
+concurrency:
+  group: gate-conformance-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  scope:
+    name: gate-conformance / scope
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: resolve base and head
+        id: refs
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE:-}" ]; then
+            echo "base=$PR_BASE" >> "$GITHUB_OUTPUT"
+            echo "head=$PR_HEAD" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=$(git rev-parse HEAD^1)" >> "$GITHUB_OUTPUT"
+            echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build diff manifest
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, subprocess
+          base, head = os.environ["BASE"], os.environ["HEAD"]
+          def git(*a):
+              return subprocess.run(["git", *a], check=True, capture_output=True).stdout
+          status_map = {"A": "added", "M": "modified", "D": "deleted",
+                        "R": "renamed", "C": "added", "T": "modified"}
+          name_status = git("diff", "--name-status", "-M", "-z", f"{base}...{head}").split(b"\0")
+          entries, i = [], 0
+          while i < len(name_status) and name_status[i]:
+              code = name_status[i].decode()[0]
+              if code in "RC":
+                  path = name_status[i + 2].decode(errors="replace"); i += 3
+              else:
+                  path = name_status[i + 1].decode(errors="replace"); i += 2
+              entries.append((status_map.get(code, "modified"), path))
+          numstat = {}
+          for line in git("diff", "--numstat", "-M", f"{base}...{head}").decode(errors="replace").splitlines():
+              p = line.split("\t")
+              if len(p) >= 3:
+                  numstat[p[-1].split(" => ")[-1].rstrip("}")] = p[0] == "-"
+          files = []
+          for status, path in entries:
+              binary = numstat.get(path, False)
+              added = []
+              if not binary and status != "deleted":
+                  patch = git("diff", "-U0", "--no-color", f"{base}...{head}", "--", path)
+                  for line in patch.decode(errors="replace").splitlines():
+                      if line.startswith("+") and not line.startswith("+++"):
+                          added.append(line[1:])
+              files.append({"path": path, "status": status, "binary": binary,
+                            "added_lines": added, "removed_lines": []})
+          json.dump({"base": base, "head": head, "files": files}, open("diff.json", "w"), indent=1)
+          print(f"manifest: {len(files)} files")
+          PY
+
+      # The spec comes from Trailhead, and only its structured fields are kept. A PR body cannot
+      # supply one: the URL is built from the repository variable and the PR number, never from
+      # text anybody can write.
+      - name: fetch the structured spec
+        id: spec
+        env:
+          TRAILHEAD_URL: ${{ vars.TRAILHEAD_URL }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 -I - <<'PY'
+          import json, os, re, sys, urllib.request
+          base = (os.environ.get("TRAILHEAD_URL") or "").strip().rstrip("/")
+          title = os.environ.get("PR_TITLE") or ""
+          # Trailhead titles its PRs "<title> (intent #N)". The number is the only thing read out
+          # of PR text, and it is read as digits, so nothing else from the title can reach a URL.
+          m = re.search(r"intent #(\d{1,12})\b", title)
+          out = {"skip": None, "spec": None}
+          if not base:
+              out["skip"] = "vars.TRAILHEAD_URL is not set"
+          elif not re.match(r"^https://[A-Za-z0-9.-]+$", base):
+              out["skip"] = "vars.TRAILHEAD_URL is not a plain https origin"
+          elif not m:
+              out["skip"] = "this PR names no intent, so there is no spec to enforce"
+          else:
+              url = f"{base}/api/intents/{m.group(1)}"
+              try:
+                  with urllib.request.urlopen(url, timeout=20) as r:
+                      body = json.load(r)
+              except Exception as e:
+                  out["skip"] = f"could not read the spec: {e.__class__.__name__}"
+              else:
+                  s = (body.get("intent") or {}).get("spec") or body.get("spec") or {}
+                  keep = ("affected_areas", "out_of_scope", "requirements",
+                          "acceptance_tests", "api_or_data_changes", "constraints", "in_scope")
+                  out["spec"] = {k: s[k] for k in keep if k in s}
+          if out["skip"]:
+              print(f"::warning::{out['skip']}; the scope gate cannot run.")
+              open("skip", "w").write(out["skip"])
+          else:
+              json.dump(out["spec"], open("spec.json", "w"), indent=1)
+              print("declared areas:", out["spec"].get("affected_areas"))
+          PY
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        if: hashFiles('spec.json') != ''
+        with:
+          toolchain: stable
+
+      # Built from the BASE commit's Trailhead source, for the same reason gate-diff-policy loads
+      # its policy from the base: a change must not be able to edit the thing that judges it.
+      - name: check the diff against its spec
+        if: hashFiles('spec.json') != ''
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+        run: |
+          set -euo pipefail
+          git worktree add --detach .gate-base "$BASE"
+          cargo install --quiet --locked --path .gate-base/crates/trailhead-server --bin trailhead --root .gate-bin 2>/dev/null \
+            || cargo install --quiet --locked --git https://github.com/shashirsb/agentreksdb-trailhead --bin trailhead --root .gate-bin
+          ./.gate-bin/bin/trailhead conformance check \
+            --manifest diff.json --spec spec.json --out conformance.json
+
+      # A spec that could not be fetched is reported, not silently passed. The job still succeeds,
+      # because a Trailhead outage must not block the queue; the warning is in the run and the
+      # governor sees it on the intent.
+      - name: report
+        if: always()
+        run: |
+          if [ -f skip ]; then
+            echo "### Scope gate did not run" >> "$GITHUB_STEP_SUMMARY"
+            cat skip >> "$GITHUB_STEP_SUMMARY"
+          elif [ -f conformance.json ]; then
+            python3 -I - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          r = json.load(open("conformance.json"))
+          print("### Scope gate\n")
+          print(f"declared: `{'`, `'.join(r['declared']) or '—'}`  ")
+          print(f"touched: `{'`, `'.join(r['touched']) or '—'}`\n")
+          if not r["findings"]:
+              print("Every hunk sits inside an area the spec declared.")
+          for f in r["findings"]:
+              print(f"- **{f['severity']}** `{f['rule']}` {f['path']}: {f['detail']}")
+          PY
+          fi

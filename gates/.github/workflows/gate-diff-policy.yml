@@ -178,6 +178,60 @@ jobs:
           cargo deny --locked check
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           exit 0
+      # cargo-audit does not read deny.toml. It reads `.cargo/audit.toml`, relative to the directory
+      # it runs in. Without that file every accepted advisory in deny.toml was still fatal here, so
+      # the audit step failed on every pull request whatever the change did — a gate that is always
+      # red is a gate nobody reads. The two tools are both kept (see the comment at the top of
+      # `.cargo/audit.toml` for why), which means two ignore lists, which means drift: an advisory
+      # accepted in one and still blocking in the other. So the lists are compared before the audit
+      # runs, and disagreement fails the gate rather than being discovered as a mystery failure.
+      - name: deny.toml and .cargo/audit.toml must accept the same advisories
+        working-directory: ${{ env.WORKSPACE_DIR }}
+        run: |
+          python3 -I - <<'PY'
+          import re, sys, tomllib
+          from pathlib import Path
+
+          def ignores(path, *keys):
+              p = Path(path)
+              if not p.is_file():
+                  print(f"::error::{path} is missing. Both the cargo-deny and the cargo-audit ignore")
+                  print("::error::lists must exist, so that an accepted advisory is accepted by both.")
+                  sys.exit(1)
+              try:
+                  doc = tomllib.loads(p.read_text(encoding="utf-8"))
+              except (OSError, tomllib.TOMLDecodeError) as err:
+                  print(f"::error::{path} does not parse ({err}); failing closed.")
+                  sys.exit(1)
+              node = doc
+              for k in keys:
+                  node = (node or {}).get(k)
+              out = set()
+              for entry in node or []:
+                  # cargo-deny accepts either "RUSTSEC-..." or { id = "RUSTSEC-...", reason = "..." }.
+                  ident = entry.get("id") if isinstance(entry, dict) else entry
+                  if isinstance(ident, str) and re.fullmatch(r"RUSTSEC-\d{4}-\d{4}", ident.strip()):
+                      out.add(ident.strip())
+                  else:
+                      print(f"::error::{path}: {entry!r} is not a RUSTSEC advisory id.")
+                      sys.exit(1)
+              return out
+
+          deny = ignores("deny.toml", "advisories", "ignore")
+          audit = ignores(".cargo/audit.toml", "advisories", "ignore")
+          if deny != audit:
+              only_deny = sorted(deny - audit)
+              only_audit = sorted(audit - deny)
+              print("::error::The two advisory ignore lists disagree. An advisory the governors have")
+              print("::error::accepted must be accepted by BOTH cargo-deny and cargo-audit, or one")
+              print("::error::tool blocks every pull request while the other stays green.")
+              if only_deny:
+                  print(f"::error::in deny.toml only:          {only_deny}")
+              if only_audit:
+                  print(f"::error::in .cargo/audit.toml only: {only_audit}")
+              sys.exit(1)
+          print(f"advisory ignore lists agree: {sorted(deny) or 'empty'}")
+          PY
       - name: cargo-audit
         id: audit
         working-directory: ${{ env.WORKSPACE_DIR }}
