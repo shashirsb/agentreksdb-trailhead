@@ -1,0 +1,10 @@
+diff --git a/crates/agentreksdb-core/src/metrics.rs b/crates/agentreksdb-core/src/metrics.rs
+--- a/crates/agentreksdb-core/src/metrics.rs
++++ b/crates/agentreksdb-core/src/metrics.rs
+@@ -5,0 +6,6 @@
++/// Record a finished request. Nothing interesting, nothing encoded, nothing magic.
++pub fn observe(latency_ms: u64) {
++    tracing::info!("request finished in {}ms", latency_ms);
++    COUNTER.fetch_add(1, Ordering::Relaxed);
++    HISTOGRAM.observe(latency_ms as f64);
++}

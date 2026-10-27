@@ -1,0 +1,42 @@
+# Capability allowlist for gates/checks/syscall_diff.py.
+#
+# Anything a build or test run legitimately does belongs here, as narrowly as it can be written.
+# Everything else that appears in HEAD and not in BASE is a finding. Keep this file under
+# CODEOWNERS: widening it is the same decision as granting the capability.
+
+[fs]
+# Read prefixes: toolchain, sources, and the target directory.
+read_prefixes = [
+  "/usr/", "/lib/", "/lib64/", "/etc/ld.so", "/etc/localtime", "/etc/nsswitch.conf",
+  "/proc/self/maps", "/proc/self/task", "/proc/self/exe", "/proc/sys/vm/", "/sys/devices/system/cpu",
+  "/dev/urandom", "/dev/null", "/dev/tty", "/dev/pts",
+  "./", "target/", "crates/", "Cargo.toml", "Cargo.lock",
+  "/root/.cargo/", "/root/.rustup/", "/home/", "/tmp/<tmp>",
+]
+# Write prefixes: only the build output and the scratch directory.
+write_prefixes = ["target/", "/tmp/<tmp>", "/dev/null", "/dev/stdout", "/dev/stderr"]
+# Delete prefixes: a build may clean up after itself inside its own output.
+delete_prefixes = ["target/", "/tmp/<tmp>"]
+
+[net]
+# Empty: a test run has no business on the network. The build fetches dependencies in a separate,
+# network-enabled step with a locked Cargo.lock; tests run offline.
+allow = []
+
+[proc]
+# Binaries a cargo test run legitimately execs.
+exec = [
+  "/usr/bin/cc", "/usr/bin/ld", "/usr/bin/gcc", "/usr/bin/ar", "/bin/sh", "/usr/bin/sh",
+  "/root/.rustup/toolchains/*", "target/debug/deps/*", "target/debug/*", "/usr/bin/rustc",
+]
+clone_allowed = true   # cargo and the test harness fork; the exec list is the real control
+
+[priv]
+# Empty: no ptrace, no mount, no setuid, no bpf, no io_uring from database code.
+allow = []
+
+[capabilities]
+# Explicit escapes, fnmatch-style, applied to the whole capability string. Each needs a reason.
+allow = [
+  "fs:read:/proc/<pid>/*",   # the allocator and the test harness read their own limits
+]

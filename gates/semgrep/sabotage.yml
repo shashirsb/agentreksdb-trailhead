@@ -1,0 +1,405 @@
+# Semgrep rules for deliberate slowness, DoS and environment-gated behaviour in AgentreksDB.
+#
+# Companion to semgrep/rust-trailhead.yml, which covers egress, process spawning, secret env reads,
+# embedded files, Trojan Source and hostname gates. This file covers the other half of the threat
+# model: a change that does not exfiltrate anything and does not add a capability, but makes the
+# database slow, unfair or unavailable — and a payload whose trigger is the clock, the host or a
+# hash seed rather than a magic value.
+#
+# A performance regression is a security bug here for two reasons: AgentreksDB is multi-master, so a
+# node that is slow but alive is worse than a node that is down (it holds locks, wins elections and
+# stalls quorums), and gate-perf measures instruction counts on a micro suite, which a sleep on a
+# cold path does not show up in.
+#
+# Run alongside the existing ruleset, from the BASE commit, so a change cannot loosen the rules that
+# judge it:
+#   semgrep scan --config .gate-base/semgrep/rust-trailhead.yml --config .gate-base/semgrep/sabotage.yml \
+#     --baseline-commit "$BASE" --sarif --output semgrep.sarif --error --metrics off
+#
+# ERROR findings block the gate; WARNING findings are annotated for the governor. Rust support in
+# semgrep is still maturing, so several rules below are deliberately written as pattern-regex: a
+# structural pattern that silently matches nothing is worse than an honest regex. Each rule names
+# the sabotage shape it is looking for and what to write instead.
+#
+# Known evasions, for all of the rules below: move the payload into a dependency (cargo-deny and the
+# lockfile gate cover that), into a macro body (semgrep does not expand macros), or into arithmetic
+# that is slow without naming anything — an O(n^2) loop over request data has no keyword to match.
+# Those belong to gate-perf and to cargo-mutants, not here.
+#
+# SILENCING A FINDING. Several of these shapes have a narrow honest use: a poll loop that sleeps, a
+# ban that expires at a wall-clock time, a regex compiled from a CODEOWNERS-protected policy file.
+# Those get a line comment naming the rule and the reason —
+#   // nosemgrep: sabotage.regex-from-non-literal — pattern comes from gates/diff-policy.toml, which
+#   // is CODEOwners-protected and cannot be set by a request.
+# — which shows up in the diff, so the justification is reviewed with the code instead of
+# disappearing into a config file. Blanket `paths: exclude` entries belong to whole modules whose
+# job is the thing being flagged, never to one awkward call site.
+
+rules:
+  # ── Deliberate slowness ────────────────────────────────────────────────────────────────────────
+  - id: sabotage.sleep-in-non-test
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Sleeping in database code. A sleep on a request path is the cheapest possible denial of
+      service and the hardest to see in a profile: it burns wall time, not instructions, so the
+      instruction-count gate stays green. Use a timer, a backoff policy with a declared cap, or a
+      notification primitive instead; if this is a retry delay it belongs in one reviewed helper.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+        - "**/examples/**"
+        - "**/xtask/**"
+        - "**/*_test.rs"
+        - "**/fuzz/**"
+    pattern-either:
+      - pattern: std::thread::sleep(...)
+      - pattern: thread::sleep(...)
+      - pattern: std::thread::sleep_ms(...)
+      - pattern: tokio::time::sleep(...)
+      - pattern: tokio::time::sleep_until(...)
+      - pattern: time::sleep(...)
+      - pattern: async_std::task::sleep(...)
+      - pattern: smol::Timer::after(...)
+      - pattern: std::thread::park_timeout(...)
+
+  - id: sabotage.spin-or-yield
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Busy-waiting. spin_loop / yield_now in a database request path burns a core and, under a
+      runtime with a fixed worker count, starves every other task on that worker. Wait on the
+      thing you are waiting for (a channel, a Notify, a condvar, a semaphore).
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+        - "**/examples/**"
+    pattern-either:
+      - pattern: std::hint::spin_loop()
+      - pattern: hint::spin_loop()
+      - pattern: core::hint::spin_loop()
+      - pattern: std::sync::atomic::spin_loop_hint()
+      - pattern: std::thread::yield_now()
+      - pattern: thread::yield_now()
+      - pattern: tokio::task::yield_now()
+      - pattern: task::yield_now()
+
+  - id: sabotage.busy-loop
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A loop with no blocking operation and no exit: an empty `loop {}`, a loop whose body is only
+      `continue`, or `while true`. This pins a CPU for the life of the process.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    pattern-either:
+      - pattern-regex: 'loop\s*\{\s*\}'
+      - pattern-regex: 'loop\s*\{\s*continue\s*;?\s*\}'
+      - pattern-regex: 'while\s+true\s*\{'
+      - pattern-regex: 'loop\s*\{\s*(std::hint::)?spin_loop\s*\(\s*\)\s*;?\s*\}'
+
+  - id: sabotage.sleep-while-holding-lock
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Awaiting or sleeping inside a lock guard's scope. Holding a mutex across a sleep or an await
+      converts a short critical section into an unbounded one and is a convoy collapse under load.
+      Drop the guard before the await, or move to an async-aware lock with a documented hold time.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    # Written as a regex on purpose: semgrep's Rust parser rejects a metavariable in the
+    # `.lock()?` / `.lock().unwrap()` position, so the structural form of this rule does not
+    # compile. The regex looks for a guard binding followed, within five lines and with no
+    # intervening `drop(`, by a sleep or an await. It therefore misses a hold that spans a
+    # function call, and it misses a guard held to the end of a long block.
+    pattern-either:
+      - pattern-regex: '\.(?:lock|write|read)\s*\(\s*\)[^\n]*\n(?:(?!\s*(?:drop|std::mem::drop)\s*\()[^\n]*\n){0,5}?[^\n]*\b(?:thread::sleep|time::sleep|sleep)\s*\('
+      - pattern-regex: '\.(?:lock|write|read)\s*\(\s*\)[^\n]*\n(?:(?!\s*(?:drop|std::mem::drop)\s*\()[^\n]*\n){0,5}?[^\n]*\.\s*await\b'
+
+  # ── Environment-gated behaviour (logic bombs) ──────────────────────────────────────────────────
+  - id: sabotage.clock-branch
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A branch on wall-clock time or a monotonic instant. Correctness must not depend on when the
+      code runs: a comparison against a date is a time bomb, and a comparison against an elapsed
+      duration in a correctness path is a race that only fails in production. Timeouts belong in
+      one reviewed helper that returns a typed error.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    pattern-either:
+      - pattern-regex: 'if\s+[^;{\n]*\b(Instant::now|SystemTime::now|Utc::now|Local::now|OffsetDateTime::now_utc|now_utc|unix_timestamp)\s*\([^;{\n]*\)[^;{\n]*(==|!=|<|>|<=|>=)'
+      - pattern-regex: '(==|!=|<|>|<=|>=)[^;{\n]*\b(Instant::now|SystemTime::now|Utc::now|Local::now)\s*\('
+      - pattern-regex: 'match\s+[^{\n]*\b(Utc::now|Local::now|SystemTime::now)\s*\('
+      - pattern-regex: '\b(Utc::now|Local::now)\s*\(\s*\)\s*\.\s*(date_naive|date|year|month|day|weekday|ordinal)\s*\(\s*\)\s*(==|!=|<|>|<=|>=)'
+      - pattern-regex: '\bduration_since\s*\(\s*UNIX_EPOCH\s*\)[^;{\n]*(==|<|>)[^;{\n]*[0-9]{6,}'
+
+  - id: sabotage.env-host-branch
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A branch on the machine's identity (hostname, node name, region, pod, instance id) read from
+      the environment. Code that behaves differently on one host passes every test on every other
+      host. Configuration belongs in the config module as declared, typed values.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/config/**"
+        - "**/config.rs"
+    pattern-either:
+      - pattern-regex: '\benv::var(_os)?\s*\(\s*"(?i:HOSTNAME|HOST|NODE_NAME|NODENAME|POD_NAME|INSTANCE_ID|AWS_REGION|KUBERNETES_SERVICE_HOST|CI)"\s*\)[^;{\n]*(==|!=|starts_with|ends_with|contains)'
+      - pattern-regex: '(if|match)\s+[^;{\n]*\b(env::var|option_env!|env!)\s*\([^;{\n]*\)[^;{\n]*(==|!=|starts_with|contains)'
+      - pattern-regex: '\b(uname|sysinfo::System::host_name|whoami::hostname|whoami::username)\s*\('
+      - pattern-regex: '\bread_to_string\s*\(\s*"/(etc/hostname|proc/sys/kernel/hostname|sys/class/dmi/id/[a-z_]+)"'
+
+  # ── Hash and seed manipulation ─────────────────────────────────────────────────────────────────
+  - id: sabotage.fixed-seed-rng
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A random generator seeded from a constant. Predictable randomness in a database means
+      predictable session tokens, predictable jitter, predictable shard and replica placement, and
+      a predictable election order — each of which turns a random choice into an attacker's
+      choice. Use OsRng (or thread_rng) outside tests; in tests, seed explicitly and say so.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+        - "**/fuzz/**"
+        - "**/sim/**"
+    pattern-either:
+      - pattern: StdRng::seed_from_u64(...)
+      - pattern: SmallRng::seed_from_u64(...)
+      - pattern: ChaCha8Rng::seed_from_u64(...)
+      - pattern: ChaCha12Rng::seed_from_u64(...)
+      - pattern: ChaCha20Rng::seed_from_u64(...)
+      - pattern: rand::rngs::StdRng::seed_from_u64(...)
+      - pattern: $R::from_seed(...)
+      - pattern-regex: '\bseed_from_u64\s*\(\s*[0-9_]+\s*\)'
+      - pattern-regex: '\bfrom_seed\s*\(\s*\[\s*[0-9]'
+
+  - id: sabotage.fixed-hasher-on-request-keyed-map
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      A map built with a deterministic or custom hasher. Rust's default SipHash with a per-process
+      random key is what makes HashMap safe to key on request data; replacing it with FxHash, FNV,
+      a zeroed AHash key or any BuildHasherDefault lets a client pick keys that all collide and
+      turn every lookup into a linear scan. If a faster hasher is genuinely needed, key the map on
+      internal ids only and say so in the type's documentation.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    pattern-either:
+      - pattern: HashMap::with_hasher(...)
+      - pattern: HashMap::with_capacity_and_hasher(...)
+      - pattern: HashSet::with_hasher(...)
+      - pattern: HashSet::with_capacity_and_hasher(...)
+      - pattern: std::collections::HashMap::with_hasher(...)
+      - pattern-regex: 'BuildHasherDefault\s*(::|<)'
+      - pattern-regex: '\b(HashMap|HashSet)\s*<[^>;]*,\s*(FxBuildHasher|FxHasher|FnvBuildHasher|FnvHasher|fnv::|rustc_hash::|ahash::RandomState::with_seed|XxHash|SeaHasher|NoHashHasher|BuildNoHashHasher)'
+      - pattern-regex: '\bahash::RandomState::with_seeds?\s*\('
+      - pattern-regex: 'impl\s+(std::hash::)?Hasher\s+for\b'
+
+  # ── Unbounded work from untrusted input ────────────────────────────────────────────────────────
+  - id: sabotage.regex-from-non-literal
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Compiling a regular expression from a value that is not a literal. If the pattern can come
+      from a request, the caller chooses the compile cost and (with a backtracking engine or a
+      large bounded repeat) the match cost — ReDoS. Compile patterns once from literals, or use
+      RegexBuilder with an explicit size_limit and dfa_size_limit and a cached, bounded set.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    patterns:
+      - pattern-either:
+          - pattern: Regex::new($X)
+          - pattern: regex::Regex::new($X)
+          - pattern: RegexBuilder::new($X)
+          - pattern: regex::bytes::Regex::new($X)
+          - pattern: RegexSet::new($X)
+      - pattern-not: Regex::new("...")
+      - pattern-not: regex::Regex::new("...")
+      - pattern-not: RegexBuilder::new("...")
+      - pattern-not: regex::bytes::Regex::new("...")
+      - pattern-not: Regex::new(r"...")
+
+  - id: sabotage.decompress-without-limit
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Decompressing without a size cap — a zip bomb reaches the allocator before anything checks
+      it. Wrap the reader in `.take(MAX_DECOMPRESSED)` (and compare the compressed and
+      decompressed sizes against a declared ratio) before handing it to a decoder.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    patterns:
+      - pattern-either:
+          - pattern: flate2::read::GzDecoder::new($R)
+          - pattern: GzDecoder::new($R)
+          - pattern: ZlibDecoder::new($R)
+          - pattern: DeflateDecoder::new($R)
+          - pattern: zstd::Decoder::new($R)
+          - pattern: zstd::stream::decode_all($R)
+          - pattern: zstd::decode_all($R)
+          - pattern: lz4_flex::decompress_size_prepended($R)
+          - pattern: xz2::read::XzDecoder::new($R)
+          - pattern: brotli::Decompressor::new($R, ...)
+          - pattern: snap::read::FrameDecoder::new($R)
+      - pattern-not-regex: '\.take\s*\('
+      - pattern-not-regex: '(MAX_DECOMPRESSED|max_decompressed|size_limit|limit_bytes|max_output)'
+
+  - id: sabotage.alloc-sized-from-input
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      An allocation sized by a value that is not a literal and is not capped. A length field read
+      from a request or a file header lets the caller ask for all of memory in one message; the OOM
+      killer then takes the whole node, which in a multi-master cluster is a cheap way to force a
+      reconfiguration. Cap it: `len.min(MAX_FRAME)`, or reserve incrementally as bytes arrive.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    patterns:
+      - pattern-either:
+          - pattern: Vec::with_capacity($N)
+          - pattern: String::with_capacity($N)
+          - pattern: vec![$E; $N]
+          - pattern: $V.reserve($N)
+          - pattern: $V.reserve_exact($N)
+          - pattern: $V.resize($N, ...)
+          - pattern: BytesMut::with_capacity($N)
+      - metavariable-regex:
+          metavariable: $N
+          regex: '(?!^\s*(\d+|0x[0-9a-fA-F]+|[A-Z][A-Z0-9_]*)\s*$).*'
+      - pattern-not-regex: '\.(min|clamp)\s*\('
+      - pattern-not-regex: '(MAX_|_MAX|LIMIT|_CAP\b|capped|bounded)'
+      # `with_capacity(rows.len())` is not attacker-controlled: the collection being measured is
+      # already in memory, so the allocation cannot exceed memory the process already holds. This
+      # exclusion is the difference between a rule people read and a rule people switch off.
+      - pattern-not-regex: '\.len\s*\(\s*\)\s*\)'
+      - pattern-not-regex: '\.len\s*\(\s*\)\s*,'
+
+  - id: sabotage.recursion-without-depth-budget
+    languages: [rust]
+    severity: ERROR
+    message: >-
+      Directly recursive function in a parser, planner or graph module with no depth, budget or
+      remaining-work parameter. Nesting depth in an untrusted document then controls stack depth,
+      and a stack overflow in Rust aborts the process — an unrecoverable crash from one request.
+      Thread an explicit `depth: u32` (or a budget) through and return a typed error at the limit.
+    paths:
+      include:
+        - "**/parser/**"
+        - "**/parse/**"
+        - "**/plan/**"
+        - "**/planner/**"
+        - "**/graph/**"
+        - "**/expr/**"
+        - "**/query/**"
+        - "**/json/**"
+        - "**/*parser*.rs"
+        - "**/*parse*.rs"
+        - "**/*graph*.rs"
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    # `fn $F(...) { ... $F(...) ... }` as a single pattern matches nothing in Rust (verified
+    # against semgrep): the function name metavariable cannot be reused inside the body of the
+    # same pattern. Binding $F with pattern-inside and matching the call separately does work,
+    # and the finding then points at the recursive call itself, which is the useful place.
+    # The pattern-not-inside clauses are the escape hatch: thread a budget through and the rule
+    # goes quiet. Only DIRECT recursion is caught — mutual recursion (a calls b calls a) is not.
+    patterns:
+      - pattern-inside: |
+          fn $F(...) { ... }
+      - pattern: $F(...)
+      - pattern-not-inside: |
+          fn $F(..., depth: $T, ...) { ... }
+      - pattern-not-inside: |
+          fn $F(..., max_depth: $T, ...) { ... }
+      - pattern-not-inside: |
+          fn $F(..., budget: $T, ...) { ... }
+      - pattern-not-inside: |
+          fn $F(..., limit: $T, ...) { ... }
+      - pattern-not-inside: |
+          fn $F(..., remaining: $T, ...) { ... }
+      - pattern-not-inside: |
+          fn $F(..., fuel: $T, ...) { ... }
+
+  # ── Advisory ───────────────────────────────────────────────────────────────────────────────────
+  - id: sabotage.unbounded-channel
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      An unbounded queue. Without back-pressure a slow consumer becomes unbounded memory growth,
+      which looks like a leak and ends as an OOM. Prefer a bounded channel with a declared depth.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    pattern-either:
+      - pattern: tokio::sync::mpsc::unbounded_channel()
+      - pattern: mpsc::unbounded_channel()
+      - pattern: futures::channel::mpsc::unbounded()
+      - pattern: crossbeam::channel::unbounded()
+      - pattern: crossbeam_channel::unbounded()
+      # …and the turbofish forms, which the structural patterns above do not match.
+      - pattern-regex: '\bunbounded(?:_channel)?\s*::<[^;()]*>\s*\('
+
+  - id: sabotage.retry-without-cap
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      A retry loop with no attempt cap or no jitter. Synchronised retries across a cluster are a
+      self-inflicted thundering herd; a retry loop with no cap turns one failure into a permanent
+      one. Cap the attempts and jitter the backoff.
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+        - "**/benches/**"
+    pattern-either:
+      - pattern-regex: 'loop\s*\{[^}]{0,400}\b(retry|reconnect|resend)\b[^}]{0,400}\}'
+      - pattern-regex: '\bfor\s+_\s+in\s+0\s*\.\.\s*(u32::MAX|usize::MAX|i32::MAX)\b'
+
+  - id: sabotage.timing-unsafe-secret-compare
+    languages: [rust]
+    severity: WARNING
+    message: >-
+      Comparing a secret, token, MAC or signature with == . Short-circuit comparison leaks the
+      length of the matching prefix, which is enough to forge a value one byte at a time. Use a
+      constant-time comparison (subtle::ConstantTimeEq).
+    paths:
+      exclude:
+        - "**/gates/checks/testdata/**"
+        - "**/tests/**"
+    pattern-regex: '\b\w*(secret|token|mac|signature|digest|hmac|password|passwd|session_key)\w*\s*(==|!=)\s*'

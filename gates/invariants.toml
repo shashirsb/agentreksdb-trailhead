@@ -1,0 +1,214 @@
+# Structural security invariants for AgentreksDB. Read by `gates/checks/invariants.py`:
+#
+#   python3 gates/checks/invariants.py --rules gates/invariants.toml --root crates
+#
+# WHY THIS FILE EXISTS, AND WHY IT IS NOT A DIFF RULE
+# ---------------------------------------------------
+# `gates/diff-policy.toml` and `gates/semgrep/*.yml` judge what a change ADDS. The most economical
+# sabotage adds nothing: it deletes one line. Remove the `require_user(...)` call from a handler and
+# the endpoint is public; remove the `sync_all()` before the Ok and the database loses the last
+# write on every crash. Nothing was added, so an added-lines gate sees a small, tidy diff.
+#
+# These invariants are checked against the HEAD TREE, not the diff. A property that must hold of the
+# code must hold after the change, whatever the change did. A deletion that breaks one is reported in
+# exactly the same way as an addition that breaks one.
+#
+# KINDS
+#   fn_body     select functions, then require/forbid patterns inside each body
+#   call_site   a call pattern that is only allowed in named places
+#   line        a line-level pattern, forbidden (or required once per file)
+#   tree_count  a pattern that must occur at least `min` times across the selected files —
+#               the anti-deletion primitive: it fails when a whole mechanism is removed.
+#               With no file matching include_paths the invariant is reported as not applicable;
+#               set `require_files = true` when the module's absence is itself the violation.
+#
+# SELECTORS (fn_body) narrow WHICH functions are judged; the require_*/forbid patterns are the
+# assertion. `select_body_any` is the useful one: it keeps a name-based selector from judging a
+# function that merely shares a word with the real thing (a `checkpoint_message` builder is not a
+# commit path). Narrow the selection, never the assertion.
+#
+# SEVERITY
+#   block  the gate fails; the change goes to a human governor
+#   warn   annotated, does not fail
+#
+# ADDING AN INVARIANT
+# Copy the nearest [[invariant]], change the id, and keep the message in the imperative ("every X
+# must Y"). Every `allow_fns` / `allow_paths` entry is a decision someone has to defend: write the
+# reason on the same line. This file is CODEOWNERS-protected, so a generated change cannot widen its
+# own allowlist.
+#
+# HONEST LIMITS: invariants.py is a brace-matching scanner, not rustc. See its header. These rules
+# are written loosely on purpose — they ask "is the authorization call present in this body", not
+# "is it reachable on every path". A deliberately placed `if false { require_user(..) }` satisfies
+# them. They catch deletion and omission, which is what they are for.
+
+[meta]
+# Paths never scanned, whatever an invariant says. Relative to --root.
+exclude_paths = [
+  '(^|/)target/',
+  '(^|/)tests?/',
+  '(^|/)benches/',
+  '(^|/)fuzz/',
+  '(^|/)examples/',
+  '_test\.rs$',
+  '(^|/)gates/checks/testdata/',   # this repo's own synthetic fixtures, which contain planted violations
+]
+
+# ─── 1. Authorization ──────────────────────────────────────────────────────────────────────────────
+
+[[invariant]]
+id = "authz.handler-authorizes"
+kind = "fn_body"
+severity = "block"
+message = "every public HTTP handler must call an authorization helper"
+remediation = """
+Call one of require_user / require_admin / authorize / ensure_permission at the top of the handler,
+or, if the endpoint is genuinely public, add it to allow_fns below with a one-line reason.
+"""
+include_paths = ['(^|/)(api|http|handlers?|routes?|server|web)(/|[._-][a-z_]*\.rs$|\.rs$)']
+# An axum-shaped handler: it takes at least one extractor. This is what makes it reachable from the
+# router, and it is the cheapest reliable signal without resolving the router graph.
+select_fn_signature = '\b(State\s*<|Path\s*<|Query\s*<|Json\s*<|HeaderMap|Extension\s*<|TypedHeader\s*<|Bytes\b|Multipart\b)'
+select_pub_only = true
+require_any = [
+  '\brequire_user\s*\(',
+  '\brequire_admin\s*\(',
+  '\brequire_governor\s*\(',
+  '\bauthorize\s*\(',
+  '\bauthz::',
+  '\bensure_permission\s*\(',
+  '\bcurrent_user\s*\([^)]*\)\s*\.\s*await\s*\?\s*\.\s*ok_or',   # explicit "None means 401"
+  '\bverify_webhook_signature\s*\(',
+  '\bverify_hmac\s*\(',
+]
+allow_fns = [
+  "healthz",          # liveness probe, no data
+  "readyz",           # readiness probe, no data
+  "metrics",          # scraped on the private port only
+  "openapi",          # static schema
+  "version",          # static build info
+  "router",           # wiring, not a handler
+  "serve_static",     # static assets
+]
+
+[[invariant]]
+id = "authz.helper-exists"
+kind = "tree_count"
+severity = "block"
+message = "the authorization helpers must still exist (at least one definition in the tree)"
+remediation = "If an authorization helper was renamed, update require_any in authz.handler-authorizes too."
+include_paths = ['\.rs$']
+pattern = '\bfn\s+(require_user|require_admin|require_governor|authorize|ensure_permission)\b'
+min = 1
+
+# ─── 2. Durability ─────────────────────────────────────────────────────────────────────────────────
+
+[[invariant]]
+id = "durability.commit-flushes"
+kind = "fn_body"
+severity = "block"
+message = "every function that commits data must flush or fsync before it returns Ok"
+remediation = """
+Call sync_all / sync_data / fdatasync / flush (or the storage layer's durable_commit) before the
+success return. If the durability is deliberately deferred to a group committer, call that committer
+here and name it in require_any.
+"""
+include_paths = ['(^|/)(storage|store|wal|log|ledger|engine|kv|db|journal|disk)(/|[._-][a-z_]*\.rs$|\.rs$)']
+select_fn_name = '(^|_)(commit|apply|append|persist|checkpoint|write_batch|flush_batch|durable_write|fsync_all)(_|$)'
+# …and only when the body actually writes to a file. This keeps the name selector off pure helpers
+# (`checkpoint_message`) and off SQL-backed paths, where durability is the upstream database's job
+# and `tx.commit()` is the boundary — judge those with a replication invariant, not this one.
+select_body_any = [
+  '\bwrite_all\s*\(',
+  '\bwrite_vectored\s*\(',
+  '\bwrite\s*\(\s*&',
+  '\bpwrite',
+  '\bmmap',
+  '\bFile\b',
+  '\bio::Write\b',
+  '\bBufWriter\b',
+]
+require_any = [
+  '\bsync_all\s*\(',
+  '\bsync_data\s*\(',
+  '\bfdatasync\s*\(',
+  '\bfsync\s*\(',
+  '\bflush\s*\(',
+  '\bdurable_commit\s*\(',
+  '\bgroup_commit\s*\(',
+  '\bbarrier\s*\(',
+  '\.commit\s*\(',      # delegating to a transaction that flushes
+]
+# The flush must appear before the LAST `Ok(` in the body: a flush placed after the success path is
+# not a flush. Approximate, offset-based — see the script header.
+require_before = '\bOk\s*\('
+allow_fns = []
+
+[[invariant]]
+id = "durability.fsync-present"
+kind = "tree_count"
+severity = "block"
+message = "the storage layer must still contain at least one real flush call"
+remediation = "If durability moved to a new helper, add it to durability.commit-flushes require_any."
+include_paths = ['(^|/)(storage|store|wal|log|engine|journal|disk)(/|\.rs$)']
+pattern = '\b(sync_all|sync_data|fdatasync|fsync|durable_commit)\s*\('
+min = 1
+
+# ─── 3. Consensus ──────────────────────────────────────────────────────────────────────────────────
+
+[[invariant]]
+id = "consensus.quorum-not-literal"
+kind = "line"
+severity = "block"
+mode = "forbid"
+message = "a quorum or majority size must be computed from the member count, never written as a literal"
+remediation = """
+Write `let quorum = members.len() / 2 + 1;` (or `members.len().div_ceil(2)` where that is the
+intended rounding). A literal quorum silently becomes wrong — and unsafe — the moment the cluster is
+resized, which makes it a split-brain bug that looks like a typo.
+"""
+include_paths = ['\.rs$']
+pattern = '(?i)\b(const|static|let)\s+[A-Za-z_]*(quorum|majority)[A-Za-z_]*\s*(:\s*[A-Za-z0-9_:<>]+\s*)?=\s*-?[0-9]'
+
+[[invariant]]
+id = "consensus.quorum-formula"
+kind = "fn_body"
+severity = "block"
+message = "a function that computes a quorum must compute n/2 + 1"
+remediation = "Use `n / 2 + 1`, or `n.div_ceil(2)`; do not return a configured or hard-coded count."
+include_paths = ['\.rs$']
+select_fn_name = '(?i)(^|_)(quorum|majority|write_quorum|read_quorum)(_|$)'
+require_any = [
+  '/\s*2\s*\+\s*1',
+  '\.div_ceil\s*\(\s*2\s*\)',
+  '>>\s*1\s*\)?\s*\+\s*1',
+]
+
+# ─── 4. Unchecked escape hatches ───────────────────────────────────────────────────────────────────
+
+[[invariant]]
+id = "unsafe.unchecked-call-allowlist"
+kind = "call_site"
+severity = "block"
+message = "a *_unchecked function may only be called from an allowlisted place"
+remediation = """
+Use the checked variant. If the unchecked one is genuinely needed for a measured hot path, add the
+calling function to allow_fns with the invariant that makes it safe written next to it, and expect
+the governor to ask for the benchmark.
+"""
+include_paths = ['\.rs$']
+pattern = '\b([A-Za-z_][A-Za-z0-9_]*_unchecked)\s*\('
+allow_matches = [
+  'from_utf8_unchecked_mut',   # only inside the allowlisted callers below
+]
+allow_paths = [
+  '(^|/)(unsafe|ffi|sys)/',    # modules that exist to hold this and are human-reviewed
+]
+allow_fns = []                 # add "Type::method" or "function" with the safety argument on the line
+
+# ─── 5. Extend here ────────────────────────────────────────────────────────────────────────────────
+# Candidates worth adding as the code grows:
+#   tenancy.query-filters-tenant   every SQL string in a handler path mentions tenant_id
+#   crypto.constant-time-compare   no == on secret/token/mac byte slices (use subtle::ConstantTimeEq)
+#   limits.body-size-capped        every router has a RequestBodyLimitLayer
+#   replication.ack-before-reply   no reply before the replica acknowledgement is counted

@@ -178,6 +178,61 @@ jobs:
         working-directory: ${{ env.WORKSPACE_DIR }}
         run: cargo test --workspace --locked --doc
 
+      # A green suite says nothing about whether the suite tested what was asked for. Every
+      # acceptance criterion in the spec must have a test behind it, declared either by a
+      # `/// trailhead: T1, T3` doc comment or by the `at_t1_<slug>` naming convention.
+      - name: traceability — every acceptance criterion has a test
+        if: github.event_name == 'pull_request'
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+          TRAILHEAD_URL: ${{ vars.TRAILHEAD_URL }}
+        run: |
+          set -euo pipefail
+          # Only this Trailhead's own intent API, never an arbitrary URL from the PR body.
+          host=$(printf '%s' "$TRAILHEAD_URL" | sed -E 's#^https?://##; s#/.*##')
+          url=$(printf '%s\n' "$BODY" | sed -n 's/^Prompt-Log: *//p' | head -1)
+          if ! printf '%s' "$url" | grep -qE "^https://${host}/api/intents/[0-9]{1,18}$"; then
+            echo "::notice::no valid Prompt-Log URL on this PR; skipping traceability"
+            exit 0
+          fi
+          curl -sSfL --max-time 20 "$url" -o intent.json
+          python3 -c "import json;d=json.load(open('intent.json'));json.dump(d['intent']['spec'],open('spec.json','w'))"
+          # Build the test list from nextest plus the trailhead: doc comments in the source.
+          cd "$WORKSPACE_DIR"
+          cargo nextest list --workspace --locked --message-format json > "$RUNNER_TEMP/list.json"
+          cd - >/dev/null
+          python3 - "$RUNNER_TEMP/list.json" "$WORKSPACE_DIR" > tests.json <<'PY'
+          import json, re, sys, pathlib
+          listing = json.load(open(sys.argv[1]))
+          names = []
+          for suite in listing.get("rust-suites", {}).values():
+              for case in suite.get("testcases", {}):
+                  names.append(f"{suite.get('binary-name','')} {case}")
+          # Map `/// trailhead: T1, T3` comments onto the test that follows them.
+          covers = {}
+          for path in pathlib.Path(sys.argv[2]).rglob("*.rs"):
+              lines = path.read_text(errors="replace").splitlines()
+              pending = []
+              for line in lines:
+                  m = re.search(r"trailhead:\s*([Tt]\d+(?:\s*,\s*[Tt]\d+)*)", line)
+                  if m:
+                      pending += [x.strip().upper() for x in m.group(1).split(",")]
+                      continue
+                  fn = re.search(r"fn\s+([a-zA-Z0-9_]+)", line)
+                  if fn and pending:
+                      covers.setdefault(fn.group(1), []).extend(pending)
+                      pending = []
+                  elif line.strip() and not line.strip().startswith(("#[", "//", "///")):
+                      pending = []
+          out = []
+          for n in names:
+              short = n.rsplit("::", 1)[-1]
+              out.append({"id": n, "covers": covers.get(short, []), "fail_before": "n/a"})
+          json.dump(out, sys.stdout)
+          PY
+          "$RUNNER_TEMP/trailhead" trace --spec spec.json --tests tests.json \
+            || { echo "::error::An acceptance criterion in the spec has no test behind it."; exit 1; }
+
   coverage:
     name: gate-tests / coverage
     needs: wait-for-policy

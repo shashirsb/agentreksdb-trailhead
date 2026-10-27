@@ -48,11 +48,14 @@ repository variable `WORKSPACE_DIR` if it moves):
 
 ```bash
 TH=../agentreksdb-trailhead/gates
-mkdir -p .github/workflows gates/semgrep
+mkdir -p .github/workflows gates/semgrep gates/checks
 cp $TH/.github/workflows/*.yml .github/workflows/
 cp $TH/CODEOWNERS .github/CODEOWNERS
-cp $TH/diff-policy.toml $TH/coverage-floor.txt gates/
-cp $TH/semgrep/rust-trailhead.yml gates/semgrep/
+cp $TH/diff-policy.toml $TH/coverage-floor.txt $TH/invariants.toml gates/
+cp $TH/semgrep/rust-trailhead.yml $TH/semgrep/sabotage.yml gates/semgrep/
+# The sabotage checks: environment invariance, magic-value triggers, syscall capability diff,
+# honeytokens, the security-invariant registry and the obfuscation scan. See gates/checks/README.md.
+cp $TH/checks/*.py gates/checks/
 # This install commit is human-authored, so it is the one commit that goes in before the ruleset:
 git add .github gates && git commit -s -m "Install Trailhead gates" && git push
 gh api -X POST repos/shashirsb/agentreksdb/rulesets --input $TH/rulesets/main.json

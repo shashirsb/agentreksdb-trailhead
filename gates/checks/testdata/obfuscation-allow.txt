@@ -1,0 +1,11 @@
+# Allowlist for gates/checks/obfuscation.py.
+#
+# Format, one per line:   <path glob><TAB or 2+ spaces><regex the added line must match>
+# A line with only a glob allows everything in that file (use sparingly).
+# Every entry is a decision: write the reason in a trailing `#` comment.
+#
+# Legitimate high-entropy content in production source. Keep this list short — the better fix is
+# almost always to move the blob into a file loaded at runtime, or into tests/.
+**/tests/vectors.rs	[0-9a-f]{64}          # RFC 6234 / RFC 8032 hash and key test vectors
+**/src/migrations/*.rs	checksum = "[0-9a-f]+" # sqlx migration checksums, generated
+**/src/tls/roots.rs	-----BEGIN CERTIFICATE  # pinned CA roots, reviewed as a batch by the governor

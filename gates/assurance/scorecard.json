@@ -1,6 +1,6 @@
 {
-  "generated_at": "2026-10-26T16:08:40Z",
-  "runner": "target/debug/trailhead",
+  "generated_at": "2026-10-26T16:20:50Z",
+  "runner": "TRAILHEAD_BIN",
   "policy": "gates/diff-policy.toml",
   "confidence_level": 0.95,
   "interval_method": "Clopper-Pearson exact binomial",

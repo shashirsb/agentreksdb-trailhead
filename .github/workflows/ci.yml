@@ -32,3 +32,15 @@ jobs:
         run: git clone --depth 1 https://github.com/shashirsb/agentreksdb-trailhead-helloworld.git /tmp/helloworld
       - name: End-to-end pipeline
         run: FAKE_MODEL_REPO=/tmp/helloworld scripts/e2e.sh
+      - name: Gate assurance — do the gates still catch planted sabotage?
+        # The corpus is the only thing that proves the gates work. It must never silently
+        # regress: a case that was caught yesterday and is missed today fails the build.
+        # Known gaps are recorded in each case.toml and reported, not hidden.
+        run: python3 gates/assurance/run.py
+      - name: Publish the gate scorecard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-scorecard
+          path: gates/assurance/scorecard.json
+          if-no-files-found: warn
