@@ -4,11 +4,29 @@
 # .github/workflows/images.yml, then lets Docker Compose recreate only what changed. A push to main is
 # live about 10 minutes later (image build + next tick). Database migrations run when the server starts.
 set -euo pipefail
+
+# Define the log and the failure trap FIRST, before anything that can fail.
+#
+# They used to come after the lock and the `cd`, which meant any failure before that point killed
+# the script under `set -e` without writing a single line. The log file then did not exist at all,
+# and "the log is missing" reads like "cron never ran" when it can equally mean "cron ran 400 times
+# and died on line 11 every time". That ambiguity cost an afternoon. A deploy that fails silently is
+# worse than one that fails loudly, so the first thing this script does is make sure it can speak.
+LOG=/var/log/trailhead-update.log
+log() { echo "$(date -u +%FT%TZ) $*" >> "$LOG" 2>/dev/null || echo "$(date -u +%FT%TZ) $*" >&2; }
+# shellcheck disable=SC2154  # rc is assigned in the same trap body, which shellcheck cannot see.
+trap 'rc=$?; [ $rc -ne 0 ] && log "FAILED rc=$rc at line $LINENO: ${BASH_COMMAND}"; exit $rc' ERR
+# Prove on every run that the log is writable, so an empty file is real evidence of "never ran".
+: >> "$LOG" 2>/dev/null || true
+
 exec 9>/var/lock/trailhead-update.lock
 flock -n 9 || exit 0
-log() { echo "$(date -u +%FT%TZ) $*" >> /var/log/trailhead-update.log; }
 
 cd /opt/trailhead
+# Git refuses to operate in a directory owned by another user ("dubious ownership"). Cron runs this
+# as root, so it normally agrees, but a checkout restored from a backup or made by another account
+# trips it — and that error is exactly the kind that used to kill the script before it could log.
+git config --global --add safe.directory /opt/trailhead 2>/dev/null || true
 before=$(git rev-parse HEAD)
 # This checkout is a mirror of main, never a place anyone commits, so the only honest answer to
 # "the remote moved somewhere my history cannot reach" is to take the remote's word for it.
