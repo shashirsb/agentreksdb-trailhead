@@ -53,8 +53,7 @@ cp $TH/.github/workflows/*.yml .github/workflows/
 cp $TH/CODEOWNERS .github/CODEOWNERS
 cp $TH/diff-policy.toml $TH/coverage-floor.txt $TH/invariants.toml gates/
 cp $TH/semgrep/rust-trailhead.yml $TH/semgrep/sabotage.yml gates/semgrep/
-# The sabotage checks: environment invariance, magic-value triggers, syscall capability diff,
-# honeytokens, the security-invariant registry and the obfuscation scan. See gates/checks/README.md.
+# The nine sabotage checks, run by gate-sabotage.yml. See gates/checks/README.md.
 cp $TH/checks/*.py gates/checks/
 # Benchmarks and fuzz targets the perf and fuzz gates measure. Both are scaffolds with the
 # oracles already written: the entry points are stubbed and marked, and until they point at the
@@ -74,6 +73,26 @@ git add .github gates benches fuzz "$WORKSPACE_DIR/supply-chain" "$WORKSPACE_DIR
   && git commit -s -m "Install Trailhead gates" && git push
 gh api -X POST repos/shashirsb/agentreksdb/rulesets --input $TH/rulesets/main.json
 ```
+
+### Which sabotage checks block
+
+`gate-sabotage / static` runs on every pull request. Two of its four checks can stop a merge, and
+which two was decided by measuring them against real history rather than by how serious each one
+sounds — a gate that cries wolf gets overridden, which is worse than not having it.
+
+| Check | Verdict | Why |
+| --- | --- | --- |
+| `obfuscation` | **blocks** on `high` | Scoped to source files it found 0 findings across 10 commits; unscoped it found 40, because ordinary English and shell sit near the 4.0 bits/char entropy threshold. It catches a base64 payload or an embedded key outright. |
+| `invariants` | **blocks** | Fires only when a rule a human wrote in `invariants.toml` is actually violated, so a finding is never a matter of taste. |
+| `literal_triggers` | advisory | Reports every interesting new constant: 323 over those same 10 commits. Correct for a magic-value hunt, useless as a gate. |
+| `comment_consistency` | advisory | Strong when it fires, but heuristic, and not grounds to stop a merge alone. |
+
+`env_invariance`, `syscall_diff` and `honeytokens` build and run the suite twice or need a real
+execution, so they run nightly over main in the same workflow rather than on each pull request.
+
+`twin_divergence` and `premortem` are not wired to anything: the first needs two independent
+generations of one spec, the second a directory of attacker candidates. Neither exists per-PR.
+Run them deliberately, from the assurance suite or by hand.
 
 ## Repository settings
 

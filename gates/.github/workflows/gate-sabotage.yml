@@ -1,0 +1,217 @@
+# Gate 10 — Sabotage checks. Partly blocking.
+#
+# These are the checks aimed at a bug someone put there on purpose, rather than at a known
+# weakness class. They were written and tested and then, for a while, nothing ran them, which is
+# the worst state for a defence to be in: the docs describe it, so everyone believes it is on.
+#
+# WHICH ONES BLOCK, AND WHY THOSE
+# Blocking a gate that cries wolf is worse than not having it, because people learn to override it.
+# So each check here was measured against real history before being given the power to stop a merge:
+#
+#   obfuscation          BLOCKS on `high`, scoped to source files. Over the last 10 commits of the
+#                        Trailhead repo it found 0 high and 0 medium in Rust, but 40 high and 136
+#                        medium once prose was included — ordinary English and shell have entropy
+#                        near 4.0 bits/char, which is the threshold. Scoped it is quiet; unscoped
+#                        it would block almost every honest change. Hence --path-regex.
+#   invariants           BLOCKS. Structural rules a human wrote down (every handler authorizes,
+#                        every commit path syncs, quorum is a majority). It only fires when a named
+#                        rule is actually violated, so a finding is never a matter of taste.
+#   literal_triggers     ADVISORY. It reports every interesting new constant: 323 candidates over
+#                        those same 10 commits. That is the correct behaviour for a magic-value
+#                        hunt and useless as a gate. Its value is a human skimming the list.
+#   comment_consistency  ADVISORY. Heuristics about code disagreeing with its own comments. Strong
+#                        signal when it fires, but not something to stop a merge on alone.
+#
+# WHAT RUNS NIGHTLY INSTEAD
+# env_invariance and syscall_diff both build and run the suite twice, so they cost far more than a
+# PR gate should. They run on a schedule over main. honeytokens plants credentials and checks
+# nobody read them, which belongs around a real execution rather than a diff.
+#
+# NOT HERE: twin_divergence needs two independent generations of one spec, and premortem needs a
+# directory of attacker candidates. Neither exists per-PR; both are run deliberately, by hand or
+# from the assurance suite. See gates/checks/README.md.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA. Never reintroduce a tag or a branch ref.
+name: gate-sabotage
+
+on:
+  pull_request:
+  merge_group:
+  schedule:
+    # 03:40 UTC daily, for the expensive runtime checks over main.
+    - cron: "40 3 * * *"
+
+concurrency:
+  group: gate-sabotage-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+env:
+  WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+  # Source files only. Prose is high-entropy by nature and would drown the obfuscation scan.
+  SOURCE_PATHS: '\.(rs|toml|lock)$'
+
+jobs:
+  # Same barrier the other gates use: diff-policy is the one gate aimed at malice and it judges a
+  # change before any runner touches it. These jobs only read the diff, but the rule is uniform.
+  wait-for-policy:
+    name: gate-sabotage / wait-for-policy
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      checks: read
+    steps:
+      - name: wait for gate-diff-policy / policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REPO: ${{ github.repository }}
+          CHECK_NAME: gate-diff-policy / policy
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 60); do
+            state=$(gh api "repos/$REPO/commits/$SHA/check-runs" \
+              --jq ".check_runs[] | select(.name == \"$CHECK_NAME\") | .status + \":\" + (.conclusion // \"none\")" \
+              2>/dev/null | head -1 || true)
+            case "$state" in
+              completed:success) echo "policy passed"; exit 0 ;;
+              completed:*) echo "::error::$CHECK_NAME concluded ${state#completed:}; not running sabotage checks."; exit 1 ;;
+            esac
+            sleep 20
+          done
+          echo "::error::timed out waiting for $CHECK_NAME"; exit 1
+
+  static:
+    name: gate-sabotage / static
+    needs: wait-for-policy
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: resolve range
+        id: refs
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "${PR_BASE:-}" ]; then
+            echo "base=$PR_BASE" >> "$GITHUB_OUTPUT"; echo "head=$PR_HEAD" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=$MG_BASE" >> "$GITHUB_OUTPUT"; echo "head=$MG_HEAD" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build the diff once
+        env:
+          BASE: ${{ steps.refs.outputs.base }}
+          HEAD: ${{ steps.refs.outputs.head }}
+        run: git diff "$BASE...$HEAD" > sabotage.diff
+
+      # ---- blocking ----
+      - name: obfuscation scan (encoded or hidden payloads)
+        run: |
+          python3 gates/checks/obfuscation.py \
+            --diff sabotage.diff --path-regex "$SOURCE_PATHS" \
+            --fail-on high --json obfuscation.json
+
+      - name: security invariant registry
+        run: |
+          python3 gates/checks/invariants.py \
+            --rules gates/invariants.toml --root "$WORKSPACE_DIR" \
+            --fail-on block --json invariants.json
+
+      # ---- advisory: reported, never fatal ----
+      - name: magic-value candidates (advisory)
+        if: always()
+        run: |
+          python3 gates/checks/literal_triggers.py --diff sabotage.diff \
+            --json literal-triggers.json > literal-triggers.txt 2>&1 || true
+          tail -1 literal-triggers.txt
+
+      - name: comment and code disagreement (advisory)
+        if: always()
+        run: |
+          python3 gates/checks/comment_consistency.py --diff sabotage.diff \
+            --json comment-consistency.json > comment-consistency.txt 2>&1 || true
+          tail -1 comment-consistency.txt
+
+      - name: summary
+        if: always()
+        run: |
+          {
+            echo "### Sabotage checks"
+            echo
+            for f in literal-triggers comment-consistency; do
+              [ -f "$f.txt" ] && { echo "- $(tail -1 "$f.txt")"; }
+            done
+            echo
+            echo "Blocking: obfuscation (high), invariants. Advisory: the two above."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sabotage-reports
+          path: "*.json"
+          retention-days: 14
+
+  # The expensive pair. They build and run the suite twice, so they go nightly over main rather
+  # than on every pull request.
+  runtime:
+    name: gate-sabotage / runtime
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-26
+        with:
+          toolchain: stable
+
+      # Plant credentials nothing has any business reading, then run the suite, then check they
+      # were not touched. A test that reads a token it was never given is not a flaky test.
+      - name: plant honeytokens
+        run: python3 gates/checks/honeytokens.py --plant --state honeytokens.json --github-env
+
+      - name: run the suite with a shifted clock, host and locale
+        env:
+          WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+        run: |
+          python3 gates/checks/env_invariance.py \
+            --cwd "$WORKSPACE_DIR" --json env-invariance.json
+
+      - name: syscall capability diff against the previous commit
+        env:
+          WORKSPACE_DIR: ${{ vars.WORKSPACE_DIR || 'agentreksdb' }}
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq strace
+          python3 gates/checks/syscall_diff.py \
+            --base-dir "$WORKSPACE_DIR" --head-dir "$WORKSPACE_DIR" \
+            --json syscall-diff.json
+
+      - name: verify no honeytoken was read
+        if: always()
+        run: python3 gates/checks/honeytokens.py --verify --state honeytokens.json --scan .
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: sabotage-runtime-reports
+          path: "*.json"
+          retention-days: 30

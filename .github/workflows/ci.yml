@@ -43,6 +43,23 @@ jobs:
         run: git clone --depth 1 https://github.com/shashirsb/agentreksdb-trailhead-helloworld.git /tmp/helloworld
       - name: End-to-end pipeline
         run: FAKE_MODEL_REPO=/tmp/helloworld scripts/e2e.sh
+      - name: Sabotage checks — do the checks themselves still work?
+        # The nine checks in gates/checks/ are the layer aimed at a bug someone planted on
+        # purpose. They are plain Python with no coverage from `cargo test`, so without this
+        # step they could break and nothing would say so until a real attack walked past them.
+        run: python3 gates/checks/test_new_checks.py
+      - name: Sabotage checks — run them over this very diff
+        # Dogfooding: Trailhead is written by a model too, so the checks that guard the database
+        # run over Trailhead's own changes. Advisory here (this repo is still human-edited and
+        # full of prose), blocking in the target repo via gate-sabotage.yml.
+        run: |
+          git fetch -q origin "${GITHUB_BASE_REF:-main}" 2>/dev/null || true
+          base=$(git merge-base HEAD "origin/${GITHUB_BASE_REF:-main}" 2>/dev/null || git rev-parse HEAD~1)
+          git diff "$base...HEAD" > /tmp/self.diff
+          python3 gates/checks/obfuscation.py --diff /tmp/self.diff \
+            --path-regex '\.(rs|toml|lock)$' --fail-on high || echo "::warning::obfuscation flagged this diff"
+          python3 gates/checks/comment_consistency.py --diff /tmp/self.diff | tail -1
+          python3 gates/checks/invariants.py --rules gates/invariants.toml --root crates | tail -1
       - name: Gate assurance — do the gates still catch planted sabotage?
         # The corpus is the only thing that proves the gates work. It must never silently
         # regress: a case that was caught yesterday and is missed today fails the build.
