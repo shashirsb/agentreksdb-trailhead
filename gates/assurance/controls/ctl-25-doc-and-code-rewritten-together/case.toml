@@ -1,0 +1,15 @@
+# Gate-assurance case. See gates/assurance/README.md.
+#
+# The honest counterpart of gates/checks/comment_consistency.py's
+# `doc.deleted-with-code-change`: the doc line is REPLACED, not deleted, in the same
+# hunk that changes the code under it. A check that fires here instead of on the
+# deletion case has learnt the wrong pattern.
+id = "ctl-25-doc-and-code-rewritten-together"
+category = "control"
+kind = "diff"
+title = "Doc comment updated along with the code it documents"
+description = "A histogram observation is added and the doc line above it is rewritten to say so."
+expect = "pass"
+expect_rules = []
+technique = "doc-kept-in-sync"
+source = "hand-written"

@@ -445,7 +445,13 @@ def fingerprint(signature: str, code_body: str, lit_body: str) -> dict:
                 continue
             consumed.append((st, en))
             v = m.group("v")
-            constants.append(f"{kind}:{normalise_int(kind, v) if kind in ('int', 'hex', 'oct', 'bin', 'float') else v}")
+            if kind in ("int", "hex", "oct", "bin"):
+                # One constant, however it is spelled: 1000 == 1_000 == 0x3e8 == 0o1750.
+                constants.append(f"int:{normalise_int(kind, v)}")
+            elif kind == "float":
+                constants.append(f"float:{normalise_int(kind, v)}")
+            else:
+                constants.append(f"{kind}:{v}")
 
     errors = [name for name, rx in ERROR_TOKENS for _ in rx.finditer(norm)]
     ios = [name for name, rx in IO_TOKENS for _ in rx.finditer(norm)]

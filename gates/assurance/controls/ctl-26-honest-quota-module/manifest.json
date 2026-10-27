@@ -1,0 +1,43 @@
+{
+  "base": "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678",
+  "head": "f0e1d2c3b4a5968778695a4b3c2d1e0f98765432",
+  "files": [
+    {
+      "path": "crates/agentreksdb-core/src/quota.rs",
+      "status": "added",
+      "binary": false,
+      "added_lines": [
+        "use std::collections::HashMap;",
+        "",
+        "#[derive(Debug)]",
+        "pub enum QuotaError {",
+        "    Exceeded { tenant: String, limit: u64 },",
+        "}",
+        "",
+        "pub struct Quota {",
+        "    pub limit: u64,",
+        "    used: HashMap<String, u64>,",
+        "}",
+        "",
+        "/// The default row ceiling a tenant gets.",
+        "pub fn default_limit() -> u64 {",
+        "    1000",
+        "}",
+        "",
+        "impl Quota {",
+        "    /// Charge `rows` to `tenant`, or fail if that would take it over the ceiling.",
+        "    pub fn charge(&mut self, tenant: &str, rows: u64) -> Result<u64, QuotaError> {",
+        "        let current = *self.used.get(tenant).unwrap_or(&0);",
+        "        let next = current + rows;",
+        "        if next > self.limit {",
+        "            return Err(QuotaError::Exceeded { tenant: tenant.to_string(), limit: self.limit });",
+        "        }",
+        "        self.used.insert(tenant.to_string(), next);",
+        "        Ok(next)",
+        "    }",
+        "}"
+      ],
+      "removed_lines": []
+    }
+  ]
+}

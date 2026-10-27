@@ -1,0 +1,28 @@
+# Template fuzz crate. Point `path` at the workspace crate under test and add a [[bin]] per
+# target. Kept out of the parent workspace so `cargo test` does not try to build it.
+[package]
+name = "agentreksdb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+serde_json = "1"
+# agentreksdb-core = { path = "../core" }
+
+[[bin]]
+name = "json_parse"
+path = "fuzz_targets/json_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "engine_ops"
+path = "fuzz_targets/engine_ops.rs"
+test = false
+doc = false

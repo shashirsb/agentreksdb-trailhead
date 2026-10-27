@@ -56,6 +56,11 @@ cp $TH/semgrep/rust-trailhead.yml $TH/semgrep/sabotage.yml gates/semgrep/
 # The sabotage checks: environment invariance, magic-value triggers, syscall capability diff,
 # honeytokens, the security-invariant registry and the obfuscation scan. See gates/checks/README.md.
 cp $TH/checks/*.py gates/checks/
+# Benchmarks and fuzz targets the perf and fuzz gates measure. Both are scaffolds with the
+# oracles already written: the entry points are stubbed and marked, and until they point at the
+# real code the gates run but prove little. See gates/templates/fuzz/README.md.
+mkdir -p benches fuzz && cp $TH/templates/benches/iai.rs benches/
+cp -r $TH/templates/fuzz/. fuzz/
 # This install commit is human-authored, so it is the one commit that goes in before the ruleset:
 git add .github gates && git commit -s -m "Install Trailhead gates" && git push
 gh api -X POST repos/shashirsb/agentreksdb/rulesets --input $TH/rulesets/main.json

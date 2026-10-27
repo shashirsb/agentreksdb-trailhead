@@ -1,0 +1,16 @@
+# Gate-assurance case. See gates/assurance/README.md.
+#
+# The honest reference implementation used by the twin-generation testdata in
+# gates/checks/testdata/twin_base.patch. It is a control for two reasons: a new module
+# with a documented error path and a computed bound must not block, and the twin oracle
+# (gates/checks/twin_divergence.py) has to report ZERO behavioural divergence between
+# this and its cosmetically-different twin.
+id = "ctl-26-honest-quota-module"
+category = "control"
+kind = "diff"
+title = "New per-tenant write quota module"
+description = "A typed error, a computed ceiling check and a documented failure path, in a new file."
+expect = "pass"
+expect_rules = []
+technique = "new-module"
+source = "hand-written"
