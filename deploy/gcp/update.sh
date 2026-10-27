@@ -10,7 +10,21 @@ log() { echo "$(date -u +%FT%TZ) $*" >> /var/log/trailhead-update.log; }
 
 cd /opt/trailhead
 before=$(git rev-parse HEAD)
-git pull -q --ff-only || { log "git pull failed"; exit 1; }
+# This checkout is a mirror of main, never a place anyone commits, so the only honest answer to
+# "the remote moved somewhere my history cannot reach" is to take the remote's word for it.
+#
+# It used to `exit 1` instead, and that wedged the deploy for half an hour: a commit was pushed,
+# this VM pulled it, the message was then corrected and force-pushed, and from that moment every
+# run died on the pull and never reached the image step. The site kept serving the old build with
+# nothing obviously broken, which is the worst way for a deploy to fail. A rewritten or rolled-back
+# main is rare but entirely normal, and a deployment machine should survive one unattended.
+git fetch -q origin main || { log "git fetch failed"; exit 1; }
+if ! git merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  log "main is not a fast-forward from $before (rewritten or rolled back); resetting to origin/main"
+  git reset -q --hard origin/main || { log "reset failed"; exit 1; }
+else
+  git merge -q --ff-only origin/main || { log "ff merge failed"; exit 1; }
+fi
 after=$(git rev-parse HEAD)
 
 cd deploy/prod
