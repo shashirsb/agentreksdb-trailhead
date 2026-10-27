@@ -516,7 +516,7 @@ async fn simulate_gates(st: &AppState, id: i64) -> anyhow::Result<()> {
         .await?;
     for (gate, check) in EXPECTED_CHECKS {
         sqlx::query(
-            "INSERT INTO gate_results (intent_id, gate, check_name, verdict, detail, head_sha) VALUES ($1,$2,$3,'pass',$4,'simulated')",
+            "INSERT INTO gate_results (intent_id, gate, check_name, verdict, detail, head_sha) VALUES ($1,$2,$3,'simulated',$4,'simulated')",
         )
         .bind(id)
         .bind(gate)
@@ -604,8 +604,12 @@ pub async fn evaluate_gates(st: &AppState, id: i64, head_sha: &str) -> anyhow::R
         .await?;
     } else if EXPECTED_CHECKS
         .iter()
-        .all(|(_, c)| matches!(verdict(c), Some("pass") | Some("warn")))
+        .all(|(_, c)| matches!(verdict(c), Some("pass") | Some("warn") | Some("simulated")))
     {
+        // `simulated` advances the intent only so a developer can walk the whole pipeline
+        // locally. It is never a pass: the verdict stays in the row, the API reports it, and
+        // the evidence page shows "no tests ran" instead of a green check. In production the
+        // GitHub App is configured, so `simulate_gates` is never reached at all.
         if it.status != "review" {
             db::transition(&mut tx, id, "review", 8, "gates", json!({"head": head_sha})).await?;
         }

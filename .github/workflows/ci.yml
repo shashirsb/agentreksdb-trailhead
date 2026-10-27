@@ -1,3 +1,8 @@
+# Trailhead's own CI. It runs in THIS repository, not in a target repo.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA with the version in a trailing comment. This
+# repo signs the commits that reach the target, so whoever can move a tag that runs here can reach
+# the signing pipeline. The same rule the gates impose on agentreksdb applies to Trailhead itself.
 name: ci
 on:
   push:
@@ -20,11 +25,17 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/trailhead
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      # `@stable` used to name the toolchain through the action's ref. Pinned by SHA the ref carries
+      # no such meaning, so the toolchain is stated explicitly rather than resting on an input
+      # default that a future pin bump could change.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, resolved 2026-10-27
+        with:
+          toolchain: stable
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
@@ -39,7 +50,7 @@ jobs:
         run: python3 gates/assurance/run.py
       - name: Publish the gate scorecard
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: gate-scorecard
           path: gates/assurance/scorecard.json

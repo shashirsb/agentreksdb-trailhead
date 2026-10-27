@@ -3,6 +3,11 @@
 # against the ledger, applies it to the recorded base, signs the commit with gitsign (keyless; the
 # certificate names THIS workflow file), pushes `trailhead/<id>` as the Trailhead GitHub App and opens
 # the PR. No person and no long-lived key can produce a commit that passes gate-attestation.
+#
+# PINNING: every `uses:` is a full 40-char commit SHA with the version in a trailing comment. This
+# is the workflow whose OIDC identity gate-attestation trusts, and it holds the App private key: a
+# mutable tag here is a direct path to signing arbitrary code as the Trailhead pipeline. Never
+# reintroduce a tag or a branch ref.
 name: commit
 on:
   workflow_dispatch:
@@ -47,13 +52,27 @@ jobs:
           echo "SEQ=$seq" >> "$GITHUB_ENV"
           jq -r .message bundle.json > message.txt
 
+      # The verifier container is what independently re-checks the ledger before anything is signed,
+      # so its bytes have to be fixed: TRAILHEAD_VERIFIER_IMAGE must be digest-pinned, exactly as
+      # gate-diff-policy requires of the same variable. There is deliberately no `:main` fallback —
+      # defaulting to a mutable tag let whoever could push that tag choose the code that decides
+      # whether a patch is legitimate, and an unset variable then looked like a working setup.
+      # Resolve a digest with:
+      #   docker buildx imagetools inspect <image>:<tag> --format '{{.Manifest.Digest}}'
       - name: Verify the ledger independently (pinned key, full chain, bound event)
         env:
-          VERIFIER: ${{ vars.TRAILHEAD_VERIFIER_IMAGE || 'ghcr.io/shashirsb/agentreksdb-trailhead:main' }}
+          VERIFIER: ${{ vars.TRAILHEAD_VERIFIER_IMAGE }}
           PUBKEY: ${{ vars.TRAILHEAD_LEDGER_PUBKEY }}
         run: |
           set -euo pipefail
           [ -n "$PUBKEY" ] || { echo "::error::set repo variable TRAILHEAD_LEDGER_PUBKEY"; exit 1; }
+          if [[ ! "$VERIFIER" =~ ^[A-Za-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::vars.TRAILHEAD_VERIFIER_IMAGE must be digest-pinned"
+            echo "::error::(ghcr.io/<owner>/agentreksdb-trailhead@sha256:<64 hex>). A mutable tag is"
+            echo "::error::not accepted: this container decides whether the patch about to be signed"
+            echo "::error::matches the public ledger. Current value: ${VERIFIER:-<unset>}"
+            exit 1
+          fi
           [[ "$BASE" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::base is not a commit sha"; exit 1; }
           docker run --rm "$VERIFIER" trailhead ledger verify-remote \
             --api "$TRAILHEAD_URL" --pubkey "$PUBKEY" \
@@ -61,15 +80,22 @@ jobs:
 
       - name: App token for the target repo
         id: app
-        uses: actions/create-github-app-token@v1   # TODO: pin to a commit SHA
+        # Pinned to the newest v1. A v3 of this action exists; moving to it changes how the App
+        # private key is exchanged for a token in the one workflow that can sign, so a major bump
+        # is a governance decision and not part of pinning.
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
         with:
           app-id: ${{ vars.TRAILHEAD_APP_ID }}
           private-key: ${{ secrets.TRAILHEAD_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
           repositories: ${{ vars.TRAILHEAD_TARGET_REPO_NAME }}
 
+      # This action installs the binary that produces every Trailhead signature, so it is pinned by
+      # SHA like everything else. `sigstore/gitsign-installer` does not resolve (see
+      # gates/.github/workflows/gate-attestation.yml); the Chainguard action is the resolvable
+      # installer and is what this repo already uses on the signing side.
       - name: Install gitsign
-        uses: chainguard-dev/actions/setup-gitsign@main   # TODO: pin to a commit SHA
+        uses: chainguard-dev/actions/setup-gitsign@8f31e9482b447ff2c69eca944a09b4b31a4a85d0 # v1.7.2
 
       - name: Apply, sign, push, open PR
         env:

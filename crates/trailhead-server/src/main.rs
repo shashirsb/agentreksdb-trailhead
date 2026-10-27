@@ -5,12 +5,18 @@
 //! trailhead worker           # worker only (scale out separately)
 //! trailhead migrate          # apply database migrations
 //! trailhead policy check     # the diff-policy gate, used by gate-diff-policy.yml
+//! trailhead conformance check # does the diff only do what the spec asked for?
 //! trailhead guardrails FILE  # evaluate a prompt against the guardrail rules
 //! trailhead ledger verify    # recompute the whole public hash chain
 //! trailhead verify SHA       # show the provenance of a commit from a Trailhead server
 //! trailhead keygen           # print a new ledger signing key
 //! trailhead model-proxy      # key-injecting, model-pinning proxy for sandboxes
 //! ```
+
+// Neither crate needs `unsafe`, and the compiler is a better guard than a regex. `forbid` (not
+// `deny`) is the point: a generated patch cannot re-enable it with a local `#[allow]` or an
+// `#[expect]`, both of which the diff-policy rules would otherwise have to chase by hand.
+#![forbid(unsafe_code)]
 
 mod api;
 mod auth;
@@ -53,6 +59,11 @@ enum Cmd {
     /// Apply database migrations.
     Migrate,
     /// Diff-policy gate.
+    /// Check that a diff only does what its spec asked for.
+    Conformance {
+        #[command(subcommand)]
+        cmd: ConformanceCmd,
+    },
     Policy {
         #[command(subcommand)]
         cmd: PolicyCmd,
@@ -103,6 +114,23 @@ enum PolicyCmd {
         manifest: PathBuf,
         #[arg(long, default_value = "gates/diff-policy.toml")]
         policy: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConformanceCmd {
+    /// Check a diff manifest against the spec that justified it; exits 1 on block.
+    Check {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        spec: PathBuf,
+        /// Optional hunk → requirement map the generator emits. Without it, tracing is skipped
+        /// rather than failing every file, so the gate can ship before the generator emits one.
+        #[arg(long)]
+        trace: Option<PathBuf>,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -219,6 +247,31 @@ async fn main() -> anyhow::Result<()> {
                 std::fs::write(o, &s)?;
             }
             if v.verdict == diffpolicy::Outcome::Block {
+                std::process::exit(1);
+            }
+        }
+        Cmd::Conformance {
+            cmd:
+                ConformanceCmd::Check {
+                    manifest,
+                    spec,
+                    trace,
+                    out,
+                },
+        } => {
+            let m: diffpolicy::Manifest = serde_json::from_slice(&std::fs::read(&manifest)?)?;
+            let sp: trailhead_core::spec::Spec = serde_json::from_slice(&std::fs::read(&spec)?)?;
+            let tm: trailhead_core::conformance::TraceMap = match &trace {
+                Some(p) => serde_json::from_slice(&std::fs::read(p)?)?,
+                None => Default::default(),
+            };
+            let r = trailhead_core::conformance::check(&sp, &m, &tm);
+            let s = serde_json::to_string_pretty(&r)?;
+            println!("{s}");
+            if let Some(o) = out {
+                std::fs::write(o, &s)?;
+            }
+            if r.blocked() {
                 std::process::exit(1);
             }
         }

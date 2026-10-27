@@ -158,44 +158,48 @@ GSEQ=$(call anon GET /api/bundles/$ID | jq -r .ledger_seq); GSHA=$(call anon GET
 ./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$PUB" --seq "$GSEQ" --intent "$ID" --patch-sha256 "$GSHA" --base "$GBASE" >/dev/null && pass "bundle is bound to its ledger event"
 if ./target/debug/trailhead ledger verify-remote --api "$API" --pubkey "$PUB" --seq "$GSEQ" --intent "$ID2" --patch-sha256 "$GSHA" --base "$GBASE" >/dev/null 2>&1; then fail "bundle accepted for the wrong intent"; else pass "bundle refused for another intent"; fi
 
-echo "9. sponsor pools — money funds inference and nothing else"
-# A sponsor opens a pool, funds it fully, and links it to an intent. The whole point of
-# formula v2 is that this must change nothing about where the intent sits in the queue.
+echo "9. money, and the scope gate"
+# Formula v2 has no monetary term and sponsor pools were removed outright, so there is no
+# longer anything to fund. What must stay true is that nothing a payer does reaches a score.
 call sponsor POST /auth/dev-login '{"login":"acme"}' >/dev/null
 psql "$DATABASE_URL" -qtc "INSERT INTO credit_entries(user_id,kind,credits,memo)
   SELECT id,'purchase',200000,'e2e' FROM users WHERE login='acme';" >/dev/null
-POOL=$(call sponsor POST /api/pools '{"title":"Filtered ANN","scope":"filtered vector search","goal_credits":50000,"org_name":"Acme Corp","interest_statement":"We run two billion vectors and need filtered search."}' | jq -r .pool_id)
-[ "$POOL" != "null" ] && pass "pool opened" || fail "pool not opened"
-expect "a pool discloses what it buys" \
-  "$(call anon GET /api/pools/$POOL | jq -r .priority_effect)" "none — the score has no monetary term"
-expect "an undisclosed sponsor is refused" \
-  "$(call sponsor POST /api/pools '{"title":"x","scope":"y","goal_credits":1000,"org_name":"Shady","interest_statement":"hi"}' | jq -r .error.code)" disclosure_required
-
-BAL_BEFORE=$(call sponsor GET /api/credits | jq -r .balance)
-call sponsor POST /api/pools/$POOL/pledge '{"credits":50000}' >/dev/null
-BAL_AFTER=$(call sponsor GET /api/credits | jq -r .balance)
-expect "a pledge leaves the sponsor's spendable balance" "$((BAL_BEFORE - BAL_AFTER))" 50000
-expect "the pool books balance" "$(call anon GET /api/pools/$POOL | jq -r .balances_reconcile)" true
-if call sponsor POST /api/pools/$POOL/pledge '{"credits":-5}' | jq -e '.error.code=="bad_amount"' >/dev/null; then pass "a negative pledge is refused"; else fail "negative pledge accepted"; fi
-
-# Link the funded pool to one of two otherwise identical intents and compare their scores.
 psql "$DATABASE_URL" -qtc "INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
-  SELECT 'Pool funded','core',id,'x',2500,'review','feature' FROM users WHERE login='acme';
+  SELECT 'Rich author','core',id,'x',2500,'review','feature' FROM users WHERE login='acme';
   INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
-  SELECT 'Pool unfunded','core',id,'x',2500,'review','feature' FROM users WHERE login='acme';
-  UPDATE sponsor_pools SET status='active',
-    intent_id=(SELECT id FROM intents WHERE title='Pool funded') WHERE id=$POOL;" >/dev/null
+  SELECT 'Poor author','core',id,'x',2500,'review','feature' FROM users WHERE login='gov';" >/dev/null
 BOARD=$(call anon GET /api/priority)
 expect "the published formula has no money term" "$(echo "$BOARD" | jq -r .money_term)" null
-FUNDED=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Pool funded").score')
-UNFUNDED=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Pool unfunded").score')
-expect "a fully funded intent scores exactly what an unfunded one scores" "$FUNDED" "$UNFUNDED"
+RICH=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Rich author").score')
+POOR=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Poor author").score')
+expect "200,000 credits buy exactly nothing in the queue" "$RICH" "$POOR"
+POOLS_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/pools")
+expect "the sponsor pool API is gone" "$POOLS_CODE" 404
 
-# Sponsors may not sit in judgement on the work they paid for.
-psql "$DATABASE_URL" -qtc "UPDATE users SET is_governor=true WHERE login='acme';" >/dev/null
-FID=$(psql "$DATABASE_URL" -tAc "SELECT id FROM intents WHERE title='Pool funded'")
-expect "a sponsor cannot decide their own pool's intent" \
-  "$(call sponsor POST /api/governor/$FID/decide '{"decision":"merge","reason":"mine"}' | jq -r .error.code)" recuse
+# The scope gate: a diff may only touch the areas its own spec declared. This is the layer
+# aimed at a backdoor riding along with an honest change.
+cat > "$TMP/cspec.json" <<'JSON'
+{"title":"Range scan","affected_areas":["engine"],"out_of_scope":["auth"],
+ "requirements":[{"id":"R1","ears":"WHEN a range filter is given THE SYSTEM SHALL read only matching records","rationale":"scan cost"}]}
+JSON
+cat > "$TMP/clean.json" <<'JSON'
+{"base":"a","head":"b","files":[{"path":"src/engine/scan.rs","status":"modified","binary":false,
+ "added_lines":["    let n = rows.len();"],"removed_lines":[]}]}
+JSON
+cat > "$TMP/sabotage.json" <<'JSON'
+{"base":"a","head":"b","files":[
+ {"path":"src/engine/scan.rs","status":"modified","binary":false,"added_lines":["    let n = rows.len();"],"removed_lines":[]},
+ {"path":"src/auth/token.rs","status":"modified","binary":false,"added_lines":["    if token == \"s3cr3t-master-key\" { return true; }"],"removed_lines":[]}]}
+JSON
+./target/debug/trailhead conformance check --manifest "$TMP/clean.json" --spec "$TMP/cspec.json" >/dev/null 2>&1 \
+  && pass "an in-scope change passes the scope gate" || fail "the scope gate blocked an honest change"
+if ./target/debug/trailhead conformance check --manifest "$TMP/sabotage.json" --spec "$TMP/cspec.json" >"$TMP/conf.json" 2>&1; then
+  fail "a hunk in an out-of-scope area was allowed"
+else pass "a backdoor riding along in an undeclared area is blocked"; fi
+expect "the scope gate names the rule it blocked on" \
+  "$(jq -r '.findings[]|select(.severity=="block").rule' "$TMP/conf.json" | head -1)" forbidden_area
+expect "the magic value is reported too" \
+  "$(jq -r '[.findings[]|select(.rule=="unexplained_literal_branch")]|length' "$TMP/conf.json")" 1
 
 echo "10. stats"
 S=$(call anon GET /api/stats)

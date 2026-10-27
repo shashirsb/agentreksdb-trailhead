@@ -4,6 +4,12 @@
 //! prompt carries, whether a diff is blocked, which weekly train is open, whether the public ledger
 //! is intact, how many credits an account has) lives here so it can be tested and audited alone.
 
+// Neither crate needs `unsafe`, and the compiler is a better guard than a regex. `forbid` (not
+// `deny`) is the point: a generated patch cannot re-enable it with a local `#[allow]` or an
+// `#[expect]`, both of which the diff-policy rules would otherwise have to chase by hand.
+#![forbid(unsafe_code)]
+
+pub mod conformance;
 pub mod credits;
 pub mod diffpolicy;
 pub mod guardrails;

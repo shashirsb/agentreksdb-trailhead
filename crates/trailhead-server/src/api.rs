@@ -4,7 +4,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::{Datelike, Utc};
@@ -130,7 +130,16 @@ pub fn router(st: AppState) -> Router {
         .route("/api/verify/{sha}", get(verify_sha))
         .route("/api/bundles/{id}", get(bundle))
         .route("/api/webhooks/github", post(webhook))
-        .route("/healthz", get(|| async { "ok" }));
+        .route("/healthz", get(|| async { "ok" }))
+        // An unknown path under /api is an error, not the single-page app. Without this, a
+        // client calling a route that was renamed or removed gets 200 and a page of HTML,
+        // which parses as neither success nor failure and hides the mistake from whoever is
+        // reading the response. Everything else still falls through to the app, so deep links
+        // keep working.
+        .route(
+            "/api/{*rest}",
+            any(|| async { ApiError::not_found("endpoint") }),
+        );
     api.fallback_service(ServeDir::new(&web).fallback(ServeFile::new(web.join("index.html"))))
         .with_state(st)
 }
@@ -417,6 +426,7 @@ async fn get_intent(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value>
     Ok(Json(json!({
         "intent": intent_json(&st.pool, &it).await?,
         "messages": messages.into_iter().map(|(r, b, t)| json!({"role": r, "body": b, "created_at": t})).collect::<Vec<_>>(),
+        "gates_simulated": gates.iter().any(|(_, v, _, _)| v == "simulated"),
         "gates": gates.into_iter().map(|(g, v, d, t)| json!({"gate": g, "verdict": v, "detail": d, "created_at": t})).collect::<Vec<_>>(),
         "events": events,
         "decision": decision.map(|(i, tr, d, r, g, t)| json!({"intent_id": i, "train": tr, "decision": d, "reason": r, "governor": g, "created_at": t})),
@@ -768,6 +778,7 @@ async fn governor_queue(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
             .map(|g| g.2.clone());
         items.push(json!({
             "intent": intent_json(&st.pool, it).await?,
+            "gates_simulated": gates.iter().any(|(_, v, _)| v == "simulated"),
             "gates": gates.into_iter().map(|(g, v, d)| json!({"gate": g, "verdict": v, "detail": d})).collect::<Vec<_>>(),
             "ai_review": ai_review,
         }));

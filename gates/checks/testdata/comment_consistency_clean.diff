@@ -1,0 +1,48 @@
+diff --git a/crates/agentreksdb-core/src/storage/batch.rs b/crates/agentreksdb-core/src/storage/batch.rs
+--- a/crates/agentreksdb-core/src/storage/batch.rs
++++ b/crates/agentreksdb-core/src/storage/batch.rs
+@@ -14,6 +14,30 @@ impl Batch {
+ impl Batch {
+     pub fn len(&self) -> usize {
+         self.rows.len()
+     }
+
++    /// Validates the batch against the configured row ceiling and rejects anything
++    /// larger. Returns an error when the batch would exceed `max_rows`.
++    pub fn validate(&self, max_rows: usize) -> Result<(), BatchError> {
++        if self.rows.len() > max_rows {
++            return Err(BatchError::TooLarge { rows: self.rows.len(), max: max_rows });
++        }
++        Ok(())
++    }
++
++    /// Checks that every row carries a non-zero id.
++    pub fn check_ids(&self) -> Result<(), BatchError> {
++        for row in &self.rows {
++            if row.id == 0 {
++                return Err(BatchError::ZeroId);
++            }
++        }
++        Ok(())
++    }
++
++    /// The caller must not mutate `rows` while this iterator is alive; the borrow
++    /// checker enforces that, this note is only a reminder.
++    pub fn iter(&self) -> impl Iterator<Item = &Row> {
++        self.rows.iter()
++    }
++
+     pub fn clear(&mut self) {
+         self.rows.clear();
+     }
+diff --git a/crates/agentreksdb-core/src/metrics.rs b/crates/agentreksdb-core/src/metrics.rs
+--- a/crates/agentreksdb-core/src/metrics.rs
++++ b/crates/agentreksdb-core/src/metrics.rs
+@@ -5,7 +5,8 @@ use std::sync::atomic::Ordering;
+ /// Record a finished request.
+-/// Increments the request counter.
++/// Increments the request counter and observes the latency histogram.
+ pub fn observe(latency_ms: u64) {
+     COUNTER.fetch_add(1, Ordering::Relaxed);
++    HISTOGRAM.observe(latency_ms as f64);
+ }
