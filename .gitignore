@@ -2,3 +2,8 @@ target/
 .env
 *.pem
 /target
+
+# Python byte-code. These were tracked by accident: a compiled artifact of a gate script
+# that nobody reads in a diff is exactly the kind of place the checks below exist to look.
+__pycache__/
+*.pyc
