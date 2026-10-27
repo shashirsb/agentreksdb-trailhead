@@ -236,6 +236,26 @@ details summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--muted)
 .v-pass .fi{background:var(--teal);color:#063e36}.v-warn .fi{background:var(--accent);color:#1F2A44}
 .v-flag .fi,.v-block .fi{background:var(--coral);color:#fff}.v-pending .fi{background:var(--surface-2)}
 .find .det{color:var(--muted);font-size:13px;overflow-wrap:anywhere}
+.v-simulated .fi{background:var(--coral);color:#fff}
+/* evidence: the traceability matrix and the raw test rows behind it */
+.simbanner{border:2px solid var(--coral);background:color-mix(in srgb,var(--coral) 12%,transparent);border-radius:10px;padding:10px 13px;font-size:13.5px;font-weight:700;margin-bottom:14px}
+.trace{display:grid;gap:10px}
+.treq{border-left:4px solid var(--violet);padding:7px 0 7px 12px}
+.treq .rid{font-family:"JetBrains Mono",monospace;font-size:11.5px;color:var(--muted);font-weight:700}
+.treq .ears{font-size:13.5px;margin-top:2px;overflow-wrap:anywhere}
+.tat{margin:8px 0 0 0;padding:6px 0 6px 12px;border-left:2px solid var(--line)}
+.tat .aid{font-family:"JetBrains Mono",monospace;font-size:11px;font-weight:700}
+.tat .gwt{font-size:13px;color:var(--muted);overflow-wrap:anywhere}
+.tlink{display:flex;gap:7px;align-items:baseline;flex-wrap:wrap;font-size:12.5px;margin-top:4px}
+.tlink .mono{font-family:"JetBrains Mono",monospace;font-size:11.5px;overflow-wrap:anywhere}
+.gap{color:var(--coral);font-weight:800;font-size:12.5px;margin-top:4px}
+.nodisc{color:var(--accent-ink,var(--muted));font-weight:700;font-size:12.5px;margin-top:4px}
+.ttable{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:8px}
+.ttable th,.ttable td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.ttable th{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.ttable td.st{font-weight:800}
+.totals{display:flex;gap:16px;flex-wrap:wrap;font-size:13px;margin:6px 0 10px}
+.totals b{font-size:17px;display:block}
 .ev{border-left:4px solid var(--violet);padding:7px 0 7px 12px;margin-bottom:8px}
 .ev .eh{display:flex;gap:10px;align-items:center;flex-wrap:wrap;font-family:"JetBrains Mono",monospace;font-size:11.5px;color:var(--muted)}
 .ev .eh b{color:var(--ink)}
@@ -926,9 +946,10 @@ function drawIntent(){
     '</div><div class="col">'+
       '<div class="card panel" id="pipePanel"></div>'+
       '<div class="card panel" id="gatesPanel"></div>'+
+      '<div class="card panel" id="evidencePanel"></div>'+
       '<div class="card panel" id="votePanel"></div>'+
     '</div></div>';
-  drawChat();drawSpec();drawPipe();drawGates();drawEvents();drawVote();
+  drawChat();drawSpec();drawPipe();drawGates();drawEvents();drawVote();loadEvidence(i.id);
 }
 function drawChat(){
   var i=CUR.intent,msgs=CUR.messages||[];
@@ -1023,11 +1044,97 @@ function drawPipe(){
 function drawGates(){
   var g=CUR.gates||[];
   var html=panelHead("shield","Gates");
+  if(CUR.gates_simulated) html+='<div class="simbanner">SIMULATED — the repo-side gates did not run. These are placeholders, not results.</div>';
   html+=g.length?'<div class="finds">'+g.map(function(x){
     var v=(x.verdict||"pending").toLowerCase(),ic=v==="pass"?ICON.check:(v==="warn"?ICON.warn:(v==="pending"?ICON.dot:ICON.flag));
+    if(v==="simulated") ic=ICON.warn;
     return '<div class="find v-'+esc(v)+'"><div class="fi">'+ic+'</div><div style="min-width:0"><b>'+esc(x.gate)+'</b> <span class="tagx">'+esc(v)+'</span><div class="det">'+esc(x.detail||"")+'</div></div></div>';
   }).join("")+'</div>':'<p class="muted" style="font-size:14px">No gate has run yet.</p>';
   $("gatesPanel").innerHTML=html;
+}
+/* ---------- evidence: what was tested, and did it prove anything ---------- */
+var EVID=null;
+function drawEvidence(){
+  var el=$("evidencePanel"); if(!el) return;
+  var html=panelHead("shield","Evidence");
+  if(!EVID){ el.innerHTML=html+'<p class="muted" style="font-size:14px">Loading…</p>'; return; }
+  var runs=EVID.runs||[],reqs=EVID.requirements||[],ats=EVID.acceptance_tests||[];
+  if(!runs.length){
+    el.innerHTML=html+'<p class="muted" style="font-size:14px">No test run has reported yet. Evidence appears once the gates run and report their results.</p>';
+    return;
+  }
+  var run=runs[0];
+  if(run.simulated){
+    html+='<div class="simbanner">SIMULATED — no tests ran. There is no GitHub App configured, so the repo-side gates did not execute. Nothing below is a passing result.</div>';
+  }
+  var t=run.totals||{};
+  html+='<div class="totals">'+
+    '<span><b>'+num(t.tests||0)+'</b>tests</span>'+
+    '<span><b>'+num(t.passed||0)+'</b>passed</span>'+
+    '<span><b>'+num(t.failed||0)+'</b>failed</span>'+
+    '<span title="Tests that failed on the parent commit. A test that already passed proves nothing about this change."><b>'+num(t.discriminating||0)+'</b>proving</span>'+
+    '<span title="Mutants caught of mutants generated."><b>'+num(t.mutants_caught||0)+'/'+num(t.mutants||0)+'</b>mutants</span></div>';
+
+  /* the matrix: requirement -> acceptance test -> the Rust tests behind it */
+  var links=run.acceptance_links||[],tests=run.tests||[];
+  function testsFor(aid){return links.filter(function(l){return l.acceptance_id===aid;});}
+  function testRow(tid){return tests.filter(function(x){return x.id===tid;})[0];}
+  html+='<div class="trace">';
+  if(!reqs.length) html+='<p class="muted" style="font-size:14px">The spec carries no requirements, so there is nothing to trace.</p>';
+  reqs.forEach(function(r){
+    html+='<div class="treq"><div class="rid">'+esc(r.id)+'</div><div class="ears">'+esc(r.ears||"")+'</div>';
+    var mine=ats.filter(function(a){return a.requirement_id===r.id;});
+    if(!mine.length) html+='<div class="gap">No acceptance test covers this requirement.</div>';
+    mine.forEach(function(a){
+      html+='<div class="tat"><div class="aid">'+esc(a.id)+(a.negative?' · negative':'')+'</div>'+
+        '<div class="gwt">Given '+esc(a.given||"")+' · when '+esc(a.when||"")+' · then '+esc(a.then||"")+'</div>';
+      var ls=testsFor(a.id);
+      if(!ls.length){
+        html+='<div class="gap">No test proves this criterion.</div>';
+      } else {
+        ls.forEach(function(l){
+          var tr=testRow(l.test_id),st=tr?tr.status:"—";
+          var ic=st==="pass"?ICON.check:(st==="fail"?ICON.flag:ICON.dot);
+          html+='<div class="tlink"><span class="find v-'+esc(st)+'" style="padding:0"><span class="fi">'+ic+'</span></span>'+
+            '<span class="mono">'+esc(l.test_id)+'</span><span class="tagx">'+esc(st)+'</span>'+
+            '<span class="muted">via '+esc(l.source)+'</span></div>';
+          if(tr&&tr.fail_before==="pass"){
+            html+='<div class="nodisc">Not discriminating: this test already passed on the parent commit, so it demonstrates nothing about this change.</div>';
+          }
+        });
+      }
+      html+='</div>';
+    });
+    html+='</div>';
+  });
+  html+='</div>';
+
+  /* every test, so the counts above can be checked against the rows they came from */
+  if(tests.length){
+    html+='<details style="margin-top:12px"><summary>All '+num(tests.length)+(tests.length===1?' test':' tests')+'</summary><table class="ttable"><thead><tr><th>test</th><th>kind</th><th>status</th><th>ms</th><th>new</th><th>on parent</th></tr></thead><tbody>';
+    tests.forEach(function(x){
+      html+='<tr><td class="mono">'+esc(x.id)+'</td><td>'+esc(x.kind||"")+'</td><td class="st">'+esc(x.status)+'</td><td>'+(x.duration_ms==null?"—":num(x.duration_ms))+'</td><td>'+(x.added_in_diff?"yes":"")+'</td><td>'+esc(x.fail_before||"")+'</td></tr>';
+    });
+    html+='</tbody></table></details>';
+  }
+  var mu=(run.mutants||[]).filter(function(m){return m.outcome!=="caught";});
+  if(mu.length){
+    html+='<details style="margin-top:8px"><summary>'+num(mu.length)+(mu.length===1?' mutant':' mutants')+' not caught</summary><table class="ttable"><thead><tr><th>mutant</th><th>file</th><th>outcome</th></tr></thead><tbody>'+
+      mu.map(function(m){return '<tr><td class="mono">'+esc(m.mutant)+'</td><td class="mono">'+esc(m.file)+'</td><td class="st">'+esc(m.outcome)+'</td></tr>';}).join("")+'</tbody></table></details>';
+  }
+  /* how to check this yourself */
+  html+='<div class="hash" style="margin-top:12px">run '+esc(run.gate)+' · '+esc(run.check_name||"")+' · head '+shortHash(run.head_sha)+
+    (run.manifest_sha256?' · manifest '+shortHash(run.manifest_sha256):'')+
+    (run.ledger_seq?' · ledger #'+esc(run.ledger_seq):'')+'</div>';
+  if(run.run_url) html+='<p style="margin-top:6px"><a class="mono" style="font-size:12px" href="'+esc(run.run_url)+'" target="_blank" rel="noopener">the run that produced this ↗</a></p>';
+  html+='<p class="muted" style="font-size:12px;margin-top:8px">'+esc(EVID.note||"")+'</p>';
+  el.innerHTML=html;
+}
+function loadEvidence(id){
+  EVID=null;drawEvidence();
+  api("/api/intents/"+encodeURIComponent(id)+"/evidence").then(function(j){
+    if(CUR&&CUR.intent&&String(CUR.intent.id)===String(id)){EVID=j;drawEvidence();}
+  },function(){ EVID={runs:[]}; drawEvidence(); });
 }
 function eventSummary(e){
   var p=e.payload||{};

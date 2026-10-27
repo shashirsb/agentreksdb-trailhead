@@ -1,0 +1,59 @@
+# cargo-audit configuration — the ignore list that mirrors `[advisories] ignore` in deny.toml.
+#
+# WHY THIS FILE EXISTS
+# gate-diff-policy runs BOTH `cargo deny check` and `cargo audit --deny warnings`. The two read the
+# same RustSec advisory database but not the same configuration: cargo-deny reads `deny.toml`,
+# cargo-audit reads `.cargo/audit.toml` and ignores deny.toml entirely. So an advisory that the
+# governors have accepted and recorded in deny.toml was still fatal to cargo-audit, and the audit
+# step failed on every pull request regardless of what the change did. A gate that fails on every
+# change teaches people to ignore it, which is worse than not having it.
+#
+# WHY NOT JUST DROP cargo-audit
+# It is a fair question: cargo-deny's `advisories` check covers the same database, so cargo-audit is
+# largely redundant. It is kept for two reasons. The gates are the only thing standing between a
+# generated patch and `main`, and two independent implementations reading the same data fail in
+# different ways — a parsing bug or a stale index in one is unlikely to be mirrored in the other.
+# Second, `cargo audit --deny warnings` also fails on yanked and unmaintained crates, which is how a
+# dependency gets quietly swapped out from under a lockfile. The cost of keeping it is this file and
+# the drift it can develop, and that drift is now itself checked: gate-diff-policy compares the two
+# ignore lists and fails if they disagree, so a governor cannot accept an advisory in one tool and
+# silently leave it blocking in the other.
+#
+# RULES FOR EDITING
+# This list is an admission, not a setting. Every entry means "we know, and we are shipping anyway".
+# Add one only together with the same id in deny.toml's `[advisories] ignore`, in the same pull
+# request, with the reason written next to it. An entry with no stated reason should be removed
+# rather than inherited. `/gates/` and the lockfile are CODEOWNED, so a human governor sees it.
+#
+# INSTALL
+# cargo-audit looks for `.cargo/audit.toml` relative to the directory it runs in, and the audit step
+# runs with `working-directory: $WORKSPACE_DIR`. In the target repo this file therefore belongs at
+# `<WORKSPACE_DIR>/.cargo/audit.toml`, next to the `deny.toml` it mirrors — not at the repo root.
+
+[advisories]
+# Accepted advisories, mirroring deny.toml. Keep sorted by id; keep the reasons.
+ignore = [
+  # Unmaintained: `atty` (unaligned read on Windows via a transitive dependency). Reachable only
+  # from a Windows-only code path the database does not build on, and no replacement is available
+  # without a major bump of the crate that pulls it in.
+  "RUSTSEC-2024-0436",
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
+]
+
+# Fail on anything that is not explicitly listed above. These mirror `cargo audit --deny warnings`:
+# an unmaintained or yanked dependency is treated as a finding, because "nobody is watching this
+# crate any more" is exactly the condition a supply-chain attack waits for.
+informational_warnings = ["unmaintained", "unsound", "notice", "yanked"]
+severity_threshold = "none"
+
+[output]
+deny = ["warnings", "unmaintained", "unsound", "yanked"]
+# Quiet output; the gate reports the exit code and the SARIF/logs carry the detail.
+format = "terminal"
+
+[yanked]
+# Always re-check yanked status against the registry rather than trusting a cached index: a crate
+# yanked after the lockfile was written is precisely the case worth catching.
+enabled = true
+update_index = true
