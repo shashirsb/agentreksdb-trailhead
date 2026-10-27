@@ -121,7 +121,10 @@ section.view{padding-block:32px 40px;min-height:62vh}
 .err .hint{color:var(--muted);font-size:13px}
 .ok{padding:11px 14px;border:var(--bw) solid var(--teal);border-radius:10px;background:color-mix(in srgb,var(--teal) 12%,var(--surface));font-size:14px;font-weight:700;margin:10px 0}
 :root[data-brand="blueprint"] .ok{border-radius:0}
-.empty{padding:26px;color:var(--muted);text-align:center}
+/* Centred is the right look for an empty state, but a long one stretched the full width of the
+   card and left a single orphaned word on the second line. `balance` evens the lines out; the
+   measure keeps a two-sentence message readable without shrinking the card itself. */
+.empty{padding:26px;color:var(--muted);text-align:center;text-wrap:balance}
 .loading{padding:22px;color:var(--muted);font-family:"JetBrains Mono",monospace;font-size:13px}
 
 /* home */
@@ -144,7 +147,7 @@ section.view{padding-block:32px 40px;min-height:62vh}
 .trainbox{margin-top:22px;padding:22px;display:grid;grid-template-columns:1fr 1fr;gap:20px}
 @media(max-width:720px){.trainbox{grid-template-columns:1fr}}
 .cd{font-family:"Baloo 2",sans-serif;font-weight:800;font-size:clamp(26px,4vw,34px);font-variant-numeric:tabular-nums;line-height:1.1}
-.cd-l{font-size:13px;color:var(--muted);font-weight:700}
+.cd-l{font-size:13px;color:var(--muted);font-weight:700;text-wrap:pretty}
 .cd-t{font-family:"JetBrains Mono",monospace;font-size:12px;color:var(--muted)}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;margin-top:22px}
 @media(max-width:760px){.grid3{grid-template-columns:1fr}}
@@ -166,6 +169,13 @@ section.view{padding-block:32px 40px;min-height:62vh}
 .fid{font-family:"JetBrains Mono",monospace;font-size:12.5px;color:var(--muted);font-weight:700}
 .frow h3{font-size:18.5px;margin:3px 0 7px;overflow-wrap:anywhere}
 .meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:13.5px;align-items:center}
+/* In the intent list the same four facts repeat on every row, so they get fixed columns rather
+   than flowing after the author's name. Flowed, "0 votes" landed at x=311 on one row and x=330
+   on the next, which is enough to stop the eye reading down the column. Numbers are tabular for
+   the same reason. Below 640px the row stacks and the grid gives way to the flex default. */
+.frow .meta{display:grid;grid-template-columns:minmax(90px,max-content) 150px 86px max-content;justify-content:start;gap:0 18px;font-variant-numeric:tabular-nums}
+.frow .meta>span{min-width:0;overflow-wrap:anywhere}
+@media(max-width:640px){.frow .meta{display:flex;gap:14px}}
 .meta b{color:var(--ink);font-weight:800}
 .frow .right{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
 .prog{display:flex;gap:4px;align-items:center}
@@ -813,7 +823,7 @@ function renderHome(){
       '<div class="card stat"><div class="v">'+num(s.in_review)+'</div><div class="l">In review</div></div>'+
       '<div class="card stat"><div class="v">'+num(s.merged)+'</div><div class="l">Merged all-time</div></div>'+
       '<div class="card stat"><div class="v">'+num(s.credits_staked)+'</div><div class="l">Credits staked · '+num(s.credits_spent)+' spent</div></div></div>'+
-      (s.target_repo_url?'<div class="cta-row" style="margin:-4px 0 18px"><a class="btn" href="'+esc(s.target_repo_url)+'" target="_blank" rel="noopener">Get the code: '+esc(s.target_repo)+' ↗</a><a class="btn ghost" href="#releases">Release notes</a></div>':'');
+      (s.target_repo_url?'<div class="cta-row" style="margin:18px 0"><a class="btn" href="'+esc(s.target_repo_url)+'" target="_blank" rel="noopener">Get the code: '+esc(s.target_repo)+' ↗</a><a class="btn ghost" href="#releases">Release notes</a></div>':'');
     if(s.target_repo_url){var nc=$("navCode");if(nc)nc.href=s.target_repo_url;}
   },function(e){$("homeStats").innerHTML=errBox(e);});
   api("/api/train").then(function(t){TRAIN=t;drawHomeTrain(t);},function(e){drawHomeTrain(null,e);});
@@ -1190,7 +1200,7 @@ function drawTrain(t,keep){
       '<div><p class="eyebrow">'+(g.phase==="review"?"Next release · in review":"Next release")+(g.reviewTrain?' · train '+esc(g.reviewTrain):'')+'</p><div class="cd" data-countdown="'+g.decision+'">'+countdownText(g.decision)+'</div><div class="cd-l">governors merge or hold, then the release is published · '+esc(fmtPt(g.decision))+'</div></div>'+
       '<div><p class="eyebrow">Next new feature request cutoff'+(g.intakeTrain?' · train '+esc(g.intakeTrain):'')+'</p><div class="cd" data-countdown="'+g.cutoff+'">'+countdownText(g.cutoff)+'</div><div class="cd-l">new requests after this join the following train · '+esc(fmtPt(g.cutoff))+'</div></div>'+
     '</div>';
-  html+='<div class="stats" style="margin-top:20px">'+(keys.length?keys.map(function(k){return '<div class="card stat"><div class="v">'+num(counts[k])+'</div><div class="l">'+esc(STATUS_LABEL[k]||k.replace(/_/g," "))+'</div></div>';}).join(""):'<div class="card stat" style="grid-column:1/-1"><div class="l">No branches on this train yet.</div></div>')+'</div>';
+  html+='<div class="stats" style="margin-top:20px">'+(keys.length?keys.map(function(k){return '<div class="card stat"><div class="v">'+num(counts[k])+'</div><div class="l">'+esc(STATUS_LABEL[k]||k.replace(/_/g," "))+'</div></div>';}).join(""):'<div class="card empty" style="grid-column:1/-1">No branches on this train yet.</div>')+'</div>';
   var p=ptParts(Date.now()),dow=WD[p.weekday];
   var nowIdx=dow===0?0:(dow<=2?1:(dow<=4?2:(dow===5?3:4)));
   var steps=[["Sunday","00:00 PT","Cutoff: the train closes"],["Mon–Tue","checks","Tests, perf, diff-policy, AI review"],["Wed–Thu","review","Governors review; second human on sensitive paths"],["Friday","00:00 PT","Decision: merged, on hold, rejected"],["Fri–Sat","buffer","Notes published; holds roll forward"]];
