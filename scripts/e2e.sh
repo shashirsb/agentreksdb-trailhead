@@ -20,6 +20,12 @@ call() { # call JAR METHOD PATH [JSON]
   if [ $# -ge 3 ]; then curl -s -b "$jar" -c "$jar" -X "$1" -H 'content-type: application/json' "$API$2" -d "$3"
   else curl -s -b "$jar" -c "$jar" -X "$1" "$API$2"; fi
 }
+code() { # code JAR METHOD PATH [JSON] -- the HTTP status rather than the body, for the cases where
+         # the status is the thing under test (a refusal must be 403, not 500).
+  local jar="$TMP/$1.jar"; shift
+  if [ $# -ge 3 ]; then curl -s -o /dev/null -w '%{http_code}' -b "$jar" -c "$jar" -X "$1" -H 'content-type: application/json' "$API$2" -d "$3"
+  else curl -s -o /dev/null -w '%{http_code}' -b "$jar" -c "$jar" -X "$1" "$API$2"; fi
+}
 wait_status() { # wait_status ID STATUS
   for _ in $(seq 1 240); do
     s=$(call anon GET "/api/intents/$1" | jq -r .intent.status)
@@ -40,11 +46,21 @@ curl -sf "$API/healthz" >/dev/null || { cat "$TMP/server.log"; fail "server did 
 echo "Trailhead e2e on $API"
 
 echo "1. sign-in and credits"
-call alice POST /auth/dev-login '{"login":"alice"}' >/dev/null
 call gov POST /auth/dev-login '{"login":"gov"}' >/dev/null
+expect "gov is a governor" "$(call gov GET /api/me | jq -r .user.is_governor)" true
+# Signing up is open, but requesting a feature and working on a release are invitation-only (0009),
+# so the authors used by sections 2-9 are invited here, before they first sign in — an invitation is
+# accepted automatically at sign-in. The gate itself, and the fact that reading and voting need no
+# invitation at all, are tested in section 13; erin below is deliberately left uninvited and votes.
+for who in alice carol dave kid; do
+  call gov POST /api/invites "$(jq -n --arg l "$who" '{login:$l,kind:"developer",note:"e2e author"}')" >/dev/null
+done
+call gov POST /api/invites '{"login":"acme-admin","kind":"org_admin","note":"e2e employer"}' >/dev/null
+call alice POST /auth/dev-login '{"login":"alice"}' >/dev/null
 expect "alice is a visitor" "$(call alice GET /api/me | jq -r .user.tier)" visitor
 expect "visitor monthly grant" "$(call alice GET /api/me | jq -r .user.credits_balance)" 500
-expect "gov is a governor" "$(call gov GET /api/me | jq -r .user.is_governor)" true
+expect "an invitation does not promote the account that holds it" \
+  "$(call alice GET /api/me | jq -r '[.user.tier, (.user.rights.request_features|tostring)]|join("/")')" visitor/true
 expect "new accounts are refused" "$(call kid POST /auth/dev-login '{"login":"kid","account_age_days":3}' >/dev/null; call kid POST /api/intents '{"title":"Some feature","area":"Engine","intent":"Please add something useful"}' | jq -r .error.code)" account_too_new
 
 echo "2. intent chat to a ready spec (offline interviewer)"
@@ -87,13 +103,34 @@ echo "4. governor"
 expect "non-governor refused" "$(call alice GET /api/governor/queue | jq -r .error.code)" governors_only
 expect "queue has the intent" "$(call gov GET /api/governor/queue | jq -r "[.items[].intent.id]|index($ID)!=null")" true
 expect "reason required" "$(call gov POST /api/governor/$ID/decide '{"decision":"merge","reason":" "}' | jq -r .error.code)" reason_required
+# A revoked invitation has to stop work that is ALREADY in flight, not merely stop the next intent
+# being started. The gate in `submit` cannot do that: this intent was submitted while the author was
+# invited, and sat in review while the invitation was withdrawn. Without the recheck in
+# worker::decide the merge would go through and the revocation would be advisory for exactly the
+# intents it most needs to reach. Holding and rejecting must still work, or withdrawing an
+# invitation would strand that author's open intents with no way to close them.
+psql "$DATABASE_URL" -qc "UPDATE invites SET revoked_at=now(), revoked_by=(SELECT id FROM users WHERE login='gov') WHERE login='alice'"
+expect "work cannot be merged once its author's invitation is revoked" \
+  "$(call gov POST /api/governor/$ID/decide '{"decision":"merge","reason":"Should be refused."}' | jq -r .error.code)" author_not_invited
+expect "the refusal says how to proceed rather than just refusing" \
+  "$(call gov POST /api/governor/$ID/decide '{"decision":"merge","reason":"Should be refused."}' | jq -r '.error.message | test("[Rr]einstate")')" true
+expect "but it can still be held, so the queue does not strand it" \
+  "$(call gov POST /api/governor/$ID/decide '{"decision":"hold","reason":"Author uninvited; parking it."}' | jq -r .decision.decision)" hold
+expect "and no decision to merge was recorded" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from decisions where intent_id=$ID and decision='merge'")" 0
+psql "$DATABASE_URL" -qc "UPDATE invites SET revoked_at=NULL, revoked_by=NULL WHERE login='alice'"
+psql "$DATABASE_URL" -qc "UPDATE intents SET status='review' WHERE id=$ID"
+expect "reinstating the invitation lets the work proceed again" \
+  "$(call gov GET /api/me | jq -r .user.is_governor)" true
 # Two governors (or a double click) racing: exactly one decision may land, with one refund.
 call gov POST /api/governor/$ID/decide '{"decision":"merge","reason":"Spec met; tests green; small additive change."}' > "$TMP/d1" & P1=$!
 call gov POST /api/governor/$ID/decide '{"decision":"merge","reason":"Same click, twice."}' > "$TMP/d2" & P2=$!
 wait $P1 $P2
 expect "exactly one racing decision wins" "$(cat "$TMP/d1" "$TMP/d2" | jq -r '.decision.decision // empty' | wc -l | tr -d ' ')" 1
 expect "the loser is told why" "$(cat "$TMP/d1" "$TMP/d2" | jq -r '.error.code // empty')" bad_state
-expect "one decision row recorded" "$(psql "$DATABASE_URL" -tAc "select count(*) from decisions where intent_id=$ID")" 1
+# Scoped to merge decisions: the revoked-author case above deliberately records a `hold` on this
+# same intent, and what this check is really about is that the racing merge landed exactly once.
+expect "one merge decision row recorded" "$(psql "$DATABASE_URL" -tAc "select count(*) from decisions where intent_id=$ID and decision='merge'")" 1
 wait_status "$ID" merged
 expect "stake refunded, balance back to 500 minus generation" "$(call alice GET /api/credits | jq -r .balance)" 488
 
@@ -401,5 +438,240 @@ cat > "$TMP/new-exempt.json" <<JSON
 JSON
 expect "a newly created file cannot claim a path exemption" \
   "$(./target/debug/trailhead policy check --manifest "$TMP/new-exempt.json" | jq -r .verdict)" block
+echo "13. invitations — signing up is open, contributing is invited"
+# 0009. Anyone may create an account, read every intent, follow a release and vote. Two actions need
+# an invitation bound to the actor's GitHub login: requesting a feature (POST /api/intents) and
+# working on a release (POST /api/intents/{id}/submit). The rules themselves are unit-tested in
+# core::invite; everything here goes through the API, because the gate is only worth anything if the
+# handlers actually consult it and the view behind it is read live rather than cached.
+
+# Eleven answers that take an intent from "filed" to a ready spec, as sections 2, 5 and 6 do inline.
+interview() { # interview JAR INTENT_ID
+  for a in perf "faster greet" "none" "src/lib.rs" "THE SYSTEM SHALL greet faster" \
+    "Given a name When greet runs Then it is fast
+Given a blank name When greet runs Then it does not fail" "not breaking" "fast" "unchanged" "low" "revert"; do
+    call "$1" POST "/api/intents/$2/messages" "$(jq -n --arg b "$a" '{body:$b}')" >/dev/null
+  done
+}
+NEW_INTENT='{"title":"Sort the listing output","area":"Console","intent":"Long listings come out in insertion order and there is no way to sort them, so finding anything means reading the lot."}'
+
+# An account that signed up and holds nothing at all.
+call nobody POST /auth/dev-login '{"login":"nobody"}' >/dev/null
+expect "an uninvited account is refused a feature request" \
+  "$(call nobody POST /api/intents "$NEW_INTENT" | jq -r .error.code)" invitation_required
+expect "the refusal is a 403, not a 500" "$(code nobody POST /api/intents "$NEW_INTENT")" 403
+expect "the refusal names what to do about it" \
+  "$(call nobody POST /api/intents "$NEW_INTENT" | jq -r '.error.hint|test("organisation key")')" true
+expect "/api/me tells the account it holds no rights, instead of letting it find out later" \
+  "$(call nobody GET /api/me | jq -r '[.user.rights.request_features,.user.rights.develop,.user.rights.create_org]|map(tostring)|join(",")')" false,false,false
+
+# The point of gating the two ACTIONS rather than the door: taking part stays open. A regression
+# that quietly gated reading or voting would be invisible in the UI and fatal to the premise, so it
+# fails here. Voting needs one merged intent (reputation, not invitation), so seed one, exactly as
+# the vote test in 6b does for erin — and no invitation, which is the thing under test.
+psql "$DATABASE_URL" -qc "insert into intents (title,area,author_id,intent,status,stake_credits) select 'nobody earlier work','Engine',id,'x','merged',0 from users where login='nobody'; update intents set updated_at = now() - interval '40 days' where title='nobody earlier work'" >/dev/null
+expect "an uninvited account holds no invitation row" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from invites where login='nobody'")" 0
+expect "an uninvited account can still read the whole queue" \
+  "$(call nobody GET /api/intents | jq -r '.intents|length > 0')" true
+expect "an uninvited account can still read any single intent" \
+  "$(call nobody GET /api/intents/$ID | jq -r .intent.id)" "$ID"
+expect "an uninvited account can still VOTE — the gate is on contributing, never on taking part" \
+  "$(call nobody POST /api/intents/$ID3/vote '{"points":3}' | jq -r .budget_left)" 91
+expect "and its vote was counted" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from votes v join users u on u.id=v.user_id where u.login='nobody'")" 1
+
+# A governor admits a developer. Acceptance is automatic at sign-in: an invitation names a login, so
+# signing in is the moment it is redeemed and there is no button to find.
+call gov POST /api/invites '{"login":"deva","kind":"developer","note":"wrote the range scanner"}' >/dev/null
+expect "the invitation is open until its holder signs in" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="deva")][0].state')" open
+call deva POST /auth/dev-login '{"login":"deva"}' >/dev/null
+expect "signing in accepts it, with no button to find" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="deva")][0].state')" accepted
+expect "the invitee now holds both contribution rights" \
+  "$(call deva GET /api/me | jq -r '[.user.rights.request_features,.user.rights.develop]|map(tostring)|join(",")')" true,true
+IDV=$(call deva POST /api/intents "$NEW_INTENT" | jq -r .intent.id)
+[ "$IDV" != "null" ] && pass "an invited developer can request a feature (#$IDV)" || fail "invited developer refused a feature request"
+interview deva "$IDV"
+expect "an invited developer can put work into a release train" \
+  "$(call deva POST /api/intents/$IDV/submit | jq -r .intent.status)" guardrails
+
+# Revocation after acceptance. `user_rights` is a VIEW, so the right has to vanish on the very next
+# request rather than at the next login — admitting someone is reversible.
+call gov POST /api/invites '{"login":"devb","kind":"developer","note":"second pair of hands"}' >/dev/null
+call devb POST /auth/dev-login '{"login":"devb"}' >/dev/null
+IDR=$(call devb POST /api/intents "$NEW_INTENT" | jq -r .intent.id)
+[ "$IDR" != "null" ] && pass "a second invitee can request a feature (#$IDR)" || fail "second invitee refused"
+expect "and gets past the submit gate, refused only on the spec" \
+  "$(call devb POST /api/intents/$IDR/submit | jq -r .error.code)" spec_not_ready
+REVID=$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="devb")][0].id')
+call gov DELETE /api/invites/$REVID '{"reason":"left the project"}' >/dev/null
+expect "an accepted invitation can still be revoked" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="devb")][0].state')" revoked
+expect "the right is gone on the very next request, not at the next login" \
+  "$(call devb GET /api/me | jq -r '[.user.rights.request_features,.user.rights.develop]|map(tostring)|join(",")')" false,false
+expect "requesting a feature is refused again" \
+  "$(call devb POST /api/intents "$NEW_INTENT" | jq -r .error.code)" invitation_required
+expect "and the draft already open can no longer be submitted" \
+  "$(call devb POST /api/intents/$IDR/submit | jq -r .error.code)" invitation_required
+
+# Issuing rules, through the API. A builder is five retained merges plus two reviews that paid off,
+# so it is seeded rather than earned here; what is under test is what the tier may then issue.
+call brian POST /auth/dev-login '{"login":"brian"}' >/dev/null
+psql "$DATABASE_URL" -qc "
+DO \$\$
+DECLARE b bigint; i int; n bigint;
+BEGIN
+  SELECT id INTO b FROM users WHERE login='brian';
+  FOR i IN 1..5 LOOP
+    INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type,updated_at)
+      VALUES ('brian retained '||i,'Engine',b,'x',0,'merged','feature', now() - interval '40 days')
+      RETURNING id INTO n;
+    IF i <= 2 THEN INSERT INTO votes(user_id,intent_id,quarter,points) VALUES (b,n,'2026-Q4',1); END IF;
+  END LOOP;
+END \$\$;" >/dev/null
+expect "the seeded account reads as a builder" "$(call brian GET /api/me | jq -r .user.tier)" builder
+expect "a builder is told its quota" "$(call brian GET /api/me | jq -r .user.invite_quota)" 3
+expect "a builder may invite a requester" \
+  "$(call brian POST /api/invites '{"login":"req-one","kind":"requester","note":"knows the engine"}' | jq -r .kind)" requester
+expect "a builder may not admit a developer" \
+  "$(call brian POST /api/invites '{"login":"dev-x","kind":"developer","note":"x"}' | jq -r .error.code)" not_permitted
+expect "a builder may not admit an organisation admin" \
+  "$(call brian POST /api/invites '{"login":"org-x","kind":"org_admin","note":"x"}' | jq -r .error.code)" not_permitted
+expect "refusing a kind is a 403, not a 500" \
+  "$(code brian POST /api/invites '{"login":"dev-x","kind":"developer","note":"x"}')" 403
+expect "and neither refused invitation left a row behind" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from invites where login in ('dev-x','org-x')")" 0
+
+# The quota counts LIVE invitations — open, unaccepted, unrevoked — and recycles as people join, so
+# it is a rate limit on one account rather than a lifetime budget that would stall the project.
+call brian POST /api/invites '{"login":"req-two","kind":"requester","note":"two"}' >/dev/null
+call brian POST /api/invites '{"login":"req-three","kind":"requester","note":"three"}' >/dev/null
+expect "the fourth open invitation is refused" \
+  "$(call brian POST /api/invites '{"login":"req-four","kind":"requester","note":"four"}' | jq -r .error.code)" quota_exhausted
+expect "the refusal says how many are held" \
+  "$(call brian POST /api/invites '{"login":"req-four","kind":"requester","note":"four"}' | jq -r '.error.message|test("3 open")')" true
+call reqone POST /auth/dev-login '{"login":"req-one"}' >/dev/null
+expect "accepting one frees the slot it held" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="req-one")][0].state')" accepted
+expect "so a further invitation now succeeds" \
+  "$(call brian POST /api/invites '{"login":"req-four","kind":"requester","note":"four"}' | jq -r .kind)" requester
+expect "a builder's quota counts only its own open invitations" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from invites i join users u on u.id=i.issued_by where u.login='brian' and i.accepted_at is null and i.revoked_at is null")" 3
+
+# One live invitation per login, so two issuers cannot each spend a slot on the same person.
+expect "a second live invitation for the same login is refused" \
+  "$(call gov POST /api/invites '{"login":"req-two","kind":"developer","note":"again"}' | jq -r .error.code)" already_invited
+expect "and it is reported as a conflict, not a refusal" \
+  "$(code gov POST /api/invites '{"login":"req-two","kind":"developer","note":"again"}')" 409
+expect "the original invitation is untouched" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="req-two")]|[length,(.[0].kind=="requester"|tostring)]|join(",")')" 1,true
+
+# An employee of a paying organisation holds no personal invitation; the membership is the grant.
+# This is the path that makes an employer's credits worth anything: without it the inference they
+# bought would pay for work that could never land. `newhire` redeemed the key back in section 9.
+expect "an org member holds no invitation of their own" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from invites where login='newhire'")" 0
+expect "but the view grants them both contribution rights" \
+  "$(call keyuser GET /api/me | jq -r '[.user.rights.request_features,.user.rights.develop]|map(tostring)|join(",")')" true,true
+IDM=$(call keyuser POST /api/intents "$NEW_INTENT" | jq -r .intent.id)
+[ "$IDM" != "null" ] && pass "an org member can request a feature (#$IDM)" || fail "org member refused a feature request"
+interview keyuser "$IDM"
+expect "an org member can put work into a release train" \
+  "$(call keyuser POST /api/intents/$IDM/submit | jq -r .intent.status)" guardrails
+# Paying for inference buys staff, never an admin who could buy or mint on the organisation's behalf.
+expect "an org member still cannot create an organisation" \
+  "$(call keyuser POST /api/orgs '{"name":"Newhire Holdings"}' | jq -r .error.code)" invitation_required
+expect "creating an organisation needs an org_admin invitation specifically" \
+  "$(call keyuser GET /api/me | jq -r .user.rights.create_org)" false
+
+# Login normalisation, end to end: the invitation is written normalised and sign-in finds it however
+# the account spells itself, or the uniqueness index and every lookup would quietly disagree.
+call gov POST /api/invites '{"login":"  @Mixed-Case  ","kind":"requester","note":"spelt loudly"}' >/dev/null
+expect "an invitation is stored lowercase, with the @ and the spaces gone" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="mixed-case")]|length')" 1
+call mixed POST /auth/dev-login '{"login":"Mixed-Case"}' >/dev/null
+expect "inviting @Mixed-Case and signing in as Mixed-Case accepts the invitation" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="mixed-case")][0].state')" accepted
+expect "and the invitee can request a feature" \
+  "$(call mixed GET /api/me | jq -r .user.rights.request_features)" true
+BEFORE_JUNK=$(psql "$DATABASE_URL" -tAc "select count(*) from invites")
+for bad in 'a--b' '-x' 'x-' 'has space' "$(printf 'a%.0s' $(seq 1 40))"; do
+  expect "an impossible GitHub login is refused ('$(echo "$bad" | cut -c1-12)')" \
+    "$(call gov POST /api/invites "$(jq -n --arg l "$bad" '{login:$l,kind:"requester",note:"junk"}')" | jq -r .error.code)" bad_login
+done
+expect "a junk login is a 400, not a 500" \
+  "$(code gov POST /api/invites '{"login":"a--b","kind":"requester","note":"junk"}')" 400
+expect "and not one of them created a row" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from invites")" "$BEFORE_JUNK"
+
+# Revocation is scoped in the UPDATE itself: the issuer may withdraw their own, a governor anyone's,
+# and everyone else is answered 404 — the same answer a made-up id gets, so ids cannot be probed.
+DEVAID=$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="deva")][0].id')
+expect "a non-governor cannot revoke someone else's invitation" \
+  "$(code brian DELETE /api/invites/$DEVAID '{"reason":"mine now"}')" 404
+expect "a made-up id is answered identically, so the range cannot be probed" \
+  "$(code brian DELETE /api/invites/999999 '{"reason":"fishing"}')" 404
+expect "the invitation someone else tried to revoke is untouched" \
+  "$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="deva")][0].state')" accepted
+expect "an issuer may revoke their own" \
+  "$(call brian DELETE /api/invites/$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="req-three")][0].id') '{"reason":"changed my mind"}' | jq -r .ok)" true
+expect "revoking twice is refused rather than recorded twice" \
+  "$(code brian DELETE /api/invites/$(call anon GET /api/invites | jq -r '[.invites[]|select(.login=="req-three")][0].id') '{"reason":"again"}')" 404
+
+# Two issuers racing one login, which is the case `invites_one_live_per_login` exists for: whoever
+# loses must not leave a second live row behind, and must not have spent a quota slot on it.
+# NOTE: the loser is currently answered 500 `internal` rather than 409 `already_invited` -- the
+# unique violation from the INSERT at api.rs:2536 is mapped through ApiError::internal, because the
+# already-invited pre-check at api.rs:2506 runs in a transaction that cannot see the other one's
+# uncommitted row. Reported, not worked around; the invariant below is what must hold either way.
+call brian POST /api/invites '{"login":"race-one","kind":"requester","note":"brian"}' > "$TMP/i1" & RP1=$!
+call gov   POST /api/invites '{"login":"race-one","kind":"requester","note":"gov"}'   > "$TMP/i2" & RP2=$!
+wait $RP1 $RP2
+expect "exactly one of two racing invitations lands" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from invites where login='race-one' and accepted_at is null and revoked_at is null")" 1
+expect "and exactly one of the two callers was told it got one" \
+  "$(cat "$TMP/i1" "$TMP/i2" | jq -r '.id // empty' | wc -l | tr -d ' ')" 1
+
+# The admission list is a transparency surface, not an insider list: who was admitted, by whom and
+# why, readable with no cookie at all. An invitation is bound to a login, so there is no secret in it.
+expect "the invitation list is served unauthenticated" "$(curl -s -o /dev/null -w '%{http_code}' "$API/api/invites")" 200
+expect "and it is not empty to an anonymous reader" \
+  "$(curl -s "$API/api/invites" | jq -r '.invites|length > 0')" true
+expect "it names the issuer of every invitation, so admissions are explicable" \
+  "$(curl -s "$API/api/invites" | jq -r '[.invites[]|select(.issued_by==null)]|length')" 0
+expect "it names who revoked a revoked one" \
+  "$(curl -s "$API/api/invites" | jq -r '[.invites[]|select(.login=="devb")][0].revoked_by')" gov
+expect "every invitation reads as open, accepted or revoked and nothing else" \
+  "$(curl -s "$API/api/invites" | jq -r '[.invites[]|select(.state!="open" and .state!="accepted" and .state!="revoked")]|length')" 0
+
+# The ledger. Issuing, accepting and revoking are all public acts, so each has to be appended — and
+# what is appended is world-readable forever, which is the part worth checking rather than assuming.
+for k in invite.issued invite.accepted invite.revoked; do
+  expect "the ledger records $k" \
+    "$(psql "$DATABASE_URL" -tAc "select count(*) > 0 from events where kind='$k'")" t
+done
+expect "an acceptance is recorded for the account that accepted, not for the issuer" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from events where kind='invite.accepted' and actor='deva'")" 1
+# A tripwire on the shape of the payload, not only on its contents. The organisation-key feature
+# leaked a key's display prefix into the ledger exactly this way -- by someone adding a field to a
+# payload that is published forever -- so a new key here has to fail this and be looked at. Today:
+# invite.issued {invite,kind,login,note,tier}, invite.accepted {invite,kind,login},
+# invite.revoked {invite,had_reason} -- the reason itself is deliberately NOT published: it is free
+# text about a named person being removed, it is withheld from /api/invites too, and the chain is
+# unerasable, so only the fact that one was given is recorded.
+expect "invite events carry exactly the fields they are meant to" \
+  "$(psql "$DATABASE_URL" -tAc "select string_agg(distinct k, ',' order by k) from events e, jsonb_object_keys(e.payload) k where e.kind like 'invite.%' and e.payload->>'removed' is null")" \
+  "had_reason,invite,kind,login,note,tier"
+expect "a revocation reason never reaches the permanent public ledger" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from events where kind='invite.revoked' and payload ? 'reason'")" 0
+expect "but the reason is still kept on the row, for the governor to answer for" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) > 0 from invites where revoked_reason is not null")" t
+expect "no session cookie, token or credential rides along in an invite event" \
+  "$(psql "$DATABASE_URL" -tAc "select count(*) from events where kind like 'invite.%' and payload::text ~* '(token|secret|password|cookie|session|@|trailhead_org_)'")" 0
+expect "an invitation is not a secret, so nothing in it had to be withheld from the chain" \
+  "$(call anon GET /api/ledger/verify | jq -r .ok)" true
+
 echo
 echo "All end-to-end checks passed."

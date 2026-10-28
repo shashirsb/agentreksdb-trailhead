@@ -279,8 +279,47 @@ details summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--muted)
 .ktable th,.ktable td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
 .ktable th{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
 .kstate{font-weight:800;font-size:12px}
+/* A five-column table inside a card has nowhere to go at phone width: left to itself it wraps
+   every cell down to two characters a line. Inside .tscroll it keeps its shape and the row
+   scrolls sideways instead, which is what the clone box and the priority tables already do. */
+.tscroll .ktable{min-width:520px}
+/* Below that, sideways scrolling would push Revoke off the edge of a card, so the issued
+   invitations stop being a table and become one block per invitation: login and state on the
+   first line, kind under it, note across, and the button in the corner. */
+@media(max-width:620px){
+  #myInvites .tscroll{overflow:visible}
+  #myInvites .ktable{min-width:0}
+  #myInvites .ktable thead{display:none}
+  #myInvites .ktable tbody,#myInvites .ktable tr,#myInvites .ktable td{display:block}
+  #myInvites .ktable tr{display:grid;grid-template-columns:1fr auto;gap:3px 12px;padding:12px 0;border-bottom:1.5px solid color-mix(in srgb,var(--line) 25%,transparent)}
+  #myInvites .ktable tr:last-child{border-bottom:0}
+  #myInvites .ktable td{border:0;padding:0;min-width:0}
+  #myInvites .ktable td:nth-child(1){grid-column:1;grid-row:1;font-weight:700}
+  #myInvites .ktable td:nth-child(2){grid-column:1;grid-row:2}
+  #myInvites .ktable td:nth-child(3){grid-column:1/-1;grid-row:3}
+  #myInvites .ktable td:nth-child(4){grid-column:2;grid-row:1;text-align:right}
+  #myInvites .ktable td:nth-child(5){grid-column:2;grid-row:2;justify-self:end}
+}
 .kstate.live{color:var(--teal-ink,var(--ink))}
 .kstate.revoked,.kstate.expired,.kstate.exhausted{color:var(--coral)}
+/* Invitations. An invitation names a GitHub login and only that account can redeem it, so it is
+   deliberately NOT dressed like an organisation key above: no show-once box, no copy button, no
+   masking, no dashed "secret" frame. Rows read like the ledger, because the list is public. */
+.st-accepted{background:var(--teal);color:#063e36}
+.st-revoked{background:var(--surface-2);color:var(--muted)}
+.ilist{display:grid;gap:12px}
+.irow{display:grid;grid-template-columns:1fr auto;gap:10px 18px;padding:14px 18px;align-items:start}
+.irow .iwho{font-family:"JetBrains Mono",monospace;font-weight:700;font-size:15px;overflow-wrap:anywhere}
+.irow .iby{font-size:13px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}
+.irow .iby b{color:var(--ink);font-weight:800}
+.irow .inote{font-size:14px;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}
+/* The right column stacks at desktop width and lies down when the row itself stacks, the same
+   trade the intent rows make at 640px. */
+.irow .irt{display:flex;flex-direction:column;align-items:flex-end;gap:7px}
+/* A governor's revoke form drops onto its own line under both columns of the row it belongs to. */
+.irow .irevw{grid-column:1/-1}
+.irow .irevw:empty{display:none}
+@media(max-width:640px){.irow{grid-template-columns:1fr}.irow .irt{flex-direction:row;align-items:center;flex-wrap:wrap}}
 .vote{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .vote input{width:70px;font:inherit;padding:6px 9px;border:2px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink)}
 .dec{margin-top:14px;padding:14px 16px;border:var(--bw) solid var(--line);border-radius:12px}
@@ -469,6 +508,7 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
       <a href="#train" data-v="train">Train</a>
       <a href="#releases" data-v="releases">Releases</a>
       <a href="#ledger" data-v="ledger">Ledger</a>
+      <a href="#invites" data-v="invites">Invitations</a>
       <a href="#how" data-v="how">How it works</a>
       <a href="#charter" data-v="charter">Charter</a>
       <a id="navCode" href="https://github.com/shashirsb/agentreksdb-trailhead-helloworld" target="_blank" rel="noopener" title="The code Trailhead builds, on GitHub">Code ↗</a>
@@ -600,6 +640,15 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
   </div>
 </section>
 
+<!-- INVITATIONS: the public admission list -->
+<section class="view" id="v-invites" hidden>
+  <div class="wrap">
+    <div class="sec-head"><p class="eyebrow">Admission, in public</p><h2>Who was invited in.</h2><p>Signing up is open. Anyone can create an account, read every intent and its whole prompt log, follow a release and vote. Two things need an invitation: requesting a feature, and working on a release. An invitation is not a secret — it names one GitHub login and only that account can redeem it — so the whole list is public, including who issued it and why.</p></div>
+    <div class="filters" id="invFilters"></div>
+    <div id="invBody"></div>
+  </div>
+</section>
+
 <!-- HOW -->
 <section class="view" id="v-how" hidden>
   <div class="wrap">
@@ -688,7 +737,7 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
 var STAGES=["Portal","Intent chat","Guardrails","Generation","Signed commit","Tests · perf","Diff-policy","Governor"];
 var STATUS_LABEL={draft:"Draft",submitted:"Submitted",guardrails:"Guardrails",held:"Held",generating:"Generating",gates:"Gates",review:"In review",merging:"Merging",flagged:"Flagged",merged:"Merged",on_hold:"On hold",rejected:"Rejected"};
 var AREAS=["Engine","Search & vector","Graph","Memory","Events","Console","Deploy","Docs"];
-var ME=null, TRAIN=null, PORTAL_FILTER="all", INTENTS=[], LEDGER_AFTER=0;
+var ME=null, ME_ENV=null, TRAIN=null, PORTAL_FILTER="all", INTENTS=[], LEDGER_AFTER=0;
 
 function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];});}
 function $(id){return document.getElementById(id);}
@@ -800,7 +849,42 @@ setInterval(function(){
 /* ---------- session / header ---------- */
 var IS_LOCAL=/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
 function loadMe(){
-  return api("/api/me").then(function(j){ME=j.user||null;},function(){ME=null;}).then(renderUser);
+  /* rights/invite_quota may sit on the user or beside it, so keep the envelope too. */
+  return api("/api/me").then(function(j){ME=j.user||null;ME_ENV=j||null;},function(){ME=null;ME_ENV=null;}).then(renderUser);
+}
+/* What this account may do. An absent `rights` means an older server: nothing is gated then,
+   because a wrong "you can't" is worse than a 403 the user can read. */
+function rights(){return (ME&&ME.rights)||(ME_ENV&&ME_ENV.rights)||{};}
+function meField(k){
+  if(ME&&ME[k]!==undefined) return ME[k];
+  if(ME_ENV&&ME_ENV[k]!==undefined) return ME_ENV[k];
+  return undefined;
+}
+/* The tier allowance. null = unlimited (governor). */
+function inviteQuota(){
+  var q=meField("invite_quota");
+  return q===undefined?(inviteKinds().length?null:0):q;
+}
+/* Exactly the kinds this account may issue, decided by the server — who may issue what is its
+   rule, not ours. The tier table below is only a fallback for a server that predates the field;
+   a steward offered "developer" would get a 403. An empty array means: may not issue at all. */
+function inviteKinds(){
+  var k=meField("invite_kinds");
+  if(Array.isArray(k)) return k;
+  var t=String((ME&&ME.tier)||"").toLowerCase();
+  if(t==="governor") return ["requester","developer","org_admin"];
+  if(t==="steward"||t==="builder") return ["requester"];
+  return [];
+}
+/* How many of the allowance remain. null = unlimited. `open` is this account's live invitations,
+   used only to reconstruct the number on a server that does not send `invites_left`; undefined
+   there means "not known yet", and the form waits for the list rather than guessing. */
+function invitesLeft(open){
+  var v=meField("invites_left");
+  if(v!==undefined) return v;
+  var q=inviteQuota();
+  if(q===null) return null;
+  return open===undefined?undefined:Math.max(0,q-open);
 }
 function renderUser(){
   var box=$("userbox");
@@ -922,6 +1006,16 @@ function renderReqForm(open){
   var w=$("reqWrap");
   if(!open){w.innerHTML="";return;}
   if(!ME){w.innerHTML='<div class="card reqform"><h3>Request a feature</h3><p class="muted" style="margin:6px 0 14px">Sign in with GitHub to file an intent. Everything you write will be public.</p><a class="btn primary" href="/auth/github/login">Sign in with GitHub</a></div>';return;}
+  /* Say this before they write a spec, not after a 403. Reading and voting stay wide open. */
+  if(rights().request_features===false){
+    w.innerHTML='<div class="card reqform"><h3>Requesting a feature needs an invitation</h3>'+
+      '<p class="muted" style="font-size:14px;margin:8px 0 12px">Everything else here is open to you: read every intent and its whole prompt log, follow a release, and vote on what gets built next. Opening a new intent is the one thing bound to an invitation, because it spends inference on our keys.</p>'+
+      '<p class="muted" style="font-size:14px;margin-bottom:16px">Two ways in: ask a steward or a governor to invite <b>'+esc(ME.login)+'</b> — invitations are bound to that login and listed in public — or, if your employer pays for inference, redeem their organisation key in Settings.</p>'+
+      '<div style="display:flex;gap:10px;flex-wrap:wrap"><a class="btn sm primary" href="#invites">See who has been invited</a>'+
+      '<a class="btn sm" href="#settings">Redeem an organisation key</a>'+
+      '<a class="btn sm ghost" href="#portal">Browse and vote on intents</a></div></div>';
+    return;
+  }
   w.innerHTML='<form class="card reqform" id="reqForm" novalidate>'+
     '<h3>Request a feature</h3><p class="muted" style="font-size:14px;margin-bottom:16px">Describe the outcome in plain words. Next, a chat turns it into a precise spec. The pinned model writes the code; you never upload any. Everything here is public.</p>'+
     '<div id="reqErr"></div>'+
@@ -1029,7 +1123,11 @@ function drawSpec(){
     '<div><dt>Acceptance tests</dt><dd>'+list(s.acceptance_tests,function(t){return '<b>'+esc(t.id)+'</b>'+(t.negative?' <span class="tagx">negative</span>':'')+' Given '+esc(t.given)+', when '+esc(t.when)+', then '+esc(t.then)+' <span class="muted">('+esc(t.requirement_id)+')</span>';})+'</dd></div>'+
     '<div><dt>Risk · rollback</dt><dd>'+(s.risk_level?esc(s.risk_level):'—')+' · '+(s.rollback_plan?esc(s.rollback_plan):'—')+'</dd></div>'+
   '</dl><details style="margin-top:12px"><summary>Full spec JSON</summary><pre>'+esc(JSON.stringify(s,null,2))+'</pre></details>';
-  if(i.status==="draft"&&isAuthor()){
+  if(i.status==="draft"&&isAuthor()&&rights().develop===false){
+    /* The spec can be finished; only starting work on a release is invitation-only. */
+    html+='<div class="lockline" style="margin-top:14px">'+
+      '<span>Working on a release is invitation-only. Keep refining the spec — it stays here — but submitting it for generation needs a developer invitation bound to <b>'+esc(ME.login)+'</b>. Ask a steward or a governor (<a href="#invites">who has been invited</a>), or redeem your employer’s organisation key in <a href="#settings">Settings</a>.</span></div>';
+  } else if(i.status==="draft"&&isAuthor()){
     html+='<div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap"><button class="btn primary" type="button" id="submitBtn"'+(r.ready?'':' disabled')+'>Submit for generation</button>'+(r.ready?'<span class="muted" style="font-size:13px">Joins the next weekly train.</span>':'<span class="muted" style="font-size:13px">Answer the questions until the spec is ready.</span>')+'</div><div id="submitErr"></div>';
   }
   $("specPanel").innerHTML=html;
@@ -1088,7 +1186,7 @@ function renderSettings(){
   api("/api/orgs").then(function(j){
     var mine=(j.orgs||[]).filter(function(o){return o.i_am_member;});
     api("/api/me/org").then(function(m){MYORG=m;drawSettings(m);},function(){MYORG=null;drawSettings(null);});
-  },function(e){b.innerHTML=errBox(e);});
+  },function(e){b.innerHTML=errBox(e);appendInvitePanel();});
 }
 function drawSettings(m){
   var b=$("settingsBody");
@@ -1114,6 +1212,7 @@ function drawSettings(m){
       api("/api/orgs",{method:"POST",body:{name:n}}).then(function(){renderSettings();},
         function(e){$("orgMsg").innerHTML=errBox(e);});
     };
+    appendInvitePanel();
     return;
   }
   var admin=m.role==="admin";
@@ -1149,6 +1248,7 @@ function drawSettings(m){
     };
     loadKeys(m.org_id);
   }
+  appendInvitePanel();
 }
 function loadKeys(org){
   api("/api/orgs/"+org+"/keys").then(function(j){
@@ -1171,6 +1271,200 @@ function loadKeys(org){
       };
     });
   },function(e){$("keyList").innerHTML=errBox(e);});
+}
+
+/* ---------- invitations ----------
+   Two things on Trailhead are invitation-only: requesting a feature and working on a release.
+   An invitation names a GitHub login, so it carries no secret and gets no secret's ceremony —
+   it is issued in plain sight and listed in public on #invites. */
+var INV_KIND={requester:"Request features",developer:"Work on releases",org_admin:"Organisation admin"};
+var INV_STATE={open:"Open",accepted:"Accepted",revoked:"Revoked"};
+var INV_ERR={
+  bad_kind:{message:"That is not a kind of invitation you can issue.",hint:"Pick one of the kinds in the list."},
+  bad_login:{message:"That does not look like a GitHub login.",hint:"Use the account name exactly as GitHub spells it — no @, no URL."},
+  bad_note:{message:"The note needs rewording.",hint:"It is published next to the invitation, so keep it short and plain."},
+  not_permitted:{message:"Your tier cannot issue that invitation.",hint:"Stewards and builders may invite requesters. Only a governor may invite developers or organisation admins."},
+  quota_exhausted:{message:"You have no invitations left.",hint:"The quota counts invitations that are still open. One frees up as soon as somebody accepts, and you can revoke one you no longer need."},
+  already_invited:{message:"That login already has an invitation.",hint:"It is on the public admission list. Revoke the old one first if you want to change its kind or note."},
+  not_found:{message:"That invitation no longer exists.",hint:"It may already have been revoked. Reload the list."},
+  not_authorized:{message:"You are not signed in as the account that issued this invitation.",hint:"Only the issuer or a governor can revoke it."}
+};
+/* The server's own words win; ours fill the gap when it sends only a code. */
+function invErr(e){e=e||{};var f=INV_ERR[e.code]||{};return errBox({code:e.code,message:e.message||f.message,hint:e.hint||f.hint});}
+function invPill(s){return '<span class="pill st-'+esc(s)+'">'+esc(INV_STATE[s]||s)+'</span>';}
+function kindLabel(k){return INV_KIND[k]||k;}
+/* GitHub's own rule: alphanumerics and single inner hyphens, 39 characters at most. */
+var GH_LOGIN=/^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+
+/* The one place a revocation is asked for, shared by the panel and the public list: a published
+   reason, in full width under whatever row it belongs to, rather than squeezed into a cell. */
+function openRevoke(mount,id,login,onDone){
+  if(!mount) return;
+  mount.innerHTML='<form class="card" id="irf-'+esc(id)+'" style="padding:14px;margin-top:12px">'+
+    '<div class="field" style="margin-bottom:10px"><label for="irr-'+esc(id)+'">Why is '+esc(login)+'’s invitation being revoked?</label>'+
+    '<input id="irr-'+esc(id)+'" autocomplete="off" placeholder="e.g. invited the wrong account"><div class="help">Published with the revocation.</div>'+
+    '<div class="ferr" id="ire-'+esc(id)+'"></div></div>'+
+    '<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn sm danger" type="submit">Revoke</button>'+
+    '<button class="btn sm ghost" type="button" id="irc-'+esc(id)+'">Keep it</button></div><div id="iro-'+esc(id)+'"></div></form>';
+  var f=$("irf-"+id);
+  $("irr-"+id).focus();
+  $("irc-"+id).onclick=function(){mount.innerHTML="";};
+  f.onsubmit=function(ev){
+    ev.preventDefault();
+    var reason=$("irr-"+id).value.trim();
+    if(reason.length<3){$("ire-"+id).textContent="Give a short reason; it is published.";return;}
+    var go=f.querySelector('button[type="submit"]');go.disabled=true;go.textContent="Revoking…";
+    api("/api/invites/"+encodeURIComponent(id),{method:"DELETE",body:{reason:reason}}).then(function(){
+      onDone();
+    },function(e){$("iro-"+id).innerHTML=invErr(e);go.disabled=false;go.textContent="Revoke";});
+  };
+}
+
+/* the public admission list */
+var INV_FILTER="all", INVITES=[], INV_TOTAL=null, INV_TRUNCATED=false;
+var INV_FILTERS=[["all","All"],["open","Open"],["accepted","Accepted"],["revoked","Revoked"]];
+function renderInvFilters(){
+  $("invFilters").innerHTML=INV_FILTERS.map(function(f){return '<button class="fbtn" type="button" data-if="'+f[0]+'" aria-pressed="'+(INV_FILTER===f[0])+'">'+f[1]+'</button>';}).join("");
+}
+$("invFilters").addEventListener("click",function(e){var b=e.target.closest(".fbtn");if(!b)return;INV_FILTER=b.dataset.if;renderInvFilters();drawInvites();});
+function renderInvites(){
+  renderInvFilters();
+  $("invBody").innerHTML=loading("Loading the admission list…");
+  api("/api/invites").then(function(j){
+    INVITES=j.invites||[];INV_TOTAL=(j.total==null?null:j.total);INV_TRUNCATED=!!j.truncated;drawInvites();
+  },function(e){$("invBody").innerHTML=errBox(e);});
+}
+/* When each thing happened, in the same short form the ledger and the intent rows use. */
+function inviteWhen(v){
+  var p=[];
+  if(v.issued_at) p.push("invited "+fmtDate(v.issued_at));
+  if(v.accepted_at) p.push("accepted "+fmtDate(v.accepted_at));
+  if(v.revoked_at) p.push("revoked "+fmtDate(v.revoked_at));
+  return p.join(" · ");
+}
+function inviteRow(v){
+  /* A governor may withdraw anyone's invitation, so the control belongs on the public list and
+     not only in the issuer's own settings. */
+  var gov=!!(ME&&ME.is_governor&&v.state!=="revoked");
+  var when=inviteWhen(v);
+  return '<div class="card irow">'+
+    '<div style="min-width:0"><div class="iwho">'+esc(v.login)+'</div>'+
+    '<div class="iby">invited by <b>'+esc(v.issued_by||"—")+'</b>'+(v.revoked_by?' · revoked by <b>'+esc(v.revoked_by)+'</b>':'')+
+      (when?'<br>'+esc(when):'')+'</div>'+
+    '<div class="inote">'+(v.note?esc(v.note):'No reason given.')+'</div></div>'+
+    '<div class="irt">'+invPill(v.state)+'<span class="tagx">'+esc(kindLabel(v.kind))+'</span>'+
+      (gov?'<button class="btn sm" type="button" data-grev="'+esc(v.id)+'" data-login="'+esc(v.login)+'">Revoke</button>':'')+'</div>'+
+    (gov?'<div class="irevw" id="grev-'+esc(v.id)+'"></div>':'')+'</div>';
+}
+function drawInvites(){
+  var all=INVITES;
+  function n(s){return all.filter(function(v){return v.state===s;}).length;}
+  var head='<div class="totals"><span><b>'+num(INV_TOTAL==null?all.length:INV_TOTAL)+'</b>invited</span><span><b>'+num(n("open"))+'</b>open</span>'+
+    '<span><b>'+num(n("accepted"))+'</b>accepted</span><span><b>'+num(n("revoked"))+'</b>revoked</span></div>';
+  var rows=INV_FILTER==="all"?all:all.filter(function(v){return v.state===INV_FILTER;});
+  /* A transparency surface that is clipped has to say so, or it reads as the whole truth. */
+  var cut=INV_TRUNCATED?'<p class="muted" style="font-size:13.5px;margin-top:14px">This list is clipped: it shows the '+num(all.length)+' most recent of '+num(INV_TOTAL==null?all.length:INV_TOTAL)+' invitations. Open, accepted and revoked are counted over the ones shown; the whole history is in the <a href="#ledger">ledger</a>.</p>':"";
+  $("invBody").innerHTML=head+(rows.length?'<div class="ilist">'+rows.map(inviteRow).join("")+'</div>':
+    '<div class="card empty">'+(all.length?'No invitations in this state.':'Nobody has been invited yet. Reading, following a release and voting are open to everyone in the meantime.')+'</div>')+cut;
+  Array.prototype.forEach.call($("invBody").querySelectorAll("[data-grev]"),function(btn){
+    btn.onclick=function(){openRevoke($("grev-"+btn.dataset.grev),btn.dataset.grev,btn.dataset.login,renderInvites);};
+  });
+}
+
+/* the Settings panel: what this account has issued, and the form to issue another.
+   Who may issue what, and how much of the allowance is left, are the server's answers now
+   (`invite_kinds`, `invites_left`), so the form draws from /api/me without waiting on anything. */
+var INV_FLASH="";
+function appendInvitePanel(){
+  var b=$("settingsBody"); if(!b||!ME) return;
+  b.insertAdjacentHTML("beforeend",'<div class="card panel" style="margin-top:14px">'+panelHead("list","Invitations")+
+    '<p class="muted" style="font-size:14px;margin-bottom:12px">Reading every intent, following a release and voting are open to everyone — an invitation is only needed to request a feature or to work on a release. An invitation names one GitHub login and only that account can redeem it, so it is not a secret: every one you issue appears on the public <a href="#invites">admission list</a> with your name against it.</p>'+
+    '<div id="invTop"></div><div id="invMsg"></div>'+
+    '<div id="myInvites">'+loading("Loading your invitations…")+'</div></div>');
+  drawInvTop();
+  loadMyInvites();
+}
+/* `open` is only passed on the fallback path, where `invites_left` is missing and the number has
+   to be reconstructed from the list once it arrives. */
+function drawInvTop(open){
+  var el=$("invTop"); if(!el) return;
+  var kinds=inviteKinds(), quota=inviteQuota(), left=invitesLeft(open);
+  if(left===undefined) return; /* old server: wait for the list rather than guess */
+  var h="";
+  if(!kinds.length){
+    h='<div class="lockline">Your tier ('+esc((ME&&ME.tier)||"visitor")+') does not issue invitations. Nothing is hidden from you here — the whole admission list is public.</div>';
+  } else if(left===0){
+    h='<div class="lockline">You are holding all '+num(quota)+' of your invitations. The quota counts the ones still open, so one frees up as soon as somebody accepts — or you can revoke one below.</div>';
+  } else {
+    h='<p class="eyebrow">'+(left===null?'Unlimited invitations':num(left)+(quota==null?'':' of '+num(quota))+' left')+'</p>'+
+      '<form id="invForm" novalidate style="margin-top:10px">'+
+      '<div class="two"><div class="field"><label for="inv-login">GitHub login</label>'+
+        '<input id="inv-login" autocomplete="off" placeholder="octocat"><div class="help">Only this account can redeem it.</div><div class="ferr" id="e-inv-login"></div></div>'+
+      '<div class="field"><label for="inv-kind">What it admits them to</label><select id="inv-kind">'+
+        kinds.map(function(k){return '<option value="'+esc(k)+'">'+esc(kindLabel(k))+'</option>';}).join("")+'</select>'+
+        '<div class="help">'+(kinds.length===1?'You may issue this one kind.':'You may issue any of these.')+'</div></div></div>'+
+      '<div class="field"><label for="inv-note">Note (optional, public)</label><input id="inv-note" maxlength="280" autocomplete="off" placeholder="e.g. maintains the Rust client">'+
+        '<div class="help">Shown beside their name on the admission list.</div><div class="ferr" id="e-inv-note"></div></div>'+
+      '<div style="display:flex;gap:10px;flex-wrap:wrap"><button class="btn sm primary" type="submit" id="invSubmit">Issue invitation</button></div></form>';
+  }
+  el.innerHTML=h;
+  var f=$("invForm");
+  if(f) f.onsubmit=function(ev){
+    ev.preventDefault();
+    var login=$("inv-login").value.trim().replace(/^@/,"").toLowerCase(), note=$("inv-note").value.trim(), ok=true;
+    $("e-inv-login").textContent="";$("e-inv-note").textContent="";$("invMsg").innerHTML="";
+    if(!login){$("e-inv-login").textContent="Name the GitHub login this invitation is for.";ok=false;}
+    else if(!GH_LOGIN.test(login)){$("e-inv-login").textContent="That is not a GitHub login. Letters, digits and single hyphens, up to 39 characters.";ok=false;}
+    if(note.length>280){$("e-inv-note").textContent="Keep the note under 280 characters.";ok=false;}
+    if(!ok) return;
+    var btn=$("invSubmit");btn.disabled=true;btn.textContent="Issuing…";
+    api("/api/invites",{method:"POST",body:{login:login,kind:$("inv-kind").value,note:note}}).then(function(r){
+      INV_FLASH="Invited "+((r&&r.login)||login)+". It is on the public admission list now.";
+      refreshInvitePanel();
+    },function(err){
+      $("invMsg").innerHTML=invErr(err);
+      btn.disabled=false;btn.textContent="Issue invitation";
+    });
+  };
+}
+/* Issuing and revoking both change what is left, which only /api/me knows. */
+function refreshInvitePanel(){
+  loadMe().then(function(){drawInvTop();loadMyInvites();},function(){drawInvTop();loadMyInvites();});
+}
+function loadMyInvites(){
+  if(!$("myInvites")) return;
+  api("/api/invites").then(function(j){
+    if(!$("myInvites")) return;
+    drawMyInvites((j.invites||[]).filter(function(v){return ME&&v.issued_by===ME.login;}));
+  },function(e){if($("myInvites"))$("myInvites").innerHTML=errBox(e);});
+}
+function drawMyInvites(mine){
+  var open=mine.filter(function(v){return v.state==="open";}).length;
+  if(meField("invites_left")===undefined) drawInvTop(open); /* old server: now the count is known */
+  if(INV_FLASH){$("invMsg").innerHTML='<div class="ok">'+esc(INV_FLASH)+'</div>';INV_FLASH="";}
+  if(!mine.length){
+    $("myInvites").innerHTML=inviteKinds().length?'<p class="muted" style="font-size:14px;margin-top:16px">You have not invited anyone yet.</p>':"";
+    return;
+  }
+  var h='<p class="muted" style="font-size:13px;margin-top:16px">'+num(mine.length)+(mine.length===1?' invitation':' invitations')+' issued · '+num(open)+' still open</p>'+
+    '<div class="tscroll"><table class="ktable"><thead><tr><th>login</th><th>kind</th><th>note</th><th>state</th><th></th></tr></thead><tbody>';
+  mine.forEach(function(v){
+    /* Revoking works after acceptance too — admitting somebody has to be reversible — so the
+       button stays until the invitation is actually revoked. */
+    h+='<tr><td class="mono">'+esc(v.login)+(v.issued_at?'<div class="hash">'+fmtDate(v.issued_at)+'</div>':'')+'</td><td>'+esc(kindLabel(v.kind))+'</td>'+
+      '<td class="muted">'+esc(v.note||"—")+'</td>'+
+      '<td><span class="kstate '+(v.state==="revoked"?"revoked":"live")+'">'+esc(INV_STATE[v.state]||v.state)+'</span></td>'+
+      '<td>'+(v.state==="revoked"?'':'<button class="btn sm" type="button" data-inv="'+esc(v.id)+'" data-login="'+esc(v.login)+'">Revoke</button>')+'</td></tr>';
+  });
+  $("myInvites").innerHTML=h+'</tbody></table></div><div id="invRevoke"></div>';
+  Array.prototype.forEach.call($("myInvites").querySelectorAll("[data-inv]"),function(btn){
+    btn.onclick=function(){
+      openRevoke($("invRevoke"),btn.dataset.inv,btn.dataset.login,function(){
+        INV_FLASH="Revoked "+btn.dataset.login+"’s invitation.";
+        refreshInvitePanel();
+      });
+    };
+  });
 }
 
 /* ---------- evidence: what was tested, and did it prove anything ---------- */
@@ -1390,7 +1684,7 @@ $("verifyBtn").onclick=function(){
 };
 
 /* ---------- routing ---------- */
-var VIEWS=["home","portal","intent","train","releases","governor","ledger","how","charter","settings"];
+var VIEWS=["home","portal","intent","train","releases","governor","ledger","invites","how","charter","settings"];
 function show(v){
   VIEWS.forEach(function(x){$("v-"+x).hidden=(x!==v);});
   Array.prototype.forEach.call(document.querySelectorAll("#nav a"),function(a){a.classList.toggle("active",a.dataset.v===v||(v==="intent"&&a.dataset.v==="portal"));});
@@ -1407,6 +1701,7 @@ function route(){
   else if(h==="releases") renderReleases();
   else if(h==="governor") renderGovernor();
   else if(h==="ledger") renderLedger(false);
+  else if(h==="invites") renderInvites();
   else if(h==="settings") renderSettings();
 }
 window.addEventListener("hashchange",route);

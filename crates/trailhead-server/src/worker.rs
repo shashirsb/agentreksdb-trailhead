@@ -980,6 +980,27 @@ pub async fn decide(
             },
         );
     }
+    // Re-check the author's right to put work in a release, at the last moment it can still be
+    // stopped. The gate in `submit` covers the start; without this one, revoking an invitation
+    // while the intent sits in guardrails or review would not stop the work merging, and the
+    // revocation would be advisory for exactly the intents it most needs to reach.
+    //
+    // Merge only. Holding or rejecting a revoked author's work must stay possible — otherwise
+    // withdrawing an invitation would strand that author's open intents with no way to close them.
+    if decision == "merge" {
+        let may: bool =
+            sqlx::query_scalar("SELECT may_develop FROM user_rights WHERE user_id = $1")
+                .bind(it.author_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if !may {
+            return invalid(
+                "author_not_invited",
+                "The author's invitation was revoked after this was submitted; it cannot be merged. \
+                 Reinstate the invitation to merge it, or reject it.",
+            );
+        }
+    }
     let train_label = it.train.clone().unwrap_or_default();
     sqlx::query("INSERT INTO decisions (intent_id, train, decision, reason, governor) VALUES ($1,$2,$3,$4,$5)")
         .bind(it.id)

@@ -2392,7 +2392,8 @@ async fn get_evidence(State(st): State<AppState>, Path(id): Path<i64>) -> R<Valu
 //
 // Signing up needs no invitation. Requesting a feature and working on a release do. These three
 // handlers are the whole of issuing, listing and revoking; the gates themselves live beside the
-// actions they guard (`create_intent`, `create_org`, and the train in `worker`).
+// actions they guard: `create_intent`, `submit`, `create_org`, and the merge recheck in
+// `worker::decide`, which is the last point a revoked invitation can still stop the work.
 
 #[derive(Deserialize)]
 struct NewInvite {
@@ -2541,7 +2542,20 @@ async fn create_invite(
     .bind(&b.note)
     .fetch_one(&mut *tx)
     .await
-    .map_err(ApiError::internal)?;
+    // The pre-check above locks only the ISSUER's row, so two different issuers racing on the same
+    // target both see a free slot and both insert; the loser meets `invites_one_live_per_login`.
+    // The index is what keeps the data right — the loser rolls back, no duplicate, no quota spent —
+    // but reporting that as a 500 tells the caller the server broke when in fact the rule worked.
+    // It is the same answer as the pre-check, arrived at a few microseconds later.
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref d) if d.is_unique_violation() => ApiError::new(
+            StatusCode::CONFLICT,
+            "already_invited",
+            "That account already holds an open invitation.",
+            "Revoke it first if you want to change the kind.",
+        ),
+        other => ApiError::internal(other),
+    })?;
     db::append_event(
         &mut tx,
         "invite.issued",
@@ -2600,12 +2614,22 @@ async fn revoke_invite(
             "That invitation, or it was already revoked, or it is not yours to revoke",
         ));
     }
+    // The reason is deliberately NOT published. It is stored on the row (`revoked_reason`) and
+    // `list_invites` does not return it either, so the ledger must not be the back door that makes
+    // it world-readable forever.
+    //
+    // A revocation reason is free text one person writes about another person being removed, which
+    // is the kind of material TRANSPARENCY.md keeps out of the chain: the enforcement outcome is
+    // published, the prose behind it is not. The accountable facts — that it happened, to which
+    // invitation, decided by whom — are all here, and they are what an outside reader needs to hold
+    // the governor to account. The ledger is append-only and unerasable by design, so anything put
+    // here is a decision that cannot be revisited.
     db::append_event(
         &mut tx,
         "invite.revoked",
         None,
         &u.login,
-        json!({"invite": id, "reason": reason}),
+        json!({"invite": id, "had_reason": !reason.is_empty()}),
     )
     .await
     .map_err(ApiError::internal)?;
