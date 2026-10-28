@@ -250,10 +250,23 @@ pub async fn run(cfg: &Config) -> anyhow::Result<i32> {
     } else {
         let gh = crate::github::GitHub { cfg, http: &http };
         match gh.repo_check(&cfg.target_repo).await {
-            Ok(perms) => r.push(
+            // Reaching the repository is the easy half. The run ends by pushing a signed commit,
+            // so without push this fails *after* the inference has been paid for and every gate
+            // has run — the most expensive possible moment to discover a permission.
+            Ok(perms) if perms.can_commit() => r.push(
                 State::Ok,
                 "github app",
-                format!("can reach {} ({perms})", cfg.target_repo),
+                format!("can reach and push to {} ({perms})", cfg.target_repo),
+            ),
+            Ok(perms) => r.push(
+                State::Fail,
+                "github app",
+                format!(
+                    "can reach {} but cannot push ({perms}) \
+                     -> give the installation Contents: read and write at \
+                     github.com/settings/installations, then re-run",
+                    cfg.target_repo
+                ),
             ),
             Err(e) => r.push(
                 State::Fail,

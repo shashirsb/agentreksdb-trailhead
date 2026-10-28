@@ -15,6 +15,57 @@ pub struct GitHub<'a> {
     pub http: &'a reqwest::Client,
 }
 
+/// What the App is actually allowed to do on the target repository.
+///
+/// This used to be a formatted string, with "no write access" as one of the words it could
+/// contain. Every caller then had to notice that one particular phrase meant failure, and the
+/// only caller — `doctor` — did not: it reported a green `ok` beside the words "no write
+/// access", because a string is a string. A diagnostic that says everything is fine while
+/// naming the reason it is not is worse than no diagnostic, so the permissions are parsed once,
+/// here, and callers are handed something they have to ask a question of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepoAccess {
+    pub admin: bool,
+    pub push: bool,
+    pub pull: bool,
+}
+
+impl RepoAccess {
+    fn from_permissions(p: &Value) -> Self {
+        let get = |k: &str| p[k].as_bool().unwrap_or(false);
+        Self {
+            admin: get("admin"),
+            push: get("push"),
+            pull: get("pull"),
+        }
+    }
+
+    /// The pipeline's last act is pushing a signed commit. Read access is not enough, and admin
+    /// implies push on GitHub even when the `push` field is not separately set.
+    pub fn can_commit(&self) -> bool {
+        self.push || self.admin
+    }
+}
+
+impl std::fmt::Display for RepoAccess {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let have: Vec<&str> = [
+            ("admin", self.admin),
+            ("push", self.push),
+            ("pull", self.pull),
+        ]
+        .into_iter()
+        .filter(|(_, v)| *v)
+        .map(|(k, _)| k)
+        .collect();
+        if have.is_empty() {
+            f.write_str("no access at all")
+        } else {
+            f.write_str(&have.join(", "))
+        }
+    }
+}
+
 impl<'a> GitHub<'a> {
     fn app_jwt(&self) -> anyhow::Result<String> {
         let app_id = self
@@ -94,21 +145,11 @@ impl<'a> GitHub<'a> {
     /// Read a repository through the App and report the permissions the installation actually
     /// has on it. Used by `trailhead doctor`: "the App is configured" and "the App can act on
     /// the target repo" are different claims, and only the second one matters.
-    pub async fn repo_check(&self, repo: &str) -> anyhow::Result<String> {
+    pub async fn repo_check(&self, repo: &str) -> anyhow::Result<RepoAccess> {
         let v = self
             .call(reqwest::Method::GET, &format!("/repos/{repo}"), None)
             .await?;
-        let p = &v["permissions"];
-        let mut have: Vec<&str> = Vec::new();
-        for k in ["admin", "push", "pull"] {
-            if p[k].as_bool().unwrap_or(false) {
-                have.push(k);
-            }
-        }
-        if have.is_empty() {
-            have.push("no write access");
-        }
-        Ok(have.join(", "))
+        Ok(RepoAccess::from_permissions(&v["permissions"]))
     }
 
     /// One GraphQL call with the App's installation token. Used for contributor signals,
@@ -238,5 +279,36 @@ mod tests {
         assert!(verify_webhook("s3cret", b"{}", &good));
         assert!(!verify_webhook("other", b"{}", &good));
         assert!(!verify_webhook("s3cret", b"{}", "sha1=abc"));
+    }
+
+    // The exact payload the live installation returned, which doctor called `ok`.
+    #[test]
+    fn read_only_installation_cannot_commit() {
+        let a = RepoAccess::from_permissions(&json!({"admin": false, "push": false, "pull": true}));
+        assert!(!a.can_commit());
+        assert_eq!(a.to_string(), "pull");
+    }
+
+    #[test]
+    fn push_or_admin_can_commit() {
+        let push =
+            RepoAccess::from_permissions(&json!({"admin": false, "push": true, "pull": true}));
+        assert!(push.can_commit());
+        assert_eq!(push.to_string(), "push, pull");
+
+        // An admin installation sometimes reports admin without push; it can still push.
+        let admin =
+            RepoAccess::from_permissions(&json!({"admin": true, "push": false, "pull": false}));
+        assert!(admin.can_commit());
+    }
+
+    // A missing or malformed `permissions` object must not read as permission.
+    #[test]
+    fn absent_permissions_are_not_access() {
+        for v in [json!({}), json!(null), json!({"push": "yes"})] {
+            let a = RepoAccess::from_permissions(&v);
+            assert!(!a.can_commit(), "{v} must not grant push");
+            assert_eq!(a.to_string(), "no access at all");
+        }
     }
 }
