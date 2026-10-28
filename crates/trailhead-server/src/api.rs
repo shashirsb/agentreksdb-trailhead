@@ -105,6 +105,8 @@ pub fn router(st: AppState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/dev-login", post(auth::dev_login))
         .route("/api/me", get(me))
+        .route("/api/invites", get(list_invites).post(create_invite))
+        .route("/api/invites/{id}", delete(revoke_invite))
         .route("/api/intents", get(list_intents).post(create_intent))
         .route("/api/intents/{id}", get(get_intent))
         .route("/api/intents/{id}/messages", post(post_message))
@@ -190,9 +192,18 @@ async fn load_intent(st: &AppState, id: i64) -> Result<IntentRow, ApiError> {
 async fn user_json(st: &AppState, u: &UserRow) -> Result<Value, ApiError> {
     let tier = users::tier_of(&st.pool, u).await?;
     let balance = db::balance(&st.pool, u.id).await?;
+    let rights = users::rights_of(&st.pool, u.id).await?;
     Ok(json!({
         "id": u.id, "login": u.login, "tier": tier.as_str(), "rep_points": u.rep_points,
         "is_governor": u.is_governor, "credits_balance": balance, "created_at": u.created_at,
+        // So the UI can tell a signed-in visitor from an invited contributor and explain the
+        // difference up front, instead of letting someone write a whole intent and then refusing it.
+        "rights": {
+            "request_features": rights.may_request_features,
+            "develop": rights.may_develop,
+            "create_org": rights.may_create_org,
+        },
+        "invite_quota": trailhead_core::invite::invite_quota(tier),
     }))
 }
 
@@ -293,6 +304,16 @@ async fn create_intent(
             "bad_intent",
             "Describe the behaviour you expect.",
             "A few sentences is enough; the interviewer asks for the rest.",
+        ));
+    }
+    // Requesting a feature is invitation-only; reading and voting are not, and neither reaches
+    // here. Checked before the account-age rule so an uninvited newcomer is told the thing they can
+    // actually act on rather than being sent away to wait ninety days for a second refusal.
+    if !users::rights_of(&st.pool, u.id).await?.may_request_features {
+        return Err(ApiError::forbidden(
+            "invitation_required",
+            "Requesting a feature is invitation-only.",
+            "Ask a steward or the governor for an invitation, or redeem your employer's organisation key in Settings.",
         ));
     }
     let activity = users::activity(&st.pool, &u).await?;
@@ -552,6 +573,17 @@ async fn submit(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>) -
     }
     if it.status != "draft" {
         return Err(ApiError::bad("not_draft", "Already submitted.", ""));
+    }
+    // Submitting is the moment generated work enters a release train, so this is the second of the
+    // two invitation-gated activities. Checked here rather than only at `create_intent` because an
+    // invitation can be revoked while a draft is open, and a withdrawn invitation has to stop the
+    // work landing rather than merely stop the next one being started.
+    if !users::rights_of(&st.pool, u.id).await?.may_develop {
+        return Err(ApiError::forbidden(
+            "invitation_required",
+            "Working on a release is invitation-only.",
+            "Ask a steward or the governor for an invitation, or redeem your employer's organisation key in Settings.",
+        ));
     }
     let spec: Spec = serde_json::from_value(it.spec.clone()).unwrap_or_default();
     let r = spec::readiness(&spec);
@@ -1472,6 +1504,16 @@ struct NewOrg {
 
 async fn create_org(State(st): State<AppState>, h: HeaderMap, Json(b): Json<NewOrg>) -> R<Value> {
     let u = auth::require_user(&st, &h).await?;
+    // Organisations are admitted by the governor only. An organisation is a funded voting bloc, and
+    // the discount in `credits::org_vote_weight` can only reduce a bloc the project can see — so
+    // creating one is not something to leave open to anyone who signed up.
+    if !users::rights_of(&st.pool, u.id).await?.may_create_org {
+        return Err(ApiError::forbidden(
+            "invitation_required",
+            "Creating an organisation is invitation-only.",
+            "Ask the governor for an organisation invitation; it is issued to one named GitHub account.",
+        ));
+    }
     let name = b.name.trim();
     if name.len() < 2 || name.len() > 80 {
         return Err(ApiError::new(
@@ -2327,4 +2369,214 @@ async fn get_evidence(State(st): State<AppState>, Path(id): Path<i64>) -> R<Valu
         "runs": out,
         "note": "Evidence rows are append-only: once written, a result cannot be edited or deleted."
     })))
+}
+
+// ---- invitations -------------------------------------------------------------------------------
+//
+// Signing up needs no invitation. Requesting a feature and working on a release do. These three
+// handlers are the whole of issuing, listing and revoking; the gates themselves live beside the
+// actions they guard (`create_intent`, `create_org`, and the train in `worker`).
+
+#[derive(Deserialize)]
+struct NewInvite {
+    login: String,
+    kind: String,
+    #[serde(default)]
+    note: String,
+}
+
+/// Public, like everything else here: anyone can see who was admitted, by whom and why. An
+/// invitation is bound to a login and is not a secret, so there is nothing to withhold — and an
+/// admission list that only insiders can read is exactly the thing this project claims not to be.
+#[derive(sqlx::FromRow)]
+struct InviteListRow {
+    id: i64,
+    login: String,
+    kind: String,
+    note: String,
+    issued_by: String,
+    revoked_by: Option<String>,
+    accepted: bool,
+    revoked: bool,
+}
+
+async fn list_invites(State(st): State<AppState>) -> R<Value> {
+    let rows: Vec<InviteListRow> = sqlx::query_as(
+        "SELECT i.id, i.login, i.kind, i.note,
+                iss.login AS issued_by,
+                rev.login AS revoked_by,
+                i.accepted_at IS NOT NULL AS accepted,
+                i.revoked_at IS NOT NULL AS revoked
+           FROM invites i
+           JOIN users iss ON iss.id = i.issued_by
+           LEFT JOIN users rev ON rev.id = i.revoked_by
+          ORDER BY i.id DESC LIMIT 500",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "invites": rows.iter().map(|r| json!({
+            "id": r.id, "login": r.login, "kind": r.kind, "note": r.note,
+            "issued_by": r.issued_by, "revoked_by": r.revoked_by,
+            "state": if r.revoked { "revoked" } else if r.accepted { "accepted" } else { "open" },
+        })).collect::<Vec<_>>()
+    })))
+}
+
+async fn create_invite(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<NewInvite>,
+) -> R<Value> {
+    use trailhead_core::invite::{self, InviteKind, IssueError};
+
+    let u = auth::require_user(&st, &h).await?;
+    let Some(kind) = InviteKind::parse(b.kind.trim()) else {
+        return Err(ApiError::bad(
+            "bad_kind",
+            "An invitation is for a requester, a developer or an organisation admin.",
+            "",
+        ));
+    };
+    let login = invite::normalize_login(&b.login).map_err(|_| {
+        ApiError::bad(
+            "bad_login",
+            "That is not a possible GitHub username.",
+            "Letters, digits and single hyphens, up to 39 characters.",
+        )
+    })?;
+    if b.note.len() > 280 {
+        return Err(ApiError::bad(
+            "bad_note",
+            "Keep the note under 280 characters.",
+            "",
+        ));
+    }
+
+    let tier = users::tier_of(&st.pool, &u).await?;
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    // Lock the issuer's row before counting, so two requests in flight cannot each see the last
+    // free slot and both take it.
+    sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    let live_held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invites
+          WHERE issued_by = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(u.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    let already: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM invites
+           WHERE login = $1 AND accepted_at IS NULL AND revoked_at IS NULL)",
+    )
+    .bind(&login)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+
+    invite::may_issue_now(tier, kind, live_held, already).map_err(|e| match e {
+        IssueError::NotPermitted => ApiError::forbidden(
+            "not_permitted",
+            "Your tier cannot issue that kind of invitation.",
+            "Stewards and builders may invite requesters; developers and organisations are admitted by the governor.",
+        ),
+        IssueError::QuotaExhausted { quota } => ApiError::forbidden(
+            "quota_exhausted",
+            &format!("You already hold {quota} open invitation(s)."),
+            "They free up as people accept them, or revoke one you no longer need.",
+        ),
+        IssueError::AlreadyInvited => ApiError::new(
+            StatusCode::CONFLICT,
+            "already_invited",
+            "That account already holds an open invitation.",
+            "Revoke it first if you want to change the kind.",
+        ),
+        IssueError::BadLogin => ApiError::bad("bad_login", "That is not a possible GitHub username.", ""),
+    })?;
+
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO invites (login, kind, issued_by, note) VALUES ($1,$2,$3,$4) RETURNING id",
+    )
+    .bind(&login)
+    .bind(kind.as_str())
+    .bind(u.id)
+    .bind(&b.note)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "invite.issued",
+        None,
+        &u.login,
+        json!({"invite": id, "login": login, "kind": kind.as_str(), "note": b.note, "tier": tier.as_str()}),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"id": id, "login": login, "kind": kind.as_str()}),
+    ))
+}
+
+/// Revoking works after acceptance as well as before: admitting someone has to be reversible, and
+/// `user_rights` reads the live row rather than a cached flag, so the right disappears on the next
+/// request rather than at the next login.
+async fn revoke_invite(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    // Optional: a reason is worth recording but is not worth refusing a revocation over. As a
+    // required extractor this rejected a bare `DELETE` with no body at all, which is the obvious
+    // way to call it and the way the documentation would have described.
+    body: Option<Json<serde_json::Value>>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let reason = body
+        .as_ref()
+        .and_then(|Json(b)| b["reason"].as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    // The issuer may withdraw their own invitation; a governor may withdraw anyone's. Scoping the
+    // UPDATE this way means a non-governor cannot revoke someone else's by guessing a number.
+    let n = sqlx::query(
+        "UPDATE invites SET revoked_at = now(), revoked_by = $2, revoked_reason = $3
+          WHERE id = $1 AND revoked_at IS NULL AND (issued_by = $2 OR $4)",
+    )
+    .bind(id)
+    .bind(u.id)
+    .bind(if reason.is_empty() {
+        None
+    } else {
+        Some(&reason)
+    })
+    .bind(u.is_governor)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?
+    .rows_affected();
+    if n == 0 {
+        return Err(ApiError::not_found(
+            "That invitation, or it was already revoked, or it is not yours to revoke",
+        ));
+    }
+    db::append_event(
+        &mut tx,
+        "invite.revoked",
+        None,
+        &u.login,
+        json!({"invite": id, "reason": reason}),
+    )
+    .await
+    .map_err(ApiError::internal)?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"ok": true})))
 }

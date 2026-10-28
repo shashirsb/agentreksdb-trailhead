@@ -53,3 +53,24 @@ pub async fn activity(pool: &PgPool, u: &UserRow) -> anyhow::Result<Activity> {
 pub async fn tier_of(pool: &PgPool, u: &UserRow) -> anyhow::Result<Tier> {
     Ok(reputation::tier(&activity(pool, u).await?))
 }
+
+/// What an account may do beyond reading and voting, which need nothing.
+///
+/// Read from the `user_rights` view rather than from columns on `users`, so revoking an invitation
+/// takes effect on the next request instead of whenever a cached flag happens to be rewritten.
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
+pub struct Rights {
+    pub may_request_features: bool,
+    pub may_develop: bool,
+    pub may_create_org: bool,
+}
+
+pub async fn rights_of(pool: &PgPool, user_id: i64) -> anyhow::Result<Rights> {
+    let r: Rights = sqlx::query_as(
+        "SELECT may_request_features, may_develop, may_create_org FROM user_rights WHERE user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(r)
+}

@@ -7,7 +7,7 @@ and decide what merges. This document says who decides, how, and on what schedul
 
 | Role | Who | Can |
 | --- | --- | --- |
-| Visitor | anyone with an eligible GitHub account | file intents, comment |
+| Visitor | anyone with a GitHub account | read everything, follow a release, comment. Filing an intent or working on a release needs an invitation (section 11) |
 | Contributor and above | see the tier table in CONTRIBUTING.md | vote, triage, review, nominate |
 | Governor | an elected member of the governing body | decide merges, holds and rejections; amend policy |
 | Election officer | a non-candidate appointed for each election | run the ballot |
@@ -91,3 +91,53 @@ Until the first election, the founder, Shashi (GitHub `shashirsb`), acts as inte
 powers of the governing body, subject to CHARTER.md. The interim governor may not amend the charter. The first
 election is held within 6 months of the first public train, or once 25 intents authored by people other than the
 founder have merged, whichever comes first.
+
+## 11. Admission
+
+Signing up is open: anyone may create an account, read every intent and follow a release. Voting needs no
+invitation but does need Contributor tier (CONTRIBUTING.md). Two actions need
+an invitation: requesting a feature (opening an intent) and working on a release (submitting one). Creating an
+organisation needs an organisation invitation.
+
+The gate is on those actions, not on the account. Gating signup would have shut out readers, which a project
+built on public intent cannot do, and would have locked out the staff of a paying organisation, who
+must sign in before they can redeem their employer's key.
+
+**Who may invite whom**
+
+| Tier | May invite | Live invitations at once |
+| --- | --- | --- |
+| Governor | requesters, developers, organisation admins | unlimited |
+| Steward | requesters only | 10 |
+| Builder | requesters only | 3 |
+| Contributor, Visitor | nobody | 0 |
+
+- A live invitation is one issued and neither accepted nor revoked. The quota counts live invitations, not
+  invitations issued over all time, so it recycles as people join and bounds what one compromised account can
+  do before anyone looks.
+- A Contributor, with one merged intent, is deliberately given no invitations. If a single merge bought the
+  power to admit others, the defences against fake accounts would be decoration. Tiers are earned and can be
+  lost; the quota follows the tier.
+- Organisations are admitted by the governor alone, with an `org_admin` invitation. An organisation is a funded
+  group of voters, and the vote discount for colleagues (CONTRIBUTING.md) can only apply to a group the project
+  can see, so who may create one is not spread across everyone who has merged a few changes. Developer
+  invitations are governor-only for the related reason that those who vote on a release should not also quietly
+  choose who produces it.
+- Staff of an organisation get the right to request features and to submit by redeeming their employer's
+  organisation key. The employer vouches for them, and the key is capped and revocable.
+- At present any invitation, of whatever kind, permits both requesting and working on a release. The kind is
+  recorded as provenance; only the organisation invitation grants anything extra.
+
+**Invitations are bound to a login, not to a secret.** An invitation names one GitHub login and is redeemed when
+that account signs in. A leaked invitation is worthless to whoever finds it, so it never needs to be kept
+secret, and the list of invitations, with who issued each and why, is public. An organisation key is the opposite
+by necessity: it goes to a whole team, so it is a bearer token and is hashed, capped and revocable. Changing
+invitations into codes would add a leakage risk that the binding removes.
+
+**Revocation is immediate and works after acceptance.** The issuer may revoke their own invitation and a
+governor may revoke any. Rights are computed from the invitations on each request and never cached, so a
+revoked invitation stops working on the next request, even if it was accepted long ago. This includes work in
+progress: submitting re-checks the right. Issuing and revoking are recorded in the ledger.
+
+The admission chain behind every contributor is therefore reconstructible from the public ledger. The interim
+governor named in section 10 is the first source of invitations.

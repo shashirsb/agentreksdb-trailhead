@@ -199,6 +199,34 @@ pub async fn upsert_user(
             u
         }
     };
+    // An invitation names a login, so signing in is the moment it is redeemed. This runs for
+    // returning accounts too: somebody who signed up to read may be invited to contribute months
+    // later, and should not have to find a button to accept it.
+    //
+    // `invites_one_live_per_login` guarantees at most one live row, so there is nothing to choose
+    // between. The UPDATE is conditional on the row still being live, which makes a revocation
+    // racing an acceptance resolve to the revocation rather than to whichever query ran last.
+    let accepted: Option<(i64, String)> = sqlx::query_as(
+        "UPDATE invites SET accepted_at = now(), accepted_user = $1
+           WHERE login = $2 AND accepted_at IS NULL AND revoked_at IS NULL
+         RETURNING id, kind",
+    )
+    .bind(user.id)
+    .bind(login.to_ascii_lowercase())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    if let Some((invite_id, kind)) = accepted {
+        db::append_event(
+            &mut tx,
+            "invite.accepted",
+            None,
+            login,
+            json!({"invite": invite_id, "kind": kind, "login": login}),
+        )
+        .await
+        .map_err(ApiError::internal)?;
+    }
     tx.commit().await.map_err(ApiError::internal)?;
     let tier = crate::users::tier_of(&st.pool, &user)
         .await

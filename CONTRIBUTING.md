@@ -15,7 +15,10 @@ documentation, signed off under the DCO (below).
 
 ## How to file an intent
 
-1. Sign in to Trailhead with GitHub.
+1. Sign in to Trailhead with GitHub. Anyone can sign in, read and vote, but requesting a feature needs an
+   invitation from a steward or the governor, bound to your GitHub login and redeemed when you sign in. If you
+   work for an organisation that has bought credits, redeeming its key also lets you request. See
+   GOVERNANCE.md section 11.
 2. Choose **Request a feature**: give a title, the area (engine, search and vector, graph, memory, events,
    console, deploy) and a short description.
 3. Talk it through in the intent chat. The interviewer asks until the spec is complete: the problem, what is in
@@ -122,11 +125,12 @@ rules each train was decided under.
 ## Reputation tiers
 
 Reputation comes only from merged intents that stay merged, weighted by reuse and reviews. Reverts take points
-back. Points decay 3 percent a month. You need at least 30 days in a tier before promotion.
+back. Tier also sets how many invitations you may hold: Steward 10 and Builder 3, requesters only; Contributor and
+Visitor none (GOVERNANCE.md section 11). Points decay 3 percent a month. You need at least 30 days in a tier before promotion.
 
 | Tier | Threshold | Free credits a month | Privileges |
 | --- | --- | --- | --- |
-| Visitor | GitHub account at least 90 days old, or verified organization email | 500 | file intents, comment |
+| Visitor | GitHub account at least 90 days old, or verified organization email | 500 | file intents and work on releases once invited, comment |
 | Contributor | 1 merged intent retained 30 days | 2,000 | vote (weight 1) |
 | Builder | 5 merged, 90 days active, 2 reviews accepted | 10,000 | vote weight 3, triage |
 | Steward | 20 merged across 2+ areas, 50 of the last 100 days active, no recent reverts | 50,000 + larger models | vote weight 5, nominate governors |
@@ -146,7 +150,8 @@ score. The work they fund is public. Purchases and spend appear in the public le
 
 An organisation can buy credits so its employees can file intents without paying personally. Its
 members draw on that balance exactly as they would their own; the employer picks up the compute
-bill. Create one, add members, buy credits: `POST /api/orgs`, `/api/orgs/:id/members`,
+bill. Creating an organisation needs an organisation invitation from the governor. Then add members, buy
+credits: `POST /api/orgs`, `/api/orgs/:id/members`,
 `/api/orgs/:id/credits`.
 
 **It buys compute for a person. It buys nothing for a feature.** An intent written by a funded

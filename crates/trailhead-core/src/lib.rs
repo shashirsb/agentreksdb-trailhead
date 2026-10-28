@@ -13,6 +13,7 @@ pub mod conformance;
 pub mod credits;
 pub mod diffpolicy;
 pub mod guardrails;
+pub mod invite;
 pub mod ledger;
 pub mod priority;
 pub mod provenance;
