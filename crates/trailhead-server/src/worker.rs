@@ -5,7 +5,7 @@
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::time::Duration;
-use trailhead_core::credits::EntryKind;
+use trailhead_core::credits::{self, EntryKind};
 use trailhead_core::diffpolicy::{FileChange, Manifest, Outcome};
 use trailhead_core::guardrails::{self, Risk};
 use trailhead_core::provenance::{self, sha256_hex};
@@ -383,15 +383,33 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
     )
     .await?;
 
-    // Who pays: the author's own balance first, then the community pool for any shortfall.
-    let owed = g.cost_credits.max(0);
-
+    // Who pays, in order: the author's employer if they have one, then the author, then the
+    // community pool. An organisation pays first because buying inference for its own people is
+    // the only thing its credits are for. Note what is absent: nothing here consults the intent
+    // to decide whether organisation money applies, only who wrote it. That is what keeps this
+    // from becoming the sponsor pool that was deleted in 0004.
     sqlx::query("SELECT id FROM users WHERE id = $1 FOR UPDATE")
         .bind(it.author_id)
         .execute(&mut *tx)
         .await?;
+    let org = db::org_of(&mut tx, it.author_id).await?;
     let bal = db::balance_tx(&mut tx, it.author_id).await?;
-    let from_author = owed.min(bal.max(0));
+    let split = credits::split_funding(g.cost_credits, org.map(|o| o.1).unwrap_or(0), bal);
+    let owed = g.cost_credits.max(0);
+
+    if let (Some((org_id, _)), true) = (org, split.from_org > 0) {
+        db::add_org_credits(
+            &mut tx,
+            org_id,
+            it.author_id,
+            EntryKind::OrgSpend,
+            split.from_org,
+            Some(id),
+            "generation, paid by the author's organisation",
+        )
+        .await?;
+    }
+    let from_author = split.from_author;
     db::add_credits(
         &mut tx,
         it.author_id,
@@ -419,7 +437,8 @@ async fn generate_job(st: &AppState, id: i64) -> anyhow::Result<Retry> {
             "pool.spend",
             Some(id),
             "backend",
-            json!({"credits": from_community, "from_author": from_author}),
+            json!({"credits": from_community, "from_author": from_author,
+                   "from_org": split.from_org}),
         )
         .await?;
     }

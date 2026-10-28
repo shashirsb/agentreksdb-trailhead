@@ -142,6 +142,32 @@ Organizations that need a feature can buy credits for their account: $0.015 per 
 approval, no merge rights, no roadmap say and no naming rights, and they are an input to no term of the queue
 score. The work they fund is public. Purchases and spend appear in the public ledger.
 
+### Organisations buying inference for their own people
+
+An organisation can buy credits so its employees can file intents without paying personally. Its
+members draw on that balance exactly as they would their own; the employer picks up the compute
+bill. Create one, add members, buy credits: `POST /api/orgs`, `/api/orgs/:id/members`,
+`/api/orgs/:id/credits`.
+
+**It buys compute for a person. It buys nothing for a feature.** An intent written by a funded
+employee sits in the queue at exactly the score it would have had if they had paid themselves —
+there is no monetary term for the money to reach, and an end-to-end test asserts a funded and an
+unfunded intent score identically.
+
+The guarantee is structural rather than a promise. Organisation credits name a **member**, never
+an intent: there is no column linking an organisation to an intent and no endpoint that funds a
+named feature. That is the difference from the sponsor pools below, and the reason this is safe
+where those were not.
+
+One thing organisations genuinely do change is votes. A company with fifty staff is fifty
+accounts that may all back the same intent, and that is not fraud but it is not fifty independent
+opinions either. So an employer's combined vote on one intent counts in full for the first few
+points and at a square-root rate after that: twelve colleagues weigh about six, while twelve
+unrelated people weigh twelve. Recording who works where is what makes that possible — a link the
+project can see is a cluster it can discount, where fifty unaffiliated-looking accounts are not.
+
+Every purchase and every credit spent is in the public ledger with the organisation named.
+
 ### No earmarked funding
 
 Nobody can pay for a named feature. Donations are unrestricted, and the project spends them wherever the

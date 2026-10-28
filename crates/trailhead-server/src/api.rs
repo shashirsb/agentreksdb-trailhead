@@ -119,6 +119,10 @@ pub fn router(st: AppState) -> Router {
         .route("/api/ledger/verify", get(ledger_verify))
         .route("/api/ledger/checkpoint", get(ledger_checkpoint))
         .route("/api/credits", get(my_credits))
+        .route("/api/orgs", get(list_orgs).post(create_org))
+        .route("/api/orgs/{id}", get(get_org))
+        .route("/api/orgs/{id}/members", post(add_org_member))
+        .route("/api/orgs/{id}/credits", post(buy_org_credits))
         .route("/api/priority", get(priority_board))
         .route("/api/me/signals", get(my_signals).post(set_signals_opt_out))
         .route(
@@ -1317,8 +1321,15 @@ async fn priority_board(State(st): State<AppState>) -> R<Value> {
         i64,
         Option<chrono::DateTime<Utc>>,
     )> = sqlx::query_as(
+        // Votes are summed in two parts: points from people with no employer on record, which
+        // count as cast, and points from each organisation, which are weighted separately below.
+        // Fifty colleagues backing their employer's priority is not fraud and it is not fifty
+        // independent opinions either; counting it as the latter would let the largest payroll
+        // set the queue, which is the outcome that deleting sponsor pools was meant to prevent.
         "SELECT i.id, i.title, i.status, i.change_type, i.author_id,
-                    COALESCE((SELECT SUM(points)::bigint FROM votes v WHERE v.intent_id = i.id), 0),
+                    COALESCE((SELECT SUM(v.points)::bigint FROM votes v
+                               LEFT JOIN org_members m ON m.user_id = v.user_id
+                              WHERE v.intent_id = i.id AND m.org_id IS NULL), 0),
                     (SELECT MAX(v.created_at) FROM votes v WHERE v.intent_id = i.id)
              FROM intents i
              WHERE i.status NOT IN ('merged','rejected','draft')
@@ -1328,9 +1339,31 @@ async fn priority_board(State(st): State<AppState>) -> R<Value> {
     .await
     .map_err(ApiError::internal)?;
 
+    // Add each organisation's bloc back, weighted. `org_vote_weight` counts the first few
+    // colleagues in full and the rest at a square-root rate, so a broad coalition inside a large
+    // company still outweighs a handful of people while a payroll cannot simply outvote everyone.
+    let bloc_rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT v.intent_id, m.org_id, SUM(v.points)::bigint
+           FROM votes v JOIN org_members m ON m.user_id = v.user_id
+          GROUP BY v.intent_id, m.org_id",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let mut org_mass: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    for (intent_id, _org, points) in &bloc_rows {
+        *org_mass.entry(*intent_id).or_insert(0.0) += trailhead_core::credits::org_vote_weight(
+            *points,
+            trailhead_core::credits::ORG_VOTE_FREE_POINTS,
+        );
+    }
+
     // The saturating prior: the median vote mass across the open board. Using the median
     // rather than the maximum means one brigaded intent cannot rescale everyone else.
-    let mut masses: Vec<f64> = rows.iter().map(|r| r.5 as f64).collect();
+    let mut masses: Vec<f64> = rows
+        .iter()
+        .map(|r| r.5 as f64 + org_mass.get(&r.0).copied().unwrap_or(0.0))
+        .collect();
     masses.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let median = if masses.is_empty() {
         1.0
@@ -1351,7 +1384,7 @@ async fn priority_board(State(st): State<AppState>) -> R<Value> {
         let sig = signals::get(&st.pool, author_id).await?;
         let idle_days = last_vote.map(|t| (Utc::now() - t).num_days()).unwrap_or(0);
         let inputs = priority::Inputs {
-            votes_raw: points as f64,
+            votes_raw: points as f64 + org_mass.get(&id).copied().unwrap_or(0.0),
             votes_median: median,
             merged_retained: merged.max(0) as u32,
             qualifying_repos: sig.shared_repos.max(0) as u32,
@@ -1414,6 +1447,272 @@ async fn set_signals_opt_out(
     let u = auth::require_user(&st, &h).await?;
     signals::set_opt_out(&st.pool, u.id, b.opted_out).await?;
     Ok(Json(json!({"opted_out": b.opted_out})))
+}
+
+// ---------- organisations ----------
+//
+// An organisation buys credits so its own members can pay for inference. Read the handlers
+// looking for the call that attaches that money to a feature: there isn't one, and that absence
+// is the entire safety property. Sponsor pools (deleted in 0004) had exactly that call, and every
+// rule written to keep it honest — no priority, no vote weight, disclosure, recusal — existed to
+// contain it. Money that only ever names a person needs none of them.
+
+#[derive(serde::Deserialize)]
+struct NewOrg {
+    name: String,
+    verified_domain: Option<String>,
+}
+
+async fn create_org(State(st): State<AppState>, h: HeaderMap, Json(b): Json<NewOrg>) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let name = b.name.trim();
+    if name.len() < 2 || name.len() > 80 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_name",
+            "An organisation name is between 2 and 80 characters.",
+            "Use the name people would recognise.",
+        ));
+    }
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    // One employer per person, enforced by a unique index; check first so the error is readable.
+    let existing: Option<i64> =
+        sqlx::query_scalar("SELECT org_id FROM org_members WHERE user_id = $1")
+            .bind(u.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    if existing.is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "already_in_org",
+            "You already belong to an organisation.",
+            "Leave it before creating another; one employer per account keeps the vote discount honest.",
+        ));
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO orgs (name, verified_domain, created_by) VALUES ($1,$2,$3) RETURNING id",
+    )
+    .bind(name)
+    .bind(
+        b.verified_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty()),
+    )
+    .bind(u.id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("orgs_name_lower") {
+            ApiError::new(
+                StatusCode::CONFLICT,
+                "name_taken",
+                "An organisation with that name already exists.",
+                "Ask its admin to add you instead.",
+            )
+        } else {
+            ApiError::internal(e)
+        }
+    })?;
+    sqlx::query(
+        "INSERT INTO org_members (org_id, user_id, role, added_by) VALUES ($1,$2,'admin',$2)",
+    )
+    .bind(id)
+    .bind(u.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    db::append_event(
+        &mut tx,
+        "org.created",
+        None,
+        &u.login,
+        json!({"org_id": id, "name": name, "domain": b.verified_domain}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"org_id": id, "name": name, "role": "admin"})))
+}
+
+/// Is this user an admin of this organisation?
+async fn require_org_admin(st: &AppState, h: &HeaderMap, org: i64) -> Result<UserRow, ApiError> {
+    let u = auth::require_user(st, h).await?;
+    let role: Option<String> =
+        sqlx::query_scalar("SELECT role FROM org_members WHERE org_id = $1 AND user_id = $2")
+            .bind(org)
+            .bind(u.id)
+            .fetch_optional(&st.pool)
+            .await
+            .map_err(ApiError::internal)?;
+    if role.as_deref() != Some("admin") {
+        return Err(ApiError::forbidden(
+            "org_admin_only",
+            "Only an admin of this organisation can do that.",
+            "Ask whoever created it.",
+        ));
+    }
+    Ok(u)
+}
+
+#[derive(serde::Deserialize)]
+struct NewMember {
+    login: String,
+}
+
+async fn add_org_member(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<NewMember>,
+) -> R<Value> {
+    let admin = require_org_admin(&st, &h, id).await?;
+    let member: Option<UserRow> = sqlx::query_as("SELECT * FROM users WHERE login = $1")
+        .bind(b.login.trim())
+        .fetch_optional(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    let Some(member) = member else {
+        return Err(ApiError::not_found("That account"));
+    };
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO org_members (org_id, user_id, added_by) VALUES ($1,$2,$3)")
+        .bind(id)
+        .bind(member.id)
+        .bind(admin.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            if e.to_string().contains("org_members_one_org") {
+                ApiError::new(
+                    StatusCode::CONFLICT,
+                    "already_in_org",
+                    "That account already belongs to an organisation.",
+                    "One employer per account; they must leave the other first.",
+                )
+            } else {
+                ApiError::internal(e)
+            }
+        })?;
+    // Who funds whom is public, because it is what lets anyone check the vote discount is applied.
+    db::append_event(
+        &mut tx,
+        "org.member_added",
+        None,
+        &admin.login,
+        json!({"org_id": id, "member": member.login}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(
+        json!({"org_id": id, "member": member.login, "role": "member"}),
+    ))
+}
+
+#[derive(serde::Deserialize)]
+struct BuyCredits {
+    credits: i64,
+}
+
+async fn buy_org_credits(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<BuyCredits>,
+) -> R<Value> {
+    let admin = require_org_admin(&st, &h, id).await?;
+    if b.credits <= 0 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_amount",
+            "Credits must be a positive number.",
+            "",
+        ));
+    }
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    db::add_org_credits(
+        &mut tx,
+        id,
+        admin.id,
+        EntryKind::OrgPurchase,
+        b.credits,
+        None,
+        "organisation credit purchase",
+    )
+    .await?;
+    db::append_event(
+        &mut tx,
+        "org.purchase",
+        None,
+        &admin.login,
+        json!({"org_id": id, "credits": b.credits}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    let bal = org_balance(&st, id).await?;
+    Ok(Json(json!({"org_id": id, "balance": bal})))
+}
+
+async fn org_balance(st: &AppState, id: i64) -> Result<i64, ApiError> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(balance,0)::bigint FROM org_balances WHERE org_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)
+    .map(|v| v.unwrap_or(0))
+}
+
+async fn list_orgs(State(st): State<AppState>) -> R<Value> {
+    let rows: Vec<(i64, String, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "SELECT org_id, name, verified_domain, purchased, spent, balance
+           FROM org_balances ORDER BY name",
+    )
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "orgs": rows.iter().map(|r| json!({
+            "id": r.0, "name": r.1, "domain": r.2,
+            "purchased": r.3, "spent": r.4, "balance": r.5,
+        })).collect::<Vec<_>>(),
+        "priority_effect": "none — the score has no monetary term, and organisation credits \
+                            name a member, never an intent",
+    })))
+}
+
+async fn get_org(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value> {
+    let row: Option<(i64, String, Option<String>, i64, i64, i64)> = sqlx::query_as(
+        "SELECT org_id, name, verified_domain, purchased, spent, balance
+           FROM org_balances WHERE org_id = $1",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(r) = row else {
+        return Err(ApiError::not_found("Organisation"));
+    };
+    let members: Vec<(String, String)> = sqlx::query_as(
+        "SELECT u.login, m.role FROM org_members m JOIN users u ON u.id = m.user_id
+          WHERE m.org_id = $1 ORDER BY m.role, u.login",
+    )
+    .bind(id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "id": r.0, "name": r.1, "domain": r.2,
+        "purchased": r.3, "spent": r.4, "balance": r.5,
+        "balances_reconcile": r.3 - r.4 == r.5,
+        "members": members.iter().map(|m| json!({"login": m.0, "role": m.1})).collect::<Vec<_>>(),
+        "vote_weighting": format!(
+            "This organisation's combined votes on one intent count in full up to {} points, \
+             then at a square-root rate. Colleagues agreeing is not independent support.",
+            trailhead_core::credits::ORG_VOTE_FREE_POINTS),
+        "priority_effect": "none — these credits pay for a member's inference and name no intent",
+    })))
 }
 
 // ---------- per-feature evidence ----------

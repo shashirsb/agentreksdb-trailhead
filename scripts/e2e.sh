@@ -195,6 +195,69 @@ expect "200,000 credits buy exactly nothing in the queue" "$RICH" "$POOR"
 POOLS_CODE=$(curl -s -o /dev/null -w '%{http_code}' "$API/api/pools")
 expect "the sponsor pool API is gone" "$POOLS_CODE" 404
 
+# Organisations: an employer buys inference for its own people, and that is all it buys.
+call orgadmin POST /auth/dev-login '{"login":"acme-admin"}' >/dev/null
+call orgdev POST /auth/dev-login '{"login":"acme-dev"}' >/dev/null
+ORG=$(call orgadmin POST /api/orgs '{"name":"Acme Corp","verified_domain":"acme.example"}' | jq -r .org_id)
+[ "$ORG" != "null" ] && pass "an organisation can be created" || fail "organisation not created"
+expect "the creator is its admin" "$(call anon GET /api/orgs/$ORG | jq -r '.members[]|select(.role=="admin").login')" acme-admin
+call orgadmin POST /api/orgs/$ORG/members '{"login":"acme-dev"}' >/dev/null
+expect "an admin can add a member" "$(call anon GET /api/orgs/$ORG | jq -r '[.members[]]|length')" 2
+expect "a non-admin cannot add members" \
+  "$(call orgdev POST /api/orgs/$ORG/members '{"login":"gov"}' | jq -r .error.code)" org_admin_only
+expect "one employer per account" \
+  "$(call orgadmin POST /api/orgs '{"name":"Other Corp"}' | jq -r .error.code)" already_in_org
+
+call orgadmin POST /api/orgs/$ORG/credits '{"credits":50000}' >/dev/null
+expect "the organisation balance is public" "$(call anon GET /api/orgs/$ORG | jq -r .balance)" 50000
+expect "its books reconcile" "$(call anon GET /api/orgs/$ORG | jq -r .balances_reconcile)" true
+expect "a negative purchase is refused" \
+  "$(call orgadmin POST /api/orgs/$ORG/credits '{"credits":-5}' | jq -r .error.code)" bad_amount
+
+# The point of the whole feature: the money pays for compute and buys nothing in the queue.
+psql "$DATABASE_URL" -qtc "INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
+  SELECT 'Org funded','core',id,'x',2500,'review','feature' FROM users WHERE login='acme-dev';
+  INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
+  SELECT 'Unfunded','core',id,'x',2500,'review','feature' FROM users WHERE login='gov';" >/dev/null
+BOARD=$(call anon GET /api/priority)
+ORGSCORE=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Org funded").score')
+PLAIN=$(echo "$BOARD" | jq -r '.intents[]|select(.title=="Unfunded").score')
+expect "an org-funded intent scores exactly what an unfunded one scores" "$ORGSCORE" "$PLAIN"
+expect "the published formula still has no money term" "$(echo "$BOARD" | jq -r .money_term)" null
+expect "the organisation page says so plainly" \
+  "$(call anon GET /api/orgs/$ORG | jq -r .priority_effect | cut -c1-4)" none
+# The risk organisations actually add is votes, not money: a large payroll is many accounts that
+# may all back one intent. Twelve colleagues must not outweigh twelve unaffiliated people.
+psql "$DATABASE_URL" -qtc "
+INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
+  SELECT 'Bloc backed','core',id,'x',2500,'review','feature' FROM users WHERE login='gov';
+INSERT INTO intents(title,area,author_id,intent,stake_credits,status,change_type)
+  SELECT 'Crowd backed','core',id,'x',2500,'review','feature' FROM users WHERE login='gov';
+DO \$\$
+DECLARE a bigint; b bigint; o bigint; u bigint; i int;
+BEGIN
+  SELECT id INTO a FROM intents WHERE title='Bloc backed';
+  SELECT id INTO b FROM intents WHERE title='Crowd backed';
+  SELECT org_id INTO o FROM org_members LIMIT 1;
+  FOR i IN 1..12 LOOP
+    INSERT INTO users(github_id,login) VALUES (9000+i,'colleague'||i) RETURNING id INTO u;
+    INSERT INTO org_members(org_id,user_id,added_by) VALUES (o,u,u);
+    INSERT INTO votes(user_id,intent_id,quarter,points) VALUES (u,a,'2026-Q4',1);
+    INSERT INTO users(github_id,login) VALUES (9500+i,'stranger'||i) RETURNING id INTO u;
+    INSERT INTO votes(user_id,intent_id,quarter,points) VALUES (u,b,'2026-Q4',1);
+  END LOOP;
+END \$\$;" >/dev/null
+BOARD2=$(call anon GET /api/priority)
+BLOC=$(echo "$BOARD2" | jq -r '.intents[]|select(.title=="Bloc backed").score')
+CROWD=$(echo "$BOARD2" | jq -r '.intents[]|select(.title=="Crowd backed").score')
+if awk "BEGIN{exit !($BLOC < $CROWD)}"; then
+  pass "twelve colleagues of one employer weigh less than twelve strangers ($BLOC < $CROWD)"
+else fail "an employer's bloc counted as full independent support ($BLOC vs $CROWD)"; fi
+
+# There is deliberately no endpoint that points organisation money at an intent.
+FUND_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$API/api/orgs/$ORG/fund" -H 'content-type: application/json' -d '{"intent_id":1}')
+expect "there is no way to fund a named feature" "$FUND_CODE" 404
+
 # The scope gate: a diff may only touch the areas its own spec declared. This is the layer
 # aimed at a backdoor riding along with an honest change.
 cat > "$TMP/cspec.json" <<'JSON'

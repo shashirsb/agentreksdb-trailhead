@@ -135,6 +135,12 @@ or paid placement. Every feature funded by credits is merged into the public cod
 10.4 Proposed new clause 2.5: no earmarked funding. Nobody may pay for a named feature, module or release.
 Donations are unrestricted, and the project spends them where the public queue already points.
 
+An organisation may buy credits so its own members can pay for the inference their intents consume.
+That is a purchase of compute on behalf of a person, not funding of a feature: the credits name a
+member, there is no mechanism to point them at an intent, and a funded intent is ranked exactly as
+an unfunded one. Where an employer's staff vote together, their combined vote on a single intent is
+weighted to reflect that colleagues are not independent voters.
+
 An earlier draft of this charter proposed "sponsor pools": an organization could fund the inference for a
 feature it wanted, under rules that gave it no priority, no vote, no review influence and no merge rights.
 That design was built and then removed before any sponsor pledged. The rules were sound on paper and held in

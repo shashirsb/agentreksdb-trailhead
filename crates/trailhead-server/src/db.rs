@@ -127,6 +127,51 @@ pub async fn append_event(
     Ok(row)
 }
 
+/// The organisation this user belongs to, and what that organisation has left to spend.
+/// Returns `None` for the great majority of contributors, who belong to no organisation.
+pub async fn org_of(tx: &mut Tx<'_>, user_id: i64) -> anyhow::Result<Option<(i64, i64)>> {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT m.org_id, COALESCE(b.balance, 0)::bigint
+           FROM org_members m
+           LEFT JOIN org_balances b ON b.org_id = m.org_id
+          WHERE m.user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(row)
+}
+
+/// Book a movement against an organisation's balance. Separate from [`add_credits`] because the
+/// `credit_org_kinds` constraint requires that organisation kinds — and only those — name an
+/// organisation, so the two cannot share a code path without one of them being able to violate it.
+pub async fn add_org_credits(
+    tx: &mut Tx<'_>,
+    org_id: i64,
+    user_id: i64,
+    kind: EntryKind,
+    credits: i64,
+    intent_id: Option<i64>,
+    memo: &str,
+) -> anyhow::Result<()> {
+    if credits == 0 {
+        return Ok(());
+    }
+    sqlx::query(
+        "INSERT INTO credit_entries (user_id, kind, credits, intent_id, memo, org_id)
+         VALUES ($1,$2,$3,$4,$5,$6)",
+    )
+    .bind(user_id)
+    .bind(kind.as_str())
+    .bind(credits)
+    .bind(intent_id)
+    .bind(memo)
+    .bind(org_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub async fn add_credits(
     tx: &mut Tx<'_>,
     user_id: i64,
