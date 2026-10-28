@@ -1,0 +1,37 @@
+# gitleaks configuration for the target repository.
+#
+# The default rules catch other people's credentials — AWS keys, GitHub tokens, private keys. This
+# file adds the one credential this project mints itself.
+#
+# An organisation key is handed to a whole engineering team so their inference is billed to their
+# employer. A secret shared that widely will eventually be pasted into a README, a test fixture or
+# a commit message, and the person who does it will not realise. Giving the key a fixed, unusual
+# prefix was a deliberate choice for exactly this moment: a credential that looks like nothing in
+# particular is one no scanner will ever find. Having chosen the shape, it would be careless not
+# to teach the scanner to look for it.
+#
+# Finding one is not a disaster — keys are revocable, and that is the control the design leans on —
+# but it should be found in a pull request rather than by whoever reads the repository later.
+
+[extend]
+# Keep every default rule; this file only adds to them.
+useDefault = true
+
+[[rules]]
+id = "trailhead-org-key"
+description = "Trailhead organisation key (bills inference to an employer; revoke it immediately)"
+# The prefix plus exactly 64 hex characters, which is the whole key and nothing shorter.
+regex = '''trailhead_org_[0-9a-fA-F]{64}'''
+keywords = ["trailhead_org_"]
+
+[[rules.allowlists]]
+description = "The documentation has to be able to describe the shape of a key."
+# Placeholders in prose and examples: trailhead_org_… and obviously-fake runs of one character.
+regexes = [
+  '''trailhead_org_(x{64}|0{64}|a{64}|ab{32}|…|\.\.\.)''',
+]
+paths = [
+  '''(^|/)docs/''',
+  '''(^|/)gates/''',
+  '''\.md$''',
+]

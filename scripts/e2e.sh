@@ -226,6 +226,57 @@ expect "an org-funded intent scores exactly what an unfunded one scores" "$ORGSC
 expect "the published formula still has no money term" "$(echo "$BOARD" | jq -r .money_term)" null
 expect "the organisation page says so plainly" \
   "$(call anon GET /api/orgs/$ORG | jq -r .priority_effect | cut -c1-4)" none
+# Organisation keys: an admin mints one in settings, staff redeem it to have their inference
+# billed to the employer, and revoking it is the control that actually matters.
+KEYJSON=$(call orgadmin POST /api/orgs/$ORG/keys '{"label":"platform team"}')
+ORGKEY=$(echo "$KEYJSON" | jq -r .key)
+KEYID=$(echo "$KEYJSON" | jq -r .key_id)
+case "$ORGKEY" in trailhead_org_*) pass "a key is minted with a greppable prefix";; *) fail "no key minted";; esac
+expect "the secret is never listed afterwards" \
+  "$(call orgadmin GET /api/orgs/$ORG/keys | jq -r '[.keys[]|select(has("key"))]|length')" 0
+expect "only a short prefix is stored for identification" \
+  "$(call orgadmin GET /api/orgs/$ORG/keys | jq -r '.keys[0].prefix|length')" 20
+expect "a non-admin cannot list keys" \
+  "$(call orgdev GET /api/orgs/$ORG/keys | jq -r .error.code)" org_admin_only
+
+# An employee redeems it and is billed to the employer from then on.
+call keyuser POST /auth/dev-login '{"login":"newhire"}' >/dev/null
+expect "an employee redeems the key and joins" \
+  "$(call keyuser POST /api/orgs/join "{\"key\":\"$ORGKEY\"}" | jq -r .org_id)" "$ORG"
+expect "redeeming twice is idempotent, not an error" \
+  "$(call keyuser POST /api/orgs/join "{\"key\":\"$ORGKEY\"}" | jq -r .already_a_member)" true
+expect "the key records that it was used" \
+  "$(call orgadmin GET /api/orgs/$ORG/keys | jq -r '.keys[0].uses')" 1
+
+# Rubbish and forged keys are refused on shape, before any lookup.
+expect "a malformed key is refused" \
+  "$(call keyuser POST /api/orgs/join '{"key":"hunter2"}' | jq -r .error.code)" key_malformed
+expect "a well-formed key that was never issued is refused" \
+  "$(call keyuser POST /api/orgs/join "{\"key\":\"trailhead_org_$(printf 'ab%.0s' $(seq 1 32))\"}" | jq -r .error.code)" key_unknown
+
+# Revocation: the control that matters when a shared secret leaks.
+call orgadmin DELETE /api/orgs/$ORG/keys/$KEYID >/dev/null
+call leaker POST /auth/dev-login '{"login":"stranger-with-leaked-key"}' >/dev/null
+expect "a revoked key cannot be redeemed" \
+  "$(call leaker POST /api/orgs/join "{\"key\":\"$ORGKEY\"}" | jq -r .error.code)" key_revoked
+expect "revoking is reported as revoked, not deleted" \
+  "$(call orgadmin GET /api/orgs/$ORG/keys | jq -r '.keys[0].state')" revoked
+expect "people who already joined keep their membership" \
+  "$(call anon GET /api/orgs/$ORG | jq -r '[.members[]|select(.login=="newhire")]|length')" 1
+
+# A capped key stops itself once it has been used enough.
+CAPPED=$(call orgadmin POST /api/orgs/$ORG/keys '{"label":"one seat","max_uses":1}' | jq -r .key)
+call cap1 POST /auth/dev-login '{"login":"capped-one"}' >/dev/null
+call cap2 POST /auth/dev-login '{"login":"capped-two"}' >/dev/null
+call cap1 POST /api/orgs/join "{\"key\":\"$CAPPED\"}" >/dev/null
+expect "a capped key refuses the next person" \
+  "$(call cap2 POST /api/orgs/join "{\"key\":\"$CAPPED\"}" | jq -r .error.code)" key_exhausted
+# The ledger must record that keys exist without ever recording a key.
+LEDGER_LEAK=$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM events WHERE payload::text LIKE '%trailhead_org_%'")
+expect "no key is ever written to the public ledger" "$LEDGER_LEAK" 0
+STORED_LEAK=$(psql "$DATABASE_URL" -tAc "SELECT count(*) FROM org_keys WHERE key_hash LIKE 'trailhead_org_%'")
+expect "the database stores hashes, never the secret" "$STORED_LEAK" 0
+
 # The risk organisations actually add is votes, not money: a large payroll is many accounts that
 # may all back one intent. Twelve colleagues must not outweigh twelve unaffiliated people.
 psql "$DATABASE_URL" -qtc "

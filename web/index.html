@@ -271,6 +271,16 @@ details summary{cursor:pointer;font-weight:700;font-size:13px;color:var(--muted)
 .ev .eh b{color:var(--ink)}
 .ev .eb{font-size:13.5px;overflow-wrap:anywhere;margin-top:2px}
 .hash{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--muted)}
+/* The one time a key is ever shown. Monospace so every character is unambiguous when copied by
+   hand, and visually loud because it cannot be recovered after this screen. */
+.keyout{border:var(--bw) dashed var(--line);border-radius:10px;padding:14px;margin:12px 0;background:var(--surface-2)}
+.keyout code{font-family:"JetBrains Mono",monospace;font-size:13px;word-break:break-all;display:block;margin:6px 0 10px}
+.ktable{width:100%;border-collapse:collapse;font-size:13px;margin-top:10px}
+.ktable th,.ktable td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);overflow-wrap:anywhere}
+.ktable th{font-family:"JetBrains Mono",monospace;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.kstate{font-weight:800;font-size:12px}
+.kstate.live{color:var(--teal-ink,var(--ink))}
+.kstate.revoked,.kstate.expired,.kstate.exhausted{color:var(--coral)}
 .vote{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
 .vote input{width:70px;font:inherit;padding:6px 9px;border:2px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink)}
 .dec{margin-top:14px;padding:14px 16px;border:var(--bw) solid var(--line);border-radius:12px}
@@ -634,6 +644,13 @@ footer .fnote{font-size:12px;color:var(--muted);max-width:60ch}
 </section>
 
 <!-- CHARTER -->
+<section class="view" id="v-settings" hidden>
+  <div class="wrap sec">
+    <div class="sec-head"><p class="eyebrow">Settings</p><h2>Your organisation.</h2><p>An organisation pays for its members' inference. It buys compute for a person, never a place in the queue: an intent written by a funded employee is ranked exactly as it would be if they paid themselves.</p></div>
+    <div id="settingsBody"></div>
+  </div>
+</section>
+
 <section class="view" id="v-charter" hidden>
   <div class="wrap">
     <div class="sec-head"><p class="eyebrow">Open source forever</p><h2>The charter, in plain words.</h2><p>These commitments are written so they can only ever be made stronger.</p></div>
@@ -795,7 +812,7 @@ function renderUser(){
         '<div class="row"><span class="muted">Credits</span><b>'+num(ME.credits_balance)+'</b></div>'+
         '<div class="row"><span class="muted">Reputation</span><b>'+num(ME.rep_points)+'</b></div>'+
         (ME.is_governor?'<div class="row"><span class="muted">Role</span><b>Governor</b></div>':'')+
-        '<div style="margin-top:10px;display:flex;gap:8px"><button class="btn sm" id="signout" type="button">Sign out</button></div></div>';
+        '<div style="margin-top:10px;display:flex;gap:8px"><a class="btn sm" href="#settings">Settings</a><button class="btn sm" id="signout" type="button">Sign out</button></div></div>';
     $("uchip").onclick=function(){var m=$("umenu");m.hidden=!m.hidden;this.setAttribute("aria-expanded",String(!m.hidden));};
     $("signout").onclick=function(){api("/auth/logout",{method:"POST"}).catch(function(){}).then(function(){ME=null;renderUser();route();});};
   } else {
@@ -1062,6 +1079,100 @@ function drawGates(){
   }).join("")+'</div>':'<p class="muted" style="font-size:14px">No gate has run yet.</p>';
   $("gatesPanel").innerHTML=html;
 }
+/* ---------- settings: the organisation and its keys ---------- */
+var MYORG=null;
+function renderSettings(){
+  var b=$("settingsBody");
+  if(!ME){ b.innerHTML='<div class="card empty">Sign in to manage your organisation.</div>'; return; }
+  b.innerHTML=loading("Loading…");
+  api("/api/orgs").then(function(j){
+    var mine=(j.orgs||[]).filter(function(o){return o.i_am_member;});
+    api("/api/me/org").then(function(m){MYORG=m;drawSettings(m);},function(){MYORG=null;drawSettings(null);});
+  },function(e){b.innerHTML=errBox(e);});
+}
+function drawSettings(m){
+  var b=$("settingsBody");
+  if(!m||!m.org_id){
+    /* Not in an organisation: either redeem a key or start one. */
+    b.innerHTML='<div class="card panel">'+panelHead("shield","Join your organisation")+
+      '<p class="muted" style="font-size:14px;margin-bottom:12px">If your employer pays for inference, paste the key they gave you. Your intents are then billed to them. It changes nothing about how your work is ranked.</p>'+
+      '<form id="joinForm" class="vote"><input id="joinKey" type="password" autocomplete="off" placeholder="trailhead_org_…" style="flex:1;min-width:0;font-family:\'JetBrains Mono\',monospace" aria-label="Organisation key">'+
+      '<button class="btn sm primary" type="submit">Join</button></form><div id="joinMsg"></div></div>'+
+      '<div class="card panel" style="margin-top:14px">'+panelHead("eye","Start an organisation")+
+      '<p class="muted" style="font-size:14px;margin-bottom:12px">Buy credits once, then let your team spend them. Every purchase and every credit spent is public, with your organisation named.</p>'+
+      '<form id="orgForm" class="vote"><input id="orgName" placeholder="Organisation name" style="flex:1;min-width:0" aria-label="Organisation name">'+
+      '<button class="btn sm" type="submit">Create</button></form><div id="orgMsg"></div></div>';
+    $("joinForm").onsubmit=function(ev){ev.preventDefault();
+      var k=$("joinKey").value.trim(); if(!k) return;
+      $("joinMsg").innerHTML=loading("Checking the key…");
+      api("/api/orgs/join",{method:"POST",body:{key:k}}).then(function(r){
+        $("joinKey").value="";renderSettings();
+      },function(e){$("joinMsg").innerHTML=errBox(e);});
+    };
+    $("orgForm").onsubmit=function(ev){ev.preventDefault();
+      var n=$("orgName").value.trim(); if(!n) return;
+      api("/api/orgs",{method:"POST",body:{name:n}}).then(function(){renderSettings();},
+        function(e){$("orgMsg").innerHTML=errBox(e);});
+    };
+    return;
+  }
+  var admin=m.role==="admin";
+  var h='<div class="card panel">'+panelHead("shield",esc(m.name))+
+    '<div class="meta" style="margin-bottom:10px"><span>role <b>'+esc(m.role)+'</b></span>'+
+    '<span>balance <b>'+num(m.balance)+'</b></span><span>spent <b>'+num(m.spent)+'</b></span>'+
+    '<span><b>'+num((m.members||[]).length)+'</b> members</span></div>'+
+    '<p class="muted" style="font-size:13px">'+esc(m.priority_effect||"")+'</p></div>';
+  if(admin){
+    h+='<div class="card panel" style="margin-top:14px">'+panelHead("shield","Keys")+
+      '<p class="muted" style="font-size:14px;margin-bottom:10px">Give a key to staff so their inference is billed here. A key is shown once and stored only as a hash. Revoke it the moment it leaks: anyone holding it can join and spend.</p>'+
+      '<form id="keyForm" class="vote"><input id="keyLabel" placeholder="What is it for, e.g. platform team" style="flex:1;min-width:0" aria-label="Key label">'+
+      '<input id="keyMax" type="number" min="1" placeholder="max uses" style="width:110px" aria-label="Maximum uses">'+
+      '<button class="btn sm primary" type="submit">Create key</button></form>'+
+      '<div id="keyOut"></div><div id="keyList">'+loading("Loading keys…")+'</div></div>';
+  }
+  $("settingsBody").innerHTML=h;
+  if(admin){
+    $("keyForm").onsubmit=function(ev){ev.preventDefault();
+      var body={label:$("keyLabel").value.trim()};
+      var mx=parseInt($("keyMax").value,10); if(mx>0) body.max_uses=mx;
+      api("/api/orgs/"+m.org_id+"/keys",{method:"POST",body:body}).then(function(r){
+        /* The only time this value exists outside the server. */
+        $("keyOut").innerHTML='<div class="keyout"><b>Copy this now.</b>'+
+          '<code id="newKey">'+esc(r.key)+'</code>'+
+          '<button class="btn sm" id="copyKey" type="button">Copy</button> '+
+          '<span class="muted" style="font-size:12.5px">'+esc(r.warning||"")+'</span></div>';
+        $("copyKey").onclick=function(){
+          try{navigator.clipboard.writeText(r.key);this.textContent="Copied";}catch(e){this.textContent="Select it manually";}
+        };
+        $("keyLabel").value="";$("keyMax").value="";loadKeys(m.org_id);
+      },function(e){$("keyOut").innerHTML=errBox(e);});
+    };
+    loadKeys(m.org_id);
+  }
+}
+function loadKeys(org){
+  api("/api/orgs/"+org+"/keys").then(function(j){
+    var ks=j.keys||[];
+    if(!ks.length){$("keyList").innerHTML='<p class="muted" style="font-size:14px">No keys yet.</p>';return;}
+    var h='<table class="ktable"><thead><tr><th>label</th><th>key</th><th>state</th><th>uses</th><th>last used</th><th></th></tr></thead><tbody>';
+    ks.forEach(function(k){
+      h+='<tr><td>'+esc(k.label)+'</td><td class="hash">'+esc(k.prefix)+'…</td>'+
+        '<td><span class="kstate '+esc(k.state)+'">'+esc(k.state)+'</span></td>'+
+        '<td>'+num(k.uses)+(k.max_uses?' / '+num(k.max_uses):'')+'</td>'+
+        '<td class="muted">'+(k.last_used_at?fmtDate(k.last_used_at):"never")+'</td>'+
+        '<td>'+(k.live?'<button class="btn sm" data-revoke="'+esc(k.id)+'" type="button">Revoke</button>':'')+'</td></tr>';
+    });
+    $("keyList").innerHTML=h+'</tbody></table>';
+    Array.prototype.forEach.call($("keyList").querySelectorAll("[data-revoke]"),function(btn){
+      btn.onclick=function(){
+        btn.disabled=true;btn.textContent="Revoking…";
+        api("/api/orgs/"+org+"/keys/"+btn.dataset.revoke,{method:"DELETE"})
+          .then(function(){loadKeys(org);},function(e){btn.disabled=false;btn.textContent="Revoke";alert(e.message||"Could not revoke");});
+      };
+    });
+  },function(e){$("keyList").innerHTML=errBox(e);});
+}
+
 /* ---------- evidence: what was tested, and did it prove anything ---------- */
 var EVID=null;
 function drawEvidence(){
@@ -1279,7 +1390,7 @@ $("verifyBtn").onclick=function(){
 };
 
 /* ---------- routing ---------- */
-var VIEWS=["home","portal","intent","train","releases","governor","ledger","how","charter"];
+var VIEWS=["home","portal","intent","train","releases","governor","ledger","how","charter","settings"];
 function show(v){
   VIEWS.forEach(function(x){$("v-"+x).hidden=(x!==v);});
   Array.prototype.forEach.call(document.querySelectorAll("#nav a"),function(a){a.classList.toggle("active",a.dataset.v===v||(v==="intent"&&a.dataset.v==="portal"));});
@@ -1296,6 +1407,7 @@ function route(){
   else if(h==="releases") renderReleases();
   else if(h==="governor") renderGovernor();
   else if(h==="ledger") renderLedger(false);
+  else if(h==="settings") renderSettings();
 }
 window.addEventListener("hashchange",route);
 

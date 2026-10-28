@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-28T04:29:37Z",
+  "generated_at": "2026-10-28T06:20:20Z",
   "runner": "TRAILHEAD_BIN",
   "policy": "gates/diff-policy.toml",
   "confidence_level": 0.95,

@@ -51,7 +51,7 @@ TH=../agentreksdb-trailhead/gates
 mkdir -p .github/workflows gates/semgrep gates/checks
 cp $TH/.github/workflows/*.yml .github/workflows/
 cp $TH/CODEOWNERS .github/CODEOWNERS
-cp $TH/diff-policy.toml $TH/coverage-floor.txt $TH/invariants.toml gates/
+cp $TH/diff-policy.toml $TH/coverage-floor.txt $TH/invariants.toml $TH/gitleaks.toml gates/
 cp $TH/semgrep/rust-trailhead.yml $TH/semgrep/sabotage.yml gates/semgrep/
 # The nine sabotage checks, run by gate-sabotage.yml. See gates/checks/README.md.
 cp $TH/checks/*.py gates/checks/

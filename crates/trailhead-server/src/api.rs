@@ -4,7 +4,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use base64::Engine;
 use chrono::{Datelike, Utc};
@@ -123,6 +123,13 @@ pub fn router(st: AppState) -> Router {
         .route("/api/orgs/{id}", get(get_org))
         .route("/api/orgs/{id}/members", post(add_org_member))
         .route("/api/orgs/{id}/credits", post(buy_org_credits))
+        .route(
+            "/api/orgs/{id}/keys",
+            get(list_org_keys).post(create_org_key),
+        )
+        .route("/api/orgs/{id}/keys/{key_id}", delete(revoke_org_key))
+        .route("/api/orgs/join", post(redeem_org_key))
+        .route("/api/me/org", get(my_org))
         .route("/api/priority", get(priority_board))
         .route("/api/me/signals", get(my_signals).post(set_signals_opt_out))
         .route(
@@ -1712,6 +1719,323 @@ async fn get_org(State(st): State<AppState>, Path(id): Path<i64>) -> R<Value> {
              then at a square-root rate. Colleagues agreeing is not independent support.",
             trailhead_core::credits::ORG_VOTE_FREE_POINTS),
         "priority_effect": "none — these credits pay for a member's inference and name no intent",
+    })))
+}
+
+/// The signed-in person's own organisation, if they have one. Drives the settings page: a member
+/// sees the balance their work draws on, an admin also sees the keys.
+async fn my_org(State(st): State<AppState>, h: HeaderMap) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    let row: Option<(i64, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT b.org_id, b.name, m.role, b.purchased, b.spent, b.balance
+           FROM org_members m JOIN org_balances b ON b.org_id = m.org_id
+          WHERE m.user_id = $1",
+    )
+    .bind(u.id)
+    .fetch_optional(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some(r) = row else {
+        return Ok(Json(json!({"org_id": null})));
+    };
+    let members: Vec<(String, String)> = sqlx::query_as(
+        "SELECT u.login, m.role FROM org_members m JOIN users u ON u.id = m.user_id
+          WHERE m.org_id = $1 ORDER BY m.role, u.login",
+    )
+    .bind(r.0)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "org_id": r.0, "name": r.1, "role": r.2,
+        "purchased": r.3, "spent": r.4, "balance": r.5,
+        "members": members.iter().map(|m| json!({"login": m.0, "role": m.1})).collect::<Vec<_>>(),
+        "priority_effect": "These credits pay for your inference. They give this organisation no \
+                            priority, no vote weight and no say in what merges.",
+    })))
+}
+
+// ---------- organisation keys ----------
+//
+// An admin mints a key in settings and gives it to staff; redeeming it bills their inference to
+// the employer. Revocation is the control that matters, because a secret shared with a whole team
+// will eventually be pasted somewhere public. Only the hash is stored, and the secret is shown
+// exactly once, at creation.
+
+#[derive(serde::Deserialize)]
+struct NewKey {
+    label: Option<String>,
+    /// Cap how many people may redeem it. Absent means no cap.
+    max_uses: Option<i64>,
+    /// Days until it stops working. Absent means it never expires on its own.
+    expires_in_days: Option<i64>,
+}
+
+async fn create_org_key(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path(id): Path<i64>,
+    Json(b): Json<NewKey>,
+) -> R<Value> {
+    let admin = require_org_admin(&st, &h, id).await?;
+    let label = b
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .unwrap_or("organisation key")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    if b.max_uses.is_some_and(|m| m <= 0) || b.expires_in_days.is_some_and(|d| d <= 0) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "bad_limits",
+            "A use limit and an expiry must both be positive.",
+            "Leave either out for no limit.",
+        ));
+    }
+    let k = credits::new_org_key();
+    let expires = b
+        .expires_in_days
+        .map(|d| Utc::now() + chrono::Duration::days(d));
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    let key_id: i64 = sqlx::query_scalar(
+        "INSERT INTO org_keys (org_id, label, prefix, key_hash, created_by, max_uses, expires_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id",
+    )
+    .bind(id)
+    .bind(&label)
+    .bind(&k.prefix)
+    .bind(&k.hash)
+    .bind(admin.id)
+    .bind(b.max_uses)
+    .bind(expires)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    // The event records that a key was minted and by whom. It records no part of the key, not
+    // even the display prefix: the ledger is public and permanent, so anything written here is
+    // world-readable forever. Six characters of a 256-bit secret are no real help to an attacker,
+    // but a public log is the last place to find out that reasoning was wrong. Admins see the
+    // prefix on the keys page, which is behind their own authorisation.
+    db::append_event(
+        &mut tx,
+        "org.key_created",
+        None,
+        &admin.login,
+        json!({"org_id": id, "key_id": key_id, "label": label,
+               "max_uses": b.max_uses, "expires_at": expires}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "key_id": key_id,
+        "label": label,
+        // The only time this value ever leaves the server.
+        "key": k.secret,
+        "prefix": k.prefix,
+        "max_uses": b.max_uses,
+        "expires_at": expires,
+        "warning": "Copy this now: it is stored only as a hash and cannot be shown again. \
+                    Anyone holding it can join this organisation and spend its credits, so share \
+                    it the way you would a password and revoke it if it leaks.",
+    })))
+}
+
+async fn list_org_keys(State(st): State<AppState>, h: HeaderMap, Path(id): Path<i64>) -> R<Value> {
+    require_org_admin(&st, &h, id).await?;
+    #[allow(clippy::type_complexity)]
+    let rows: Vec<(
+        i64,
+        String,
+        String,
+        chrono::DateTime<Utc>,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        i64,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT id, label, prefix, created_at, revoked_at, expires_at, last_used_at, uses, max_uses
+           FROM org_keys WHERE org_id = $1 ORDER BY id DESC",
+    )
+    .bind(id)
+    .fetch_all(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
+    let now = Utc::now();
+    Ok(Json(json!({
+        "keys": rows.iter().map(|r| {
+            let revoked = r.4.is_some();
+            let expired = r.5.is_some_and(|e| e <= now);
+            let exhausted = r.8.is_some_and(|m| r.7 >= m);
+            json!({
+                "id": r.0, "label": r.1, "prefix": r.2, "created_at": r.3,
+                "revoked_at": r.4, "expires_at": r.5, "last_used_at": r.6,
+                "uses": r.7, "max_uses": r.8,
+                "live": !revoked && !expired && !exhausted,
+                "state": if revoked { "revoked" } else if expired { "expired" }
+                         else if exhausted { "exhausted" } else { "live" },
+            })
+        }).collect::<Vec<_>>(),
+        "note": "Keys are stored as hashes. The secret is shown once, when it is created.",
+    })))
+}
+
+async fn revoke_org_key(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Path((id, key_id)): Path<(i64, i64)>,
+) -> R<Value> {
+    let admin = require_org_admin(&st, &h, id).await?;
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    // Scoped by org_id as well as id, so an admin of one organisation cannot revoke another's key
+    // by guessing a number.
+    let n = sqlx::query(
+        "UPDATE org_keys SET revoked_at = now(), revoked_by = $3
+          WHERE id = $2 AND org_id = $1 AND revoked_at IS NULL",
+    )
+    .bind(id)
+    .bind(key_id)
+    .bind(admin.id)
+    .execute(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?
+    .rows_affected();
+    if n == 0 {
+        return Err(ApiError::not_found("That key, or it was already revoked"));
+    }
+    // Revoking stops future redemptions. People who already joined stay members: their work was
+    // genuinely funded, and quietly ejecting them would leave spent credits unexplained. Remove
+    // them from the member list if that is what is wanted.
+    db::append_event(
+        &mut tx,
+        "org.key_revoked",
+        None,
+        &admin.login,
+        json!({"org_id": id, "key_id": key_id}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    Ok(Json(json!({"key_id": key_id, "revoked": true,
+                   "members_kept": "Revoking blocks new redemptions; existing members are unchanged."})))
+}
+
+#[derive(serde::Deserialize)]
+struct JoinOrg {
+    key: String,
+}
+
+/// Redeem a key: the caller joins the organisation, and from then on their inference is billed to
+/// it. This is the endpoint an employee uses from the intent chat.
+async fn redeem_org_key(
+    State(st): State<AppState>,
+    h: HeaderMap,
+    Json(b): Json<JoinOrg>,
+) -> R<Value> {
+    let u = auth::require_user(&st, &h).await?;
+    // Shape first, so a stray paste never reaches the database.
+    let hash = credits::parse_org_key(&b.key).map_err(|e| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            e.code(),
+            e.message(),
+            "Organisation keys are created by an admin under the organisation's settings.",
+        )
+    })?;
+    let mut tx = st.pool.begin().await.map_err(ApiError::internal)?;
+    // FOR UPDATE so two people redeeming the last use of a capped key cannot both succeed.
+    #[allow(clippy::type_complexity)]
+    let row: Option<(
+        i64,
+        i64,
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        i64,
+        Option<i64>,
+    )> = sqlx::query_as(
+        "SELECT id, org_id, revoked_at, expires_at, uses, max_uses
+               FROM org_keys WHERE key_hash = $1 FOR UPDATE",
+    )
+    .bind(&hash)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(ApiError::internal)?;
+    let Some((key_id, org_id, revoked_at, expires_at, uses, max_uses)) = row else {
+        let e = credits::OrgKeyError::Unknown;
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            e.code(),
+            e.message(),
+            "",
+        ));
+    };
+    let state = credits::OrgKeyState {
+        revoked: revoked_at.is_some(),
+        expired: expires_at.is_some_and(|e| e <= Utc::now()),
+        uses,
+        max_uses,
+    };
+    credits::org_key_usable(state)
+        .map_err(|e| ApiError::new(StatusCode::FORBIDDEN, e.code(), e.message(), ""))?;
+
+    // Already a member of this organisation: say so plainly rather than spending a use.
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT org_id FROM org_members WHERE user_id = $1")
+            .bind(u.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(ApiError::internal)?;
+    if current == Some(org_id) {
+        return Ok(Json(json!({"org_id": org_id, "already_a_member": true})));
+    }
+    if current.is_some() {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "already_in_org",
+            "You already belong to a different organisation.",
+            "One employer per account; leave the other first.",
+        ));
+    }
+
+    sqlx::query("INSERT INTO org_members (org_id, user_id, added_by) VALUES ($1,$2,$2)")
+        .bind(org_id)
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("UPDATE org_keys SET uses = uses + 1, last_used_at = now() WHERE id = $1")
+        .bind(key_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    sqlx::query("INSERT INTO org_key_redemptions (key_id, user_id) VALUES ($1,$2)")
+        .bind(key_id)
+        .bind(u.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::internal)?;
+    // Who joined through which key is public. It is what lets anyone check that an organisation's
+    // votes are being clustered, and that its spending is attached to real named people.
+    db::append_event(
+        &mut tx,
+        "org.key_redeemed",
+        None,
+        &u.login,
+        json!({"org_id": org_id, "key_id": key_id}),
+    )
+    .await?;
+    tx.commit().await.map_err(ApiError::internal)?;
+    let name: String = sqlx::query_scalar("SELECT name FROM orgs WHERE id = $1")
+        .bind(org_id)
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "org_id": org_id, "org": name, "role": "member",
+        "effect": "Your intents' inference is now billed to this organisation. Your votes count \
+                   within its bloc, because colleagues are not independent voters.",
     })))
 }
 

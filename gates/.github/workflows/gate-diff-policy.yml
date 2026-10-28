@@ -122,6 +122,10 @@ jobs:
           mkdir -p .gate-base/semgrep
           git show "$BASE:gates/diff-policy.toml" > .gate-base/diff-policy.toml
           git show "$BASE:gates/semgrep/rust-trailhead.yml" > .gate-base/semgrep/rust-trailhead.yml
+          # Tolerated missing so the gate still runs on a repo installed before this file existed.
+          git show "$BASE:gates/gitleaks.toml" > .gate-base/gitleaks.toml 2>/dev/null \
+            || echo '[extend]
+          useDefault = true' > .gate-base/gitleaks.toml
       # The verifier image must be pinned by digest, not by a tag: `:main` is mutable, and this
       # container is handed the whole PR worktree. Set the repository variable
       # TRAILHEAD_VERIFIER_IMAGE to `ghcr.io/<owner>/agentreksdb-trailhead@sha256:<64 hex>`.
@@ -260,7 +264,12 @@ jobs:
           fi
           tar xz -f gitleaks.tar.gz gitleaks
           set +e
-          ./gitleaks git --log-opts="$BASE..$HEAD" \
+          # --config adds the one credential this project mints itself: an organisation key,
+          # which is handed to a whole team and so will eventually be pasted somewhere public.
+          # Giving it a fixed prefix was a deliberate choice for this moment; teaching the
+          # scanner that prefix is the other half of it. Loaded from the base commit like every
+          # other policy here, so a change cannot delete the rule that would catch it.
+          ./gitleaks git --config .gate-base/gitleaks.toml --log-opts="$BASE..$HEAD" \
             --report-format sarif --report-path gitleaks.sarif --redact
           echo "exit=$?" >> "$GITHUB_OUTPUT"
           exit 0
