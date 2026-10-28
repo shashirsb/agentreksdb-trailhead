@@ -13,7 +13,8 @@ writes need a session cookie (`th_session`) from GitHub sign-in. Errors are
 | POST | `/auth/dev-login` `{"login":"alice"}` | only when `TRAILHEAD_DEV_LOGIN=1`; for local runs and tests |
 | GET | `/api/me` | `{"user": User \| null}` |
 
-`User = {id, login, tier, rep_points, is_governor, credits_balance, created_at, rights, invite_quota}`
+`User = {id, login, tier, rep_points, is_governor, credits_balance, created_at, rights, invite_quota,
+invites_left, invite_kinds}`
 Tiers: `visitor`, `contributor`, `builder`, `steward`, `governor`.
 
 - `rights = {request_features, develop, create_org}` (booleans) is what this account may do right now. It is
@@ -22,6 +23,12 @@ Tiers: `visitor`, `contributor`, `builder`, `steward`, `governor`.
   `develop` gates `POST /api/intents/:id/submit` (see Invitations).
 - `invite_quota` is the number of live invitations this tier may hold at once (see Invitations). `null` means
   unlimited, which only `governor` has; `0` means this tier may invite nobody.
+- `invites_left` is how many of that allowance remain, i.e. the quota minus the live invitations this account
+  has issued. `null` when `invite_quota` is `null`.
+- `invite_kinds` lists exactly the kinds this account may issue, e.g. `["requester"]`, derived server-side from
+  the same `may_issue` the handler enforces. Build any chooser from this rather than re-deriving it from `tier`:
+  a client that restates the rule is a second copy of it, and the copy furthest from the code is the one that
+  goes stale without anyone noticing. An empty array means this account may issue nothing.
 
 ## Invitations
 Signing up is open. Opening an intent (requesting a feature) and submitting one (working on a release) need an
@@ -33,7 +40,10 @@ and the list below is public. This is the opposite of an organisation key, which
 is a bearer token: hashed, capped and revocable. Do not turn invitations into codes; that would add a leakage
 risk the login binding removes.
 
-`Invite = {id, login, kind, note, issued_by, revoked_by, state}`. `kind`: `requester` (may request features),
+`Invite = {id, login, kind, note, issued_by, revoked_by, issued_at, accepted_at, revoked_at, state}`, with the
+three timestamps RFC3339 and null when that has not happened. `total` is the count before the 500 cap and
+`truncated` says whether the cap bit — a transparency surface that clips in silence is worse than one that
+admits it. `kind`: `requester` (may request features),
 `developer` (the same, plus work landing in a release), `org_admin` (the same, plus creating one organisation).
 `state`: `open` · `accepted` · `revoked` (`revoked` wins once an invitation has been revoked, even if it had
 been accepted). `login` is stored lowercase without a leading `@`; `revoked_by` is null unless revoked.
@@ -44,7 +54,7 @@ their employer's key also get both rights.
 
 | Method | Path | Body / query | Returns |
 | --- | --- | --- | --- |
-| GET | `/api/invites` | | `{"invites":[Invite]}` newest first, at most 500. Public on purpose: who was admitted, by whom and why should not be an insider's list |
+| GET | `/api/invites` | | `{"total", "truncated", "invites":[Invite]}` newest first, at most 500. Public on purpose: who was admitted, by whom and why should not be an insider's list |
 | POST | `/api/invites` | `{login, kind, note?}` (signed in) | `{"id", "login", "kind"}` |
 | DELETE | `/api/invites/:id` | `{"reason"?}`, or no body at all | `{"ok": true}` |
 

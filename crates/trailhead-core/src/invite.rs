@@ -130,6 +130,23 @@ pub fn may_issue(tier: Tier, kind: InviteKind) -> bool {
     }
 }
 
+/// Every kind this tier may issue, so a client never has to restate the rule.
+///
+/// The front end needs to know which options to offer. Given only a tier it has to re-derive
+/// `may_issue` in its own language, and the copy of the rule that lives furthest from this file is
+/// the one that goes stale without anybody noticing. Deriving the list from `may_issue` itself
+/// means the two cannot disagree.
+pub fn issuable_kinds(tier: Tier) -> Vec<InviteKind> {
+    [
+        InviteKind::Requester,
+        InviteKind::Developer,
+        InviteKind::OrgAdmin,
+    ]
+    .into_iter()
+    .filter(|k| may_issue(tier, *k))
+    .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum IssueError {
     /// This tier may not issue this kind of invitation.
@@ -224,6 +241,29 @@ mod tests {
         assert!(InviteKind::OrgAdmin.may_create_org());
         assert!(!InviteKind::Requester.may_create_org());
         assert!(!InviteKind::Developer.may_create_org());
+    }
+
+    // The list a client is handed must agree with the rule the server enforces, or the UI will
+    // offer an option that comes straight back as a 403.
+    #[test]
+    fn issuable_kinds_agrees_with_may_issue_for_every_tier() {
+        for t in EVERY_TIER {
+            let listed = issuable_kinds(t);
+            for k in [
+                InviteKind::Requester,
+                InviteKind::Developer,
+                InviteKind::OrgAdmin,
+            ] {
+                assert_eq!(
+                    listed.contains(&k),
+                    may_issue(t, k),
+                    "{t:?}/{k:?} disagree between issuable_kinds and may_issue"
+                );
+            }
+        }
+        assert!(issuable_kinds(Tier::Visitor).is_empty());
+        assert_eq!(issuable_kinds(Tier::Builder), vec![InviteKind::Requester]);
+        assert_eq!(issuable_kinds(Tier::Governor).len(), 3);
     }
 
     #[test]

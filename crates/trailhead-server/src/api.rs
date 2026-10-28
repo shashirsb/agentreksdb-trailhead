@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use tower_http::services::{ServeDir, ServeFile};
 use trailhead_core::credits::{self, EntryKind, VoteError};
+use trailhead_core::invite;
 use trailhead_core::reputation::{self, Tier};
 use trailhead_core::spec::{self, Spec};
 use trailhead_core::{diffpolicy, guardrails, ledger, train};
@@ -193,6 +194,15 @@ async fn user_json(st: &AppState, u: &UserRow) -> Result<Value, ApiError> {
     let tier = users::tier_of(&st.pool, u).await?;
     let balance = db::balance(&st.pool, u.id).await?;
     let rights = users::rights_of(&st.pool, u.id).await?;
+    let quota = invite::invite_quota(tier);
+    let live_held: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM invites
+          WHERE issued_by = $1 AND accepted_at IS NULL AND revoked_at IS NULL",
+    )
+    .bind(u.id)
+    .fetch_one(&st.pool)
+    .await
+    .map_err(ApiError::internal)?;
     Ok(json!({
         "id": u.id, "login": u.login, "tier": tier.as_str(), "rep_points": u.rep_points,
         "is_governor": u.is_governor, "credits_balance": balance, "created_at": u.created_at,
@@ -203,7 +213,14 @@ async fn user_json(st: &AppState, u: &UserRow) -> Result<Value, ApiError> {
             "develop": rights.may_develop,
             "create_org": rights.may_create_org,
         },
-        "invite_quota": trailhead_core::invite::invite_quota(tier),
+        // The allowance, how many of it remain, and which kinds this tier may issue. All three are
+        // served rather than derived client-side: a front end given only a tier has to restate
+        // `may_issue` in its own language, and that copy is the one that silently goes stale.
+        // `invite_quota` null means unlimited, and `invites_left` is then null too.
+        "invite_quota": quota,
+        "invites_left": quota.map(|q| (q - live_held).max(0)),
+        "invite_kinds": invite::issuable_kinds(tier)
+            .iter().map(|k| k.as_str()).collect::<Vec<_>>(),
     }))
 }
 
@@ -2385,9 +2402,6 @@ struct NewInvite {
     note: String,
 }
 
-/// Public, like everything else here: anyone can see who was admitted, by whom and why. An
-/// invitation is bound to a login and is not a secret, so there is nothing to withhold — and an
-/// admission list that only insiders can read is exactly the thing this project claims not to be.
 #[derive(sqlx::FromRow)]
 struct InviteListRow {
     id: i64,
@@ -2396,17 +2410,24 @@ struct InviteListRow {
     note: String,
     issued_by: String,
     revoked_by: Option<String>,
-    accepted: bool,
-    revoked: bool,
+    issued_at: chrono::DateTime<Utc>,
+    accepted_at: Option<chrono::DateTime<Utc>>,
+    revoked_at: Option<chrono::DateTime<Utc>>,
 }
 
+/// Public, like everything else here: anyone can see who was admitted, by whom and why. An
+/// invitation is bound to a login and is not a secret, so there is nothing to withhold — and an
+/// admission list only insiders can read is exactly the thing this project claims not to be.
+///
+/// The page is capped, and the total is returned alongside it. A cap with no total truncates in
+/// silence, which on a transparency surface is worse than no list: a reader cannot tell a complete
+/// record from a clipped one.
 async fn list_invites(State(st): State<AppState>) -> R<Value> {
     let rows: Vec<InviteListRow> = sqlx::query_as(
         "SELECT i.id, i.login, i.kind, i.note,
                 iss.login AS issued_by,
                 rev.login AS revoked_by,
-                i.accepted_at IS NOT NULL AS accepted,
-                i.revoked_at IS NOT NULL AS revoked
+                i.issued_at, i.accepted_at, i.revoked_at
            FROM invites i
            JOIN users iss ON iss.id = i.issued_by
            LEFT JOIN users rev ON rev.id = i.revoked_by
@@ -2415,11 +2436,22 @@ async fn list_invites(State(st): State<AppState>) -> R<Value> {
     .fetch_all(&st.pool)
     .await
     .map_err(ApiError::internal)?;
+    let total: i64 = sqlx::query_scalar("SELECT count(*) FROM invites")
+        .fetch_one(&st.pool)
+        .await
+        .map_err(ApiError::internal)?;
     Ok(Json(json!({
+        "total": total,
+        "truncated": total > rows.len() as i64,
         "invites": rows.iter().map(|r| json!({
             "id": r.id, "login": r.login, "kind": r.kind, "note": r.note,
             "issued_by": r.issued_by, "revoked_by": r.revoked_by,
-            "state": if r.revoked { "revoked" } else if r.accepted { "accepted" } else { "open" },
+            "issued_at": r.issued_at,
+            "accepted_at": r.accepted_at,
+            "revoked_at": r.revoked_at,
+            "state": if r.revoked_at.is_some() { "revoked" }
+                     else if r.accepted_at.is_some() { "accepted" }
+                     else { "open" },
         })).collect::<Vec<_>>()
     })))
 }
